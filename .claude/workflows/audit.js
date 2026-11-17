@@ -173,8 +173,25 @@ log(`commit ${inv.commit}; baseline ${inv.baseline_ok ? 'ok' : 'FAILED: ' + inv.
 const confirmed = []
 const refuted = []
 const notTested = []
-const seen = new Set()
-const keyOf = (v) => (v.location + '|' + v.root_cause).toLowerCase().slice(0, 160)
+const unverified = [] // candidates whose verifier did not finish; carried to the report
+// Identity is the full normalised location and root cause; a key that matches an earlier
+// finding is recorded as a merge on that finding, never dropped silently.
+const seen = new Map()
+const keyOf = (v) => `${v.location}|${v.root_cause}`.toLowerCase().replace(/\s+/g, ' ').trim()
+const addConfirmed = (v, r) => {
+  const k = keyOf(v)
+  const existing = seen.get(k)
+  if (existing) {
+    if (existing.title !== v.title) {
+      ;(existing.merged = existing.merged || []).push(v.title)
+      log(`round ${r}: "${v.title}" merged into "${existing.title}" (same location and root cause)`)
+    }
+    return false
+  }
+  seen.set(k, v)
+  confirmed.push(v)
+  return true
+}
 
 const review = (lens, round) =>
   agent(`${RULES}
@@ -185,15 +202,17 @@ For every inventory row this lens applies to, decide: finding, holds (say why), 
 applicable (say why), and write those cells to ${RUN}/grid-${lens.key}-r${round}.md.
 Use the dynamic techniques in Phase 4 that fit: boundary tests on limits, property or fuzz
 tests on converters, differential tests between sibling implementations, fault injection.
-Already reported, do not repeat: ${[...seen].slice(0, 200).join(' ; ') || 'nothing yet'}
+Already reported, do not repeat: ${confirmed.slice(0, 200).map((c) => `${c.title} (${c.location})`).join(' ; ') || 'nothing yet'}
 Return every candidate finding, and what you could not test and why.`,
     { label: `review:${lens.key}:r${round}`, phase: 'Review', schema: FINDINGS_SCHEMA })
 
-const verify = (found, lens, round) => {
+// A null result (the agent was skipped or died) is a failure, not an empty result: absorb
+// counts it so the round is not dry, and the item is re-queued.
+const verify = async (found, lens, round) => {
   if (!found) return null
   if (found.not_tested) notTested.push(`${lens.key}: ${found.not_tested}`)
   if (!found.findings.length) return { verdicts: [] }
-  return agent(`${RULES}
+  const verdicts = await agent(`${RULES}
 
 Task: Phase 5 of the plan. Another reviewer (lens ${lens.key}) reported the candidates
 below. You did not find them; your job is to refute them. For each: read the code path
@@ -203,32 +222,35 @@ produces it. Say whether confirming it needs a deployed instance.
 Candidates:
 ${JSON.stringify(found.findings, null, 1)}`,
     { label: `verify:${lens.key}:r${round}`, phase: 'Verify', schema: VERDICTS_SCHEMA })
+  if (!verdicts) unverified.push(...found.findings.map((f) => ({ ...f, lens: lens.key, round })))
+  return verdicts
 }
 
-const absorb = (results) => {
+const absorb = (results, r, what) => {
   let fresh = 0
-  for (const r of results.filter(Boolean)) {
-    for (const v of r.verdicts || []) {
+  let failed = 0
+  for (const res of results) {
+    if (!res) { failed++; continue }
+    for (const v of res.verdicts || []) {
       if (!v.real) { refuted.push({ title: v.title, why: v.evidence.slice(0, 400) }); continue }
-      const k = keyOf(v)
-      if (seen.has(k)) continue
-      seen.add(k)
-      confirmed.push(v)
-      fresh++
+      if (addConfirmed(v, r)) fresh++
     }
   }
-  return fresh
+  if (failed) log(`round ${r}: ${failed} ${what} agent(s) returned nothing; re-queued, and the round does not count as dry`)
+  return { fresh, failed }
 }
 
 let work = lenses
 let dry = 0
 let round = 0
+let stopped = 'when the critic found no gaps'
 const sweptPatterns = new Set()
 while (work.length && dry < 2 && round < MAX_ROUNDS) {
   round++
   const r = round
   const results = await pipeline(work, (lens) => review(lens, r), (found, lens) => verify(found, lens, r))
-  let fresh = absorb(results)
+  const retry = work.filter((_, i) => !results[i])
+  let { fresh, failed } = absorb(results, r, 'review/verify')
 
   // Variant sweep: each newly confirmed pattern is searched for across the whole codebase.
   const patterns = [...new Set(confirmed.map((c) => c.pattern))].filter((p) => !sweptPatterns.has(p))
@@ -246,11 +268,15 @@ Do not re-report these known findings: ${confirmed.map((c) => c.title).join(' ; 
 Write your cells to ${RUN}/grid-sweep-r${r}-${i}.md and return each new candidate.`,
       { label: `sweep:r${r}:${i}`, phase: 'Sweep', schema: FINDINGS_SCHEMA }),
     (found, _p, i) => verify(found, { key: `sweep-${i}` }, r))
-  fresh += absorb(sweeps)
+  toSweep.forEach((p, i) => { if (!sweeps[i]) sweptPatterns.delete(p) })
+  const s = absorb(sweeps, r, 'sweep/verify')
+  fresh += s.fresh
+  failed += s.failed
 
   log(`round ${r}: ${fresh} new confirmed finding(s); ${confirmed.length} total, ${refuted.length} refuted`)
-  dry = fresh === 0 ? dry + 1 : 0
-  if (r >= MAX_ROUNDS || dry >= 2) break
+  dry = fresh === 0 && failed === 0 ? dry + 1 : 0
+  if (dry >= 2) { stopped = 'after two dry rounds'; break }
+  if (r >= MAX_ROUNDS) { stopped = 'at the round cap'; break }
 
   // Completeness critic: decides what the next round looks at.
   const critic = await agent(`${RULES}
@@ -264,8 +290,13 @@ nothing this time, and what an attacker would try that nobody tried. Return the 
 gaps to examine next, each as a lens key, a title, and exactly what to look at. Return an
 empty list only if you would stake your reputation on the coverage.`,
     { label: `critic:r${r}`, phase: 'Critic', schema: CRITIC_SCHEMA })
-  work = critic ? critic.gaps.map((g) => ({ key: g.key, title: g.title, rows: g.rows })) : []
-  if (!work.length) log(`round ${r}: the critic found no further gaps`)
+  if (!critic) {
+    log(`round ${r}: the critic did not finish; coverage is unknown, so every lens runs again`)
+    work = [...lenses, ...retry.filter((l) => !lenses.includes(l))]
+  } else {
+    work = [...retry, ...critic.gaps.map((g) => ({ key: g.key, title: g.title, rows: g.rows }))]
+    if (!work.length) log(`round ${r}: the critic found no further gaps`)
+  }
 }
 if (round >= MAX_ROUNDS && dry < 2) log(`stopped at the round cap (${MAX_ROUNDS}) before two dry rounds: coverage is NOT complete by the plan's stopping rule`)
 
@@ -288,7 +319,8 @@ ${JSON.stringify(live.map((c) => ({ title: c.title, location: c.location, eviden
     for (const v of lv.verdicts) {
       const hit = confirmed.find((c) => c.title === v.title)
       if (hit) { hit.live_evidence = v.evidence; if (!v.real) hit.live_refuted = true }
-      else if (v.real && !seen.has(keyOf(v))) { seen.add(keyOf(v)); confirmed.push(v) }
+      else if (v.real) addConfirmed(v, 'live')
+      else refuted.push({ title: v.title, why: `live, unmatched title: ${v.evidence.slice(0, 400)}` })
     }
     liveNotes = `${lv.verdicts.length} checked on a disposable deployment`
   } else liveNotes = 'the live agent did not finish'
@@ -307,11 +339,14 @@ including the critique and the "one step further" section, and merge the grid-*.
 into its coverage grid. Then update ${REGISTER}: add each confirmed finding under its class
 with status open, re-mark past findings you can tell were re-checked, add any new class and
 any new pattern. These are the only files you may change.
-Run facts: commit ${inv.commit}; depth ${depth}; rounds ${round}; stopped ${dry >= 2 ? 'after two dry rounds' : 'at the round cap or when the critic found no gaps'}; live phase: ${liveNotes}.
+Run facts: commit ${inv.commit}; depth ${depth}; rounds ${round}; stopped ${stopped}; live phase: ${liveNotes}.
 Confirmed findings:
 ${JSON.stringify(confirmed, null, 1)}
 Refuted candidates:
 ${JSON.stringify(refuted, null, 1)}
+Unverified candidates (their verifier did not finish; list them in their own section, and
+note any that a later round confirmed or refuted):
+${JSON.stringify(unverified, null, 1)}
 Not tested, as reported by reviewers:
 ${notTested.join('\n') || '(none)'}`,
   { label: 'report', phase: 'Report', schema: REPORT_SCHEMA })
@@ -326,5 +361,6 @@ return {
   counts: confirmed.reduce((a, c) => ((a[c.severity] = (a[c.severity] || 0) + 1), a), {}),
   confirmed: confirmed.map((c) => ({ severity: c.severity, title: c.title, location: c.location, fix: c.fix })),
   refuted: refuted.length,
+  unverified: unverified.map((f) => ({ severity: f.severity, title: f.title, location: f.location })),
   live: liveNotes,
 }

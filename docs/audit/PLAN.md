@@ -41,6 +41,11 @@ A run is **done** when all of these hold:
 - **Refute first.** Before reporting, try to disprove the finding. Record what was tried.
 - **Do not change the audited tree.** Work in a private copy with its own build directory.
   The only files an audit writes in the repository are the run report and the register.
+- **No stale binaries.** `git archive` keeps commit times, so a copy built in a shared
+  target directory can be reported `Fresh` and run another copy's binary. After extracting,
+  `touch` every source file (or give each copy a unique package version). The first build
+  of a copy must show the workspace crates as `Compiling`, not `Fresh`; re-run any result
+  obtained otherwise.
 - **Destructive tests** (draining balances, filling storage, changing policy, upgrading)
   run only on a disposable local deployment created for the audit, never on an instance
   that holds real data or value.
@@ -89,7 +94,7 @@ them in the run report: they are the rows of the coverage grid.
 | Commit points | Every place where execution can be suspended, state is committed, or a failure rolls work back | Await points, transaction boundaries, callbacks |
 | Limits | Every constant or setting that bounds size, count, depth, time, memory or cost, and what it protects | Constants and configuration |
 | Unbounded work | Every loop, recursion, allocation or copy whose size comes from an untrusted input | Follow untrusted inputs into loops, recursive functions and conversions |
-| Failure sites | Every place that can abort: assertions, unwraps, indexing, arithmetic overflow, out-of-memory | Search for the language's aborting constructs outside tests |
+| Failure sites | Every place that can abort: assertions, unwraps, indexing, arithmetic overflow, out-of-memory | Search for the language's aborting constructs outside tests. Also list the panic locations compiled into the release artifact, grouped by crate (the `.rs` path strings in its data section, e.g. `strings` or `wasm-objdump -s` and grep `\.rs`), and reconcile them with the source rows: dependencies abort too |
 | Boundary conversions | Every translation between formats or type systems | Serializers, parsers, encoders, value mappers |
 | Value flows | Every path by which money, credits, tokens or metered resources move or are spent | Payment, metering and resource-accounting code |
 | Admin surface | Every setting an operator can change, its valid range, and what happens outside it | Configuration endpoints and init arguments |

@@ -1,0 +1,10 @@
+# `cargo deny check advisories` (run in .github/workflows/ci.yml). Each ignore is an
+# unmaintained-crate notice, not a vulnerability; re-check when the parent crate is bumped.
+# cargo-deny only checks registry crates, so the path-vendored `vendor/chrono` is not
+# scanned: re-check RUSTSEC-2026-0543 by hand whenever monty is bumped.
+[advisories]
+version = 2
+ignore = [
+  { id = "RUSTSEC-2026-0249", reason = "smartstring 1.0.1 is unmaintained; it is a non-optional dependency of rhai 1.27 (no vulnerability advisory)" },
+  { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained; pulled in by monty, vendored as vendor/chrono with wasmbind removed (no vulnerability advisory)" },
+]
