@@ -10,7 +10,7 @@
 //! Note: `call` is a reserved Rhai keyword, so the call function is named
 //! `icp::call_canister(...)`.
 
-use crate::bridge::{HostBridge, MAX_LOG_BYTES, ValueBudget, budget_error};
+use crate::bridge::{HostBridge, ValueBudget, budget_error, container_depth, float_json, log_line};
 use rhai::packages::{Package, StandardPackage};
 use rhai::{Dynamic, Engine, EvalAltResult, FuncRegistration, ImmutableString, Module, NativeCallContext, Position};
 use serde_json::Value;
@@ -32,8 +32,6 @@ pub const MAX_FN_EXPR_DEPTH: usize = 64;
 /// whole array on `for` and on assignment, and the largest reply the bridge passes (99,999
 /// one-field records) is about 47 MiB per copy natively, 33 MiB on wasm32.
 pub const MAX_MEMORY_BYTES: usize = 128 << 20;
-/// Deepest value accepted when converting to JSON.
-const MAX_VALUE_DEPTH: usize = crate::candid_bridge::MAX_DEPTH;
 const SUSPEND: &str = "__icp_suspend__";
 
 #[derive(Clone, Debug)]
@@ -60,13 +58,10 @@ struct RunState {
 
 impl RunState {
     fn log(&mut self, line: String) {
-        if self.log_bytes >= MAX_LOG_BYTES {
-            return;
+        if let Some((line, used)) = log_line(self.log_bytes, line) {
+            self.log_bytes = used;
+            self.logs.push(line);
         }
-        let mut line = line;
-        crate::bridge::truncate(&mut line, MAX_LOG_BYTES - self.log_bytes);
-        self.log_bytes += line.len();
-        self.logs.push(line);
     }
 }
 
@@ -119,10 +114,13 @@ fn request(st: &Shared, req: Request, pos: Position) -> Result<Dynamic, Box<Eval
 /// Bounded like every other value leaving a script: Rhai strings are shared, so an array
 /// of references to one large string is small in the engine and huge once copied out.
 fn to_json_value(d: &Dynamic, depth: usize, budget: &mut ValueBudget) -> Result<Value, Box<EvalAltResult>> {
-    if depth > MAX_VALUE_DEPTH {
-        return Err(format!("value nested deeper than {MAX_VALUE_DEPTH} levels").into());
-    }
     budget.node()?;
+    if d.is_blob() || d.is_array() || d.is_map() {
+        container_depth(depth)?;
+    }
+    if let Ok(f) = d.as_float() {
+        return Ok(float_json(f));
+    }
     if d.is_blob() {
         let b = d.clone().into_blob().unwrap_or_default();
         budget.bytes(b.len())?;
@@ -522,8 +520,8 @@ mod tests {
     fn print_is_capped_per_run() {
         let b = MockBridge::default();
         block_on(run("let s = \"x\"; s.pad(100000, 'x'); for i in 0..1000 { print(s); } 1", &b)).unwrap();
-        let total: usize = b.logs.take().iter().map(|l| l.len()).sum();
-        assert!(total <= MAX_LOG_BYTES + 64, "{total}");
+        let total: usize = b.logs.take().iter().map(|l| crate::bridge::log_cost(l)).sum();
+        assert!(total <= crate::bridge::MAX_LOG_BYTES, "{total}");
     }
 
     #[test]

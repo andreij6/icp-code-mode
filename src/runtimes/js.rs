@@ -2,7 +2,7 @@
 //! host drains the job queue, dispatches every pending request concurrently
 //! (so `Promise.all` becomes a true batch), settles the promises and repeats.
 
-use crate::bridge::{HostBridge, MAX_LOG_BYTES, budget_error, check_budget, normalize_numbers, now_ms, truncate};
+use crate::bridge::{HostBridge, MAX_LOG_BYTES, budget_error, check_budget, log_line, normalize_numbers, now_ms, truncate};
 use boa_engine::builtins::promise::{PromiseState, ResolvingFunctions};
 use boa_engine::context::time::FixedClock;
 use boa_engine::context::{ContextBuilder, HostHooks};
@@ -24,7 +24,7 @@ pub const STACK_SIZE_LIMIT: usize = 10 * 1024;
 /// Host round-trips (each one a batch of concurrent requests).
 pub const MAX_ROUNDS: usize = 64;
 /// Concurrent `icp.*` requests per round.
-pub const MAX_PENDING: usize = 64;
+pub use super::MAX_PENDING;
 /// Values crossing into Rust (results, call args, console.log) are snapshotted with
 /// these bounds; Boa's own `to_json` / `JSON.stringify` recurse without a limit and
 /// would overflow the wasm stack.
@@ -63,11 +63,38 @@ pub const MAX_PROMISE_JOBS: u64 = 100_000;
 /// functions/symbols dropped like `JSON.stringify` does. Also wraps `JSON.stringify`
 /// with the same bounds, replacer included. Evaluates to `[snapshot, show]`; `show`
 /// formats any value for `console.log` and error text.
+///
+/// With `host` set (values leaving the script), the rules all runtimes share apply where
+/// JSON has none: NaN and infinities become "NaN"/"inf"/"-inf", errors their text, typed
+/// arrays arrays of their elements, ArrayBuffers and DataViews byte arrays, and lone
+/// surrogates U+FFFD (as Python's do).
 const SNAPSHOT_JS: &str = r#"(() => {
   const keys = Object.keys, isArray = Array.isArray, def = Object.defineProperty, str = JSON.stringify, apply = Reflect.apply;
   const create = Object.create, Str = String, objToString = Object.prototype.toString, sliceS = String.prototype.slice;
   const MAXD = __MAXD__, MAXN = __MAXN__, MAXB = __MAXB__;
   const put = (o, k, v) => def(o, k, { value: v, writable: true, enumerable: true, configurable: true });
+  const cut = s => s.length > 4096 ? apply(sliceS, s, [0, 4096]) + "…" : s;
+  const errText = v => {
+    const n = v.name, m = v.message, name = typeof n === "string" ? cut(n) : "Error";
+    return typeof m === "string" && m ? name + ": " + cut(m) : name;
+  };
+  const gd = Object.getOwnPropertyDescriptor, from = Array.from, U8 = Uint8Array, isView = ArrayBuffer.isView, isFin = Number.isFinite;
+  const taLen = gd(Object.getPrototypeOf(U8.prototype), "length").get, abLen = gd(ArrayBuffer.prototype, "byteLength").get;
+  const isWF = String.prototype.isWellFormed, toWF = String.prototype.toWellFormed;
+  const wellFormed = s => apply(isWF, s, []) ? s : apply(toWF, s, []);
+  const len = (g, x) => { try { return apply(g, x, []); } catch (_) { return -1; } };
+  // Typed arrays as arrays of their elements; ArrayBuffers and DataViews as byte arrays.
+  // `tag`: the value's Object.prototype.toString text (no exception for ordinary objects).
+  const plain = (x, tag) => {
+    let n = -1;
+    if (isView(x)) {
+      n = len(taLen, x);
+      if (n < 0) { x = new U8(x.buffer, x.byteOffset, x.byteLength); n = len(taLen, x); }
+    } else if (tag === "[object ArrayBuffer]" && len(abLen, x) >= 0) { x = new U8(x); n = len(taLen, x); }
+    if (n < 0) return undefined;
+    if (n > MAXN) throw new RangeError("value has more than " + MAXN + " elements");
+    return apply(from, null, [x]);
+  };
   // Pristine valueOf methods: each throws unless `this` really is that kind of box.
   const UNBOX = [Number.prototype.valueOf, String.prototype.valueOf, Boolean.prototype.valueOf, BigInt.prototype.valueOf];
   const unbox = x => {
@@ -79,7 +106,7 @@ const SNAPSHOT_JS: &str = r#"(() => {
   // `replacer`: optional JSON.stringify replacer function, applied here (inside the bounds)
   // in the order the spec gives: toJSON, then the replacer, then the type rules.
   // `list`: an array replacer's property list; objects then serialise only those keys.
-  const snapshot = (root, replacer, list) => {
+  const snapshot = (root, replacer, list, host) => {
     let nodes = 0, bytes = 0;
     const walk = (x, d, holder, key) => {
       let t = typeof x;
@@ -90,6 +117,15 @@ const SNAPSHOT_JS: &str = r#"(() => {
       if (replacer) { x = apply(replacer, holder, [key, x]); t = typeof x; }
       // Boxed primitives (new Number(1), Object("s"), ...) serialise as their value.
       if (t === "object" && x !== null) { x = unbox(x); t = typeof x; }
+      if (host) {
+        if (t === "number" && !isFin(x)) { x = x !== x ? "NaN" : x > 0 ? "inf" : "-inf"; t = "string"; }
+        if (t === "object" && x !== null) {
+          const tag = apply(objToString, x, []);
+          if (tag === "[object Error]") { x = errText(x); t = "string"; }
+          else { const b = plain(x, tag); if (b !== undefined) x = b; }
+        }
+        if (t === "string") x = wellFormed(x);
+      }
       if (++nodes > MAXN) throw new RangeError("value has more than " + MAXN + " elements");
       if (t === "bigint") throw new TypeError("BigInt values cannot cross into the host; convert to string");
       if (t === "function" || t === "symbol") return undefined;
@@ -107,13 +143,13 @@ const SNAPSHOT_JS: &str = r#"(() => {
       }
       const out = {}, ks = list || keys(x);
       for (let i = 0; i < ks.length; i++) {
-        const k = ks[i], xv = x[k];
+        const k = ks[i], xv = x[k], kk = host ? wellFormed(k) : k;
         // Left out of the output (a listed key the object lacks): costs nothing.
         if (xv === undefined && !replacer) continue;
         bytes += k.length;
         if (bytes > MAXB) throw new RangeError("value holds more than " + MAXB + " bytes of text");
         const v = walk(xv, d + 1, x, k);
-        if (v !== undefined) put(out, k, v);
+        if (v !== undefined) put(out, kk, v);
       }
       return out;
     };
@@ -163,7 +199,6 @@ const SNAPSHOT_JS: &str = r#"(() => {
   bounded("repeat", (s, n) => s.length * n);
   // console.log / error text: the language's own text for primitives, functions and
   // errors (only `name` and `message`, cut short), bounded JSON for other objects.
-  const cut = s => s.length > 4096 ? apply(sliceS, s, [0, 4096]) + "…" : s;
   const big = (k, x) => typeof x === "bigint" ? Str(x) + "n" : x;
   const show = v => {
     const t = typeof v;
@@ -171,10 +206,7 @@ const SNAPSHOT_JS: &str = r#"(() => {
     if (t === "bigint") return Str(v) + "n";
     if (t === "function") { const n = v.name; return typeof n === "string" && n ? "[Function " + cut(n) + "]" : "[Function]"; }
     if (t !== "object" || v === null) return Str(v);
-    if (apply(objToString, v, []) === "[object Error]") {
-      const n = v.name, m = v.message, name = typeof n === "string" ? cut(n) : "Error";
-      return typeof m === "string" && m ? name + ": " + cut(m) : name;
-    }
+    if (apply(objToString, v, []) === "[object Error]") return errText(v);
     return str(snapshot(v, big));
   };
   return [snapshot, show];
@@ -452,7 +484,7 @@ fn budget(st: &Shared) -> JsResult<()> {
 fn to_json_safe(v: &JsValue, st: &Shared, ctx: &mut Context) -> JsResult<Value> {
     let snapshot = st.borrow().snapshot.clone();
     let plain = match snapshot {
-        Some(f) => f.call(&JsValue::undefined(), std::slice::from_ref(v), ctx)?,
+        Some(f) => f.call(&JsValue::undefined(), &[v.clone(), JsValue::undefined(), JsValue::undefined(), JsValue::from(true)], ctx)?,
         None => return Err(JsNativeError::error().with_message("engine not initialised").into()),
     };
     let v = normalize_numbers(plain.to_json(ctx)?.unwrap_or(Value::Null));
@@ -494,13 +526,10 @@ fn console_fn(level: &'static str, state: &Shared) -> NativeFunction {
                 line.push_str(&display(a, st, ctx).unwrap_or_else(|| "<unprintable value>".into()));
             }
             let mut s = st.borrow_mut();
-            if s.log_bytes + line.len() > MAX_LOG_BYTES {
-                truncate(&mut line, MAX_LOG_BYTES - s.log_bytes);
-                s.log_bytes = MAX_LOG_BYTES;
-            } else {
-                s.log_bytes += line.len();
+            if let Some((line, used)) = log_line(s.log_bytes, line) {
+                s.log_bytes = used;
+                s.logs.push(line);
             }
-            s.logs.push(line);
             Ok(JsValue::undefined())
         },
         state.clone(),
@@ -1062,8 +1091,8 @@ mod tests {
     fn console_output_is_capped_while_running() {
         let b = MockBridge::default();
         block_on(run("const s = 'x'.repeat(100000); for (let i = 0; i < 1000; i++) console.log(s); return 1", &b)).unwrap();
-        let total: usize = b.logs.take().iter().map(|l| l.len()).sum();
-        assert!(total <= MAX_LOG_BYTES + 64, "{total}");
+        let total: usize = b.logs.take().iter().map(|l| crate::bridge::log_cost(l)).sum();
+        assert!(total <= MAX_LOG_BYTES, "{total}");
     }
 
     #[test]

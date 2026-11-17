@@ -6,14 +6,14 @@
 //! * `icp.call_async(...)` is awaitable, so `await asyncio.gather(...)` puts several
 //!   calls in flight; the host dispatches them together when the VM blocks.
 
-use crate::bridge::{HostBridge, ValueBudget, check_budget, instruction_counter, now_ms};
+use crate::bridge::{HostBridge, ValueBudget, check_budget, container_depth, float_json, instruction_counter, now_ms};
 use monty::{MontyRun, RunProgress};
 use monty_types::{
     CompileOptions, DateTimeSource, ExcType, ExtFunctionResult, MontyException, MontyObject, MontyUuid,
     NameLookupResult, ObjectRef, OsFunctionCall, OsPolicy, PrintWriter, RandomSeed, RandomStart, ResourceLimits,
     ResourceTracker, SleepMode,
 };
-use serde_json::{Map, Number, Value};
+use serde_json::{Map, Value};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -22,30 +22,32 @@ pub const MAX_SUSPENSIONS: usize = 256;
 pub const MAX_MEMORY_BYTES: usize = 64 << 20;
 const MAX_PRINT_BYTES: usize = crate::bridge::MAX_LOG_BYTES;
 
-/// Collects `print` output up to `MAX_PRINT_BYTES`, then cuts it with the marker the
-/// other runtimes use (`bridge::truncate`) and drops the rest. Monty's own capped
-/// collector raises `MemoryError` instead.
+/// Collects `print` output up to `MAX_PRINT_BYTES`, measured as the other runtimes measure
+/// it (JSON-escaped, newlines included: `bridge::log_cost`), then cuts it with their marker
+/// and drops the rest. Monty's own capped collector raises `MemoryError` instead.
 #[derive(Default)]
 struct Printed {
     text: String,
+    /// Escaped size of `text`.
+    used: usize,
     cut: bool,
 }
 
-const CUT_MARK: &str = "…[truncated]";
-
 impl Printed {
     fn append(&mut self, s: &str) {
+        use crate::bridge::{cut_escaped, escaped_len, escaped_prefix};
         if self.cut {
             return;
         }
-        if self.text.len() + s.len() <= MAX_PRINT_BYTES {
+        let n = escaped_len(s);
+        if self.used + n <= MAX_PRINT_BYTES - crate::bridge::LOG_RESERVE {
             self.text.push_str(s);
+            self.used += n;
             return;
         }
-        let keep = MAX_PRINT_BYTES - CUT_MARK.len();
-        self.text.push_str(&s[..s.floor_char_boundary(keep.saturating_sub(self.text.len()))]);
-        self.text.truncate(self.text.floor_char_boundary(keep));
-        self.text.push_str(CUT_MARK);
+        self.text.push_str(&s[..escaped_prefix(s, MAX_PRINT_BYTES - self.used)]);
+        // Room for the newline the last line is charged as `bridge::log_cost` charges it.
+        cut_escaped(&mut self.text, MAX_PRINT_BYTES - 2);
         self.cut = true;
     }
 }
@@ -81,10 +83,13 @@ const MAX_VALUE_DEPTH: usize = crate::candid_bridge::MAX_DEPTH;
 /// What is left of this run's VM budget. On-chain it is what is left of the policy's
 /// instruction budget (`set_limits`), so Python obeys the same limit as JavaScript and
 /// Rhai; the web-time shim makes one "nanosecond" one instruction. Off-chain it is what
-/// is left of `EXECUTION_BUDGET` of wall time since `started`.
+/// is left of `EXECUTION_BUDGET` of wall time since `started`, unless the bridge sets a
+/// deadline.
 fn vm_budget<B: HostBridge>(bridge: &B, started: Option<std::time::Instant>) -> Duration {
-    if cfg!(target_arch = "wasm32") {
-        Duration::from_nanos(bridge.instruction_deadline().saturating_sub(instruction_counter()))
+    // Natively too when a deadline is set (tests), so the budget path runs off-chain.
+    let deadline = bridge.instruction_deadline();
+    if cfg!(target_arch = "wasm32") || deadline != u64::MAX {
+        Duration::from_nanos(deadline.saturating_sub(instruction_counter()))
     } else {
         EXECUTION_BUDGET.saturating_sub(started.map_or(Duration::ZERO, |s| s.elapsed()))
     }
@@ -121,9 +126,6 @@ fn icp_module() -> MontyObject {
 /// nested>`) is an error, never text standing in for the data.
 fn to_json(o: ObjectRef<'_>, depth: usize, budget: &mut ValueBudget) -> Result<Value, String> {
     use monty_types::unstable::{MontyNode as N, node};
-    if depth > MAX_VALUE_DEPTH {
-        return Err(format!("value nested deeper than {MAX_VALUE_DEPTH} levels"));
-    }
     budget.node()?;
     Ok(match node(o) {
         N::None => Value::Null,
@@ -131,23 +133,26 @@ fn to_json(o: ObjectRef<'_>, depth: usize, budget: &mut ValueBudget) -> Result<V
         N::Int(i) => Value::from(*i),
         // Beyond i64: exact decimal string (matches how nat/int come back from candid).
         N::BigInt(_) => Value::String(int_text(o, budget)?),
-        N::Float(f) => Number::from_f64(*f).map_or(Value::Null, Value::Number),
+        N::Float(f) => float_json(*f),
         N::String(s) => {
             budget.bytes(s.len())?;
             Value::String(s.clone())
         }
         // bytes / bytearray -> byte array (what candid `blob` accepts), one node per byte.
         N::Bytes(b) => {
+            container_depth(depth)?;
             budget.bytes(b.len())?;
             for _ in 0..b.len() {
                 budget.node()?;
             }
             Value::Array(b.iter().map(|x| Value::from(*x)).collect())
         }
-        N::List(_) | N::Tuple(_) | N::Set(_) | N::FrozenSet(_) | N::NamedTuple { .. } => Value::Array(
-            o.items().unwrap_or_default().into_iter().map(|x| to_json(x, depth + 1, budget)).collect::<Result<_, _>>()?,
-        ),
+        N::List(_) | N::Tuple(_) | N::Set(_) | N::FrozenSet(_) | N::NamedTuple { .. } => {
+            container_depth(depth)?;
+            Value::Array(o.items().unwrap_or_default().into_iter().map(|x| to_json(x, depth + 1, budget)).collect::<Result<_, _>>()?)
+        }
         N::Dict(_) => {
+            container_depth(depth)?;
             let mut out = Map::new();
             for (k, v) in o.pairs().unwrap_or_default() {
                 let key = match node(k) {
@@ -392,6 +397,10 @@ async fn drive<B: HostBridge>(code: &str, bridge: &B, out: &mut Printed) -> Resu
                     let e = exc(ExcType::TypeError, "icp functions take positional arguments only");
                     allow(c.tracker_mut(), bridge, started);
                     c.resume(ExtFunctionResult::Error(e), PrintWriter::Callback(out))
+                } else if c.function_name == "icp.call_async" && !c.allow_eager_await && queued.len() >= super::MAX_PENDING {
+                    let e = exc(ExcType::RuntimeError, format!("more than {} concurrent icp requests", super::MAX_PENDING));
+                    allow(c.tracker_mut(), bridge, started);
+                    c.resume(ExtFunctionResult::Error(e), PrintWriter::Callback(out))
                 } else if c.function_name == "icp.call_async" && !c.allow_eager_await {
                     queued.push((c.call_id, c.function_name.clone(), args));
                     allow(c.tracker_mut(), bridge, started);
@@ -459,6 +468,19 @@ mod tests {
         let (r, b) = py(&code);
         assert_eq!(r.unwrap(), json!([300, 300]));
         assert_eq!(b.calls.borrow().len(), 3);
+    }
+
+    /// 185: a gather batch holds at most `MAX_PENDING` requests, as in JS; nothing is sent
+    /// when it is refused.
+    #[test]
+    fn gather_batches_are_capped_like_js() {
+        let gather = |n: usize| format!("import asyncio\nxs = await asyncio.gather(*[icp.call_async('{L}', 'm') for i in range({n})])\nlen(xs)");
+        let (r, b) = py(&gather(crate::runtimes::MAX_PENDING));
+        assert_eq!(r.unwrap(), json!(crate::runtimes::MAX_PENDING));
+        assert_eq!(b.calls.borrow().len(), crate::runtimes::MAX_PENDING);
+        let (r, b) = py(&gather(crate::runtimes::MAX_PENDING + 1));
+        assert!(r.unwrap_err().contains("concurrent icp requests"));
+        assert!(b.calls.borrow().is_empty());
     }
 
     #[test]
@@ -604,7 +626,7 @@ mod tests {
         let e = block_on(run(&seq, &BigReplyBridge::new(200))).unwrap_err();
         assert!(e.contains("MemoryError"), "{e}");
         let gather = format!(
-            "import asyncio\nxs = await asyncio.gather(*[icp.call_async('{L}', 'm') for i in range(200)])\nlen(xs)"
+            "import asyncio\nxs = []\nfor j in range(4):\n    xs += await asyncio.gather(*[icp.call_async('{L}', 'm') for i in range(50)])\nlen(xs)"
         );
         let e = block_on(run(&gather, &BigReplyBridge::new(200))).unwrap_err();
         assert!(e.contains("MemoryError"), "{e}");

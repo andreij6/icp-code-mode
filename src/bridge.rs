@@ -91,19 +91,50 @@ impl ValueBudget {
     }
 }
 
+/// The depth rule every runtime and the bridge share: at most `MAX_DEPTH` levels of arrays
+/// and objects (bytes and blobs count as arrays); scalars add no level. Call it for a
+/// container at `depth` (the root is at 0).
+pub fn container_depth(depth: usize) -> Result<(), String> {
+    const MAX: usize = crate::candid_bridge::MAX_DEPTH;
+    match depth {
+        d if d >= MAX => Err(format!("value nested deeper than {MAX} levels")),
+        _ => Ok(()),
+    }
+}
+
+/// A float as it leaves a script or a reply: non-finite values as the strings "NaN",
+/// "inf" and "-inf" (which the Candid bridge parses back), in every runtime.
+pub fn float_json(f: f64) -> Value {
+    match serde_json::Number::from_f64(f) {
+        Some(n) => Value::Number(n),
+        None if f.is_nan() => Value::String("NaN".into()),
+        None if f > 0.0 => Value::String("inf".into()),
+        None => Value::String("-inf".into()),
+    }
+}
+
+/// A script's result with integers beyond 2^53 as exact decimal strings, as Candid replies
+/// give them, whatever the language (Python and Rhai integers are exact up to 2^63).
+pub fn big_ints_to_strings(v: Value) -> Value {
+    const SAFE: u64 = crate::candid_bridge::MAX_SAFE_INT;
+    match v {
+        Value::Number(n) if n.as_i64().map_or(n.is_u64(), |i| i.unsigned_abs() > SAFE) => Value::String(n.to_string()),
+        Value::Array(a) => Value::Array(a.into_iter().map(big_ints_to_strings).collect()),
+        Value::Object(o) => Value::Object(o.into_iter().map(|(k, v)| (k, big_ints_to_strings(v))).collect()),
+        v => v,
+    }
+}
+
 /// Hold a host reply to the same limits as values leaving a script, so every runtime
 /// accepts the same replies (Rhai's engine limits equal these and never count more).
 pub fn check_value(v: &Value) -> Result<(), String> {
     fn walk(v: &Value, depth: usize, b: &mut ValueBudget) -> Result<(), String> {
-        const MAX: usize = crate::candid_bridge::MAX_DEPTH;
-        if depth > MAX {
-            return Err(format!("value nested deeper than {MAX} levels"));
-        }
         b.node()?;
         match v {
             Value::String(s) => b.bytes(s.len()),
-            Value::Array(a) => a.iter().try_for_each(|x| walk(x, depth + 1, b)),
-            Value::Object(o) => o.iter().try_for_each(|(k, x)| b.bytes(k.len()).and_then(|_| walk(x, depth + 1, b))),
+            Value::Array(a) => container_depth(depth).and_then(|_| a.iter().try_for_each(|x| walk(x, depth + 1, b))),
+            Value::Object(o) => container_depth(depth)
+                .and_then(|_| o.iter().try_for_each(|(k, x)| b.bytes(k.len()).and_then(|_| walk(x, depth + 1, b)))),
             _ => Ok(()),
         }
     }
@@ -127,12 +158,10 @@ pub fn decode_checked(svc: &Service, func: &candid::types::Function, bytes: &[u8
     Ok(v)
 }
 
-/// Deterministic "now" for script clocks: block time on-chain, 0 off-chain (tests).
+/// Deterministic "now" for script clocks: block time on-chain, the settable test clock
+/// off-chain (0 unless a test moves it).
 pub fn now_ms() -> u64 {
-    #[cfg(target_arch = "wasm32")]
-    return ic_cdk::api::time() / 1_000_000;
-    #[cfg(not(target_arch = "wasm32"))]
-    0
+    ic::now_ns() / 1_000_000
 }
 
 /// JS engines hand back every number as f64; turn integral values in the
@@ -140,7 +169,10 @@ pub fn now_ms() -> u64 {
 pub fn normalize_numbers(v: Value) -> Value {
     match v {
         Value::Number(n) if !n.is_i64() && !n.is_u64() => match n.as_f64() {
-            Some(f) if f.fract() == 0.0 && f.abs() <= 9_007_199_254_740_991.0 => Value::from(f as i64),
+            // -0 stays a float, as it does in Python and Rhai.
+            Some(f) if f.fract() == 0.0 && f.abs() <= 9_007_199_254_740_991.0 && !(f == 0.0 && f.is_sign_negative()) => {
+                Value::from(f as i64)
+            }
             _ => Value::Number(n),
         },
         Value::Array(a) => Value::Array(a.into_iter().map(normalize_numbers).collect()),
@@ -149,26 +181,45 @@ pub fn normalize_numbers(v: Value) -> Value {
     }
 }
 
-/// Append-only, size-capped log buffer shared by bridge implementations.
+/// Append-only, size-capped log buffer shared by bridge implementations, with the
+/// runtimes' measure (`log_cost`), so it keeps whatever a runtime captured.
 #[derive(Default)]
 pub struct LogBuf {
     lines: std::cell::RefCell<Vec<String>>,
     bytes: std::cell::Cell<usize>,
 }
 
+/// What one captured output line costs against `MAX_LOG_BYTES`: its JSON-escaped size (the
+/// size it is sent at) plus its escaped newline, so empty lines are not free.
+pub fn log_cost(line: &str) -> usize {
+    escaped_len(line) + 2
+}
+
+/// Room a log keeps for the line that ends it with the marker (`log_line`).
+pub const LOG_RESERVE: usize = CUT_MARK.len() + 2;
+
+/// Charge `line` to a log that has `used` of `MAX_LOG_BYTES`: the line to keep (cut with
+/// the marker if it does not fit) and the new total, or `None` once the log is full. Whole
+/// lines fill the log up to `LOG_RESERVE` short of the cap, so whatever is dropped is
+/// always marked; a line a runtime already cut passes through unchanged.
+pub fn log_line(used: usize, mut line: String) -> Option<(String, usize)> {
+    if used >= MAX_LOG_BYTES {
+        return None;
+    }
+    match used + log_cost(&line) {
+        n if n <= MAX_LOG_BYTES - LOG_RESERVE || (n <= MAX_LOG_BYTES && line.ends_with(CUT_MARK)) => Some((line, n)),
+        _ => {
+            cut_escaped(&mut line, (MAX_LOG_BYTES - used).saturating_sub(2));
+            Some((line, MAX_LOG_BYTES))
+        }
+    }
+}
+
 impl LogBuf {
     pub fn push(&self, line: String) {
-        let used = self.bytes.get();
-        if used >= MAX_LOG_BYTES {
-            return;
-        }
-        let mut lines = self.lines.borrow_mut();
-        if used + line.len() > MAX_LOG_BYTES {
-            lines.push("…[output truncated]".into());
-            self.bytes.set(MAX_LOG_BYTES);
-        } else {
-            self.bytes.set(used + line.len());
-            lines.push(line);
+        if let Some((line, used)) = log_line(self.bytes.get(), line) {
+            self.bytes.set(used);
+            self.lines.borrow_mut().push(line);
         }
     }
     pub fn take(&self) -> Vec<String> {
@@ -211,23 +262,76 @@ pub const TRAP_LINGER_SECONDS: u64 = 360;
 /// lasts longer than `MAX_RUN_SECONDS`, then lingers at most `TRAP_LINGER_SECONDS`.
 pub const STALE_RUN_MS: u64 = (MAX_RUN_SECONDS + TRAP_LINGER_SECONDS) * 1000;
 
-/// Instructions executed so far in this call context (0 off-chain).
+/// Instructions executed so far in this call context. Off-chain, a stand-in that advances by
+/// one at every read (each read is one budget check), so native tests can set a deadline
+/// and see every runtime stop at it.
 pub fn instruction_counter() -> u64 {
     #[cfg(target_arch = "wasm32")]
     return ic_cdk::api::call_context_instruction_counter();
     #[cfg(not(target_arch = "wasm32"))]
-    0
+    TEST_INSTRUCTIONS.with(|c| {
+        c.set(c.get() + 1);
+        c.get()
+    })
 }
 
-/// Truncate to at most `max` bytes on a char boundary, marking the cut.
+#[cfg(not(target_arch = "wasm32"))]
+thread_local!(static TEST_INSTRUCTIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) });
+
+/// The mark left where text was cut.
+pub const CUT_MARK: &str = "…[truncated]";
+
+/// Truncate to at most `max` bytes in all on a char boundary, marking the cut (the mark is
+/// left out when `max` has no room for it).
 pub fn truncate(s: &mut String, max: usize) {
     if s.len() > max {
-        let mut cut = max;
-        while !s.is_char_boundary(cut) {
-            cut -= 1;
+        let keep = if max >= CUT_MARK.len() { max - CUT_MARK.len() } else { max };
+        s.truncate(s.floor_char_boundary(keep));
+        if max >= CUT_MARK.len() {
+            s.push_str(CUT_MARK);
         }
-        s.truncate(cut);
-        s.push_str("…[truncated]");
+    }
+}
+
+/// Bytes `c` takes once JSON-escaped.
+fn escaped_char(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+        c if (c as u32) < 0x20 => 6,
+        c => c.len_utf8(),
+    }
+}
+
+/// Bytes `s` takes once JSON-escaped (control characters become `\u00XX`, six bytes each).
+pub fn escaped_len(s: &str) -> usize {
+    s.chars().map(escaped_char).sum()
+}
+
+/// Length in bytes of the longest prefix of `s` whose escaped form fits in `max`.
+pub fn escaped_prefix(s: &str, max: usize) -> usize {
+    let mut used = 0;
+    for (i, c) in s.char_indices() {
+        used += escaped_char(c);
+        if used > max {
+            return i;
+        }
+    }
+    s.len()
+}
+
+/// Cut `s` so that, with the marker, its escaped form fits in `max`.
+pub fn cut_escaped(s: &mut String, max: usize) {
+    let fits = max >= CUT_MARK.len();
+    s.truncate(escaped_prefix(s, if fits { max - CUT_MARK.len() } else { max }));
+    if fits {
+        s.push_str(CUT_MARK);
+    }
+}
+
+/// Truncate so the escaped form of `s`, marker included, fits in `max`.
+pub fn truncate_escaped(s: &mut String, max: usize) {
+    if escaped_prefix(s, max) < s.len() {
+        cut_escaped(s, max);
     }
 }
 
@@ -296,7 +400,7 @@ mod ic {
     }
 
     /// Block time on-chain; a settable clock in native tests.
-    fn now_ns() -> u64 {
+    pub(super) fn now_ns() -> u64 {
         #[cfg(target_arch = "wasm32")]
         return ic_cdk::api::time();
         #[cfg(not(target_arch = "wasm32"))]
@@ -1045,7 +1149,7 @@ mod ic {
         }
 
         fn principal(&self) -> String {
-            ic_cdk::api::canister_self().to_text()
+            canister_self().to_text()
         }
 
         fn log(&self, line: String) {
@@ -1222,7 +1326,7 @@ mod ic {
             let b = bridge();
             policy::set_limits(Limits { max_calls_per_script: 0, max_instructions: 1, call_timeout_seconds: Some(5), ..Limits::default() });
             assert_eq!(b.recheck(&fx(), Some("m")), Ok(policy::DEFAULT_CALL_TIMEOUT_SECONDS));
-            assert_eq!(b.instruction_deadline(), policy::DEFAULT_MAX_INSTRUCTIONS);
+            assert_eq!(b.instruction_deadline() - b.base_instructions, policy::DEFAULT_MAX_INSTRUCTIONS);
             policy::set_limits(Limits::default());
             policy::remove_allowed(fx());
         }
@@ -1404,6 +1508,67 @@ mod ic {
             reset();
         }
 
+        /// 110: interface TTLs at their boundaries, on the settable clock.
+        #[test]
+        fn interface_ttls_hold_to_the_nanosecond() {
+            let svc = Rc::new(Service::parse(DID).unwrap());
+            DID_CACHE.with(|c| c.borrow_mut().insert(FX.into(), (DID.into(), svc, 5)));
+            TEST_NOW.set(5 + DID_CACHE_TTL_NS);
+            assert!(cache_get(FX, DID_CACHE_TTL_NS).is_some());
+            TEST_NOW.set(5 + DID_CACHE_TTL_NS + 1);
+            assert!(cache_get(FX, DID_CACHE_TTL_NS).is_none());
+            TEST_NOW.set(7);
+            assert!(fetch_failed(FX, "no such method".into(), true).is_err());
+            TEST_NOW.set(7 + DID_FAIL_TTL_NS);
+            assert!(failed_get(FX).is_some());
+            TEST_NOW.set(7 + DID_FAIL_TTL_NS + 1);
+            assert!(failed_get(FX).is_none());
+            reset();
+            DID_CACHE.with(|c| c.borrow_mut().clear());
+            DID_FAILED.with(|c| c.borrow_mut().clear());
+        }
+
+        /// 110: a call through the fake network writes one `Started` entry and lists the
+        /// run as pending until it ends; the run's clock is the test clock.
+        #[test]
+        fn a_sent_call_opens_one_started_entry_and_a_pending_run() {
+            policy::set_allowed(fx(), vec!["*".into()]).unwrap();
+            policy::set_candid_override(fx(), Some(DID.into())).unwrap();
+            net(|_, m| match m {
+                "tick" => Ok(candid::encode_args(()).unwrap()),
+                other => panic!("unexpected {other}"),
+            });
+            TEST_NOW.set(3_000_000_000);
+            let before = policy::audit_len();
+            let b = bridge();
+            assert_eq!(block_on(b.call(FX, "tick", Value::Null)), Ok(Value::Null));
+            assert_eq!(policy::audit_len(), before + 1);
+            let id = b.run_id().unwrap();
+            let entry = policy::audit_run(id, None).remove(0);
+            assert!(matches!(entry.status, AuditStatus::Started), "{:?}", entry.status);
+            assert_eq!(entry.timestamp_ns, 3_000_000_000);
+            assert!(pending_run_ids().contains(&id));
+            assert_eq!(b.principal(), canister_self().to_text(), "no platform read off-chain");
+            drop(b);
+            assert!(!pending_run_ids().contains(&id));
+            policy::set_candid_override(fx(), None).unwrap();
+            reset();
+        }
+
+        /// 134: an over-long method name is refused before anything else.
+        #[test]
+        fn over_long_method_names_are_refused() {
+            let b = bridge();
+            let e = block_on(b.call(FX, &"m".repeat(MAX_METHOD_LEN + 1), Value::Null)).unwrap_err();
+            assert!(e.contains("longer than"), "{e}");
+            policy::set_allowed(fx(), vec!["*".into()]).unwrap();
+            policy::set_candid_override(fx(), Some(DID.into())).unwrap();
+            let e = block_on(b.call(FX, &"m".repeat(MAX_METHOD_LEN), Value::Null)).unwrap_err();
+            assert!(!e.contains("longer than"), "{e}");
+            policy::set_candid_override(fx(), None).unwrap();
+            reset();
+        }
+
         /// 141: a search stops fetching on run-wide refusals only.
         #[test]
         fn search_continues_past_a_removed_canister() {
@@ -1443,11 +1608,20 @@ pub mod mock {
         pub logs: RefCell<Vec<String>>,
         /// Only this canister is "allowlisted".
         pub allowed: &'static str,
+        /// `instruction_deadline` (see `instruction_counter`'s off-chain stand-in).
+        pub deadline: u64,
     }
 
     impl Default for MockBridge {
         fn default() -> Self {
-            Self { calls: RefCell::default(), logs: RefCell::default(), allowed: "ryjl3-tyaaa-aaaaa-aaaba-cai" }
+            Self { calls: RefCell::default(), logs: RefCell::default(), allowed: "ryjl3-tyaaa-aaaaa-aaaba-cai", deadline: u64::MAX }
+        }
+    }
+
+    impl MockBridge {
+        /// A bridge whose instruction budget ends after `checks` more budget checks.
+        pub fn with_budget(checks: u64) -> Self {
+            Self { deadline: instruction_counter() + checks, ..Self::default() }
         }
     }
 
@@ -1471,6 +1645,9 @@ pub mod mock {
         }
         fn log(&self, line: String) {
             self.logs.borrow_mut().push(line);
+        }
+        fn instruction_deadline(&self) -> u64 {
+            self.deadline
         }
     }
 
@@ -1505,6 +1682,66 @@ pub mod mock {
         }
     }
 
+    /// 175: a cut text, marker included, is never longer than asked, in raw or escaped bytes.
+    #[test]
+    fn truncation_stays_within_max() {
+        for text in ["x".repeat(5000), "🦀é".repeat(2000), "\u{1}\"".repeat(3000)] {
+            for max in [3, 14, 15, 300, 512, 4096] {
+                let mut s = text.clone();
+                truncate(&mut s, max);
+                assert!(s.len() <= max, "{max}: {}", s.len());
+                assert_eq!(s.ends_with(CUT_MARK), max >= CUT_MARK.len());
+                let mut s = text.clone();
+                truncate_escaped(&mut s, max);
+                assert!(escaped_len(&s) <= max, "{max}: {}", escaped_len(&s));
+                assert_eq!(s.ends_with(CUT_MARK), max >= CUT_MARK.len());
+            }
+        }
+        let mut s = "short".to_string();
+        truncate(&mut s, 5);
+        truncate_escaped(&mut s, 5);
+        assert_eq!(s, "short");
+    }
+
+    /// 175 / 176: a line that does not fit keeps its prefix (it is not replaced by a marker),
+    /// and lines are charged escaped, newline included.
+    #[test]
+    fn log_buffer_keeps_the_prefix_and_charges_newlines() {
+        let buf = LogBuf::default();
+        buf.push("a".repeat(MAX_LOG_BYTES - 1000));
+        buf.push("b".repeat(5000));
+        buf.push("c".into());
+        let lines = buf.take();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].starts_with('b') && lines[1].ends_with(CUT_MARK), "{}", &lines[1][..10]);
+        assert!(lines.iter().map(|l| log_cost(l)).sum::<usize>() <= MAX_LOG_BYTES);
+        let buf = LogBuf::default();
+        (0..MAX_LOG_BYTES).for_each(|_| buf.push(String::new()));
+        let lines = buf.take();
+        assert_eq!(lines.len(), (MAX_LOG_BYTES - LOG_RESERVE) / 2 + 1, "an empty line costs its escaped newline");
+        assert_eq!(lines.last().unwrap(), CUT_MARK, "what was dropped is marked");
+        assert_eq!(log_cost("\u{1}"), 8);
+    }
+
+    /// 114 / 155 / 156: the value rules every runtime shares.
+    #[test]
+    fn shared_value_rules() {
+        let safe = (1u64 << 53) - 1;
+        let v = big_ints_to_strings(serde_json::json!([safe, -(safe as i64), safe + 1, -(safe as i64) - 1, u64::MAX, 1.5e300, { "k": 1u64 << 60 }]));
+        assert_eq!(v, serde_json::json!([safe, -(safe as i64), "9007199254740992", "-9007199254740992", "18446744073709551615", 1.5e300, { "k": "1152921504606846976" }]));
+        assert_eq!([f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.5].map(float_json), [serde_json::json!("NaN"), "inf".into(), "-inf".into(), 0.5.into()]);
+        assert_eq!(normalize_numbers(serde_json::json!([-0.0, 0.0])), serde_json::json!([-0.0, 0]));
+        let max = crate::candid_bridge::MAX_DEPTH;
+        assert!(container_depth(max - 1).is_ok() && container_depth(max).is_err());
+        // Replies: MAX levels of arrays fit, scalars inside them included; one more does not.
+        let nest = |n: usize, inner: Value| (0..n).fold(inner, |v, _| serde_json::json!([v]));
+        for inner in [serde_json::json!([]), serde_json::json!(1)] {
+            let levels = if inner.is_array() { 1 } else { 0 };
+            assert!(check_value(&nest(max - levels, inner.clone())).is_ok());
+            assert!(check_value(&nest(max + 1 - levels, inner)).is_err());
+        }
+    }
+
     #[test]
     fn value_budget_truncate_normalize_logbuf_and_overrides() {
         // LogBuf cap short-circuits once MAX_LOG_BYTES is reached.
@@ -1513,10 +1750,10 @@ pub mod mock {
         buf.push("overflow".into());
         assert_eq!(buf.take().len(), 1);
 
-        // Multi-byte UTF-8 boundary truncation.
+        // Multi-byte UTF-8 boundary truncation; no room for the marker.
         let mut s = "a🦀🦀".to_string();
         truncate(&mut s, 3);
-        assert_eq!(s, "a…[truncated]");
+        assert_eq!(s, "a");
 
         // ValueBudget node and byte caps.
         let mut vb = ValueBudget::default();

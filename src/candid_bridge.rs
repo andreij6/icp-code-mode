@@ -5,7 +5,7 @@
 //! types, and replies are decoded against its declared return types so record
 //! and variant fields come back with their real names.
 
-use crate::bridge::{MAX_METHOD_LEN, ValueBudget, truncate};
+use crate::bridge::{MAX_METHOD_LEN, ValueBudget, float_json as f64_json, truncate};
 use candid::types::value::{IDLField, VariantValue};
 use candid::types::{Field, FuncMode, Function, Label, Type, TypeInner};
 use candid::{IDLArgs, IDLValue, Int, Nat, Principal, TypeEnv};
@@ -13,7 +13,7 @@ use serde_json::{Map, Number, Value};
 use std::collections::BTreeMap;
 
 /// JSON integers beyond this magnitude are emitted as strings (JS `Number` safety).
-const MAX_SAFE_INT: u64 = (1 << 53) - 1;
+pub const MAX_SAFE_INT: u64 = (1 << 53) - 1;
 /// Candid decoding work budget per reply (see `DecoderConfig::set_decoding_quota`). Candid
 /// charges 50x per byte when decoding to `IDLValue`, so this admits a full 2 MiB reply.
 const DECODING_QUOTA: usize = 50 * (2 << 20) + 5_000_000;
@@ -186,7 +186,12 @@ pub struct ReplyError {
 
 impl Service {
     pub fn parse(did: &str) -> Result<Self, String> {
-        let invalid = |e: String| format!("invalid candid interface: {e}");
+        // The parser's error quotes the offending text, which can be most of the interface.
+        let invalid = |e: String| {
+            let mut m = format!("invalid candid interface: {e}");
+            truncate(&mut m, 300);
+            m
+        };
         check_shape(did).map_err(invalid)?;
         let prog: candid_parser::IDLProg = did.parse().map_err(|e: candid_parser::Error| invalid(e.to_string()))?;
         // check_prog skips imports: refuse them rather than silently miss their types.
@@ -459,7 +464,7 @@ fn finite_or_named<F>(f: F, finite: bool, v: &Value, what: &str) -> Result<F, St
 fn float64(v: &Value) -> Result<f64, String> {
     let f = match v {
         Value::Number(n) => n.as_f64().ok_or("invalid float")?,
-        Value::String(s) => s.parse().map_err(|_| format!("`{s}` is not a valid float"))?,
+        Value::String(s) => s.parse().map_err(|_| format!("`{}` is not a valid float", shown(s)))?,
         _ => return Err(format!("expected float, got {}", kind(v))),
     };
     finite_or_named(f, f.is_finite(), v, "float64")
@@ -474,7 +479,7 @@ fn float32(v: &Value) -> Result<f32, String> {
             // serde_json already rounded a float literal to f64
             _ => n.as_f64().ok_or("invalid float")? as f32,
         },
-        Value::String(s) => s.parse().map_err(|_| format!("`{s}` is not a valid float"))?,
+        Value::String(s) => s.parse().map_err(|_| format!("`{}` is not a valid float", shown(s)))?,
         _ => return Err(format!("expected float, got {}", kind(v))),
     };
     finite_or_named(f, f.is_finite(), v, "float32")
@@ -493,7 +498,7 @@ fn kind(v: &Value) -> &'static str {
 
 fn principal(v: &Value) -> Result<Principal, String> {
     let s = v.as_str().ok_or_else(|| format!("expected principal text, got {}", kind(v)))?;
-    Principal::from_text(s).map_err(|e| format!("invalid principal `{s}`: {e}"))
+    Principal::from_text(s).map_err(|e| format!("invalid principal `{}`: {e}", shown(s)))
 }
 
 /// Convert JSON into a Candid value of type `ty`.
@@ -629,16 +634,6 @@ fn big(s: String) -> Value {
     match mag.parse::<u64>() {
         Ok(m) if m <= MAX_SAFE_INT => Value::Number(s.parse::<i64>().map(Number::from).unwrap_or_else(|_| Number::from(m))),
         _ => Value::String(s),
-    }
-}
-
-fn f64_json(f: f64) -> Value {
-    // Non-finite floats as strings (`float64()` parses them back).
-    match Number::from_f64(f) {
-        Some(n) => Value::Number(n),
-        None if f.is_nan() => Value::String("NaN".into()),
-        None if f > 0.0 => Value::String("inf".into()),
-        None => Value::String("-inf".into()),
     }
 }
 
@@ -822,6 +817,29 @@ mod tests {
         assert!(n.encode_args("f", &json!("9".repeat(MAX_INT_DIGITS + 1))).err().unwrap().contains("digits"));
         let huge = IDLValue::Nat(candid::Nat(candid::Nat::from(1u8).0 << 200_000u32));
         assert!(idl_to_json(&huge, 0, &mut ValueBudget::default()).unwrap_err().contains("bits"));
+    }
+
+    /// 164: errors quote at most a short prefix of script- or target-authored text.
+    #[test]
+    fn errors_quote_only_a_prefix() {
+        let big = "z".repeat(1 << 20);
+        let s = Service::parse("service : { p : (principal) -> (); f : (float64) -> (); v : (variant { a }) -> () }").unwrap();
+        for (m, v) in [("p", json!(big)), ("f", json!(big)), ("v", json!(big)), ("v", json!({ big.clone(): null }))] {
+            let e = s.encode_args(m, &v).err().unwrap();
+            assert!(e.len() < 400, "{m}: {}", e.len());
+        }
+        let e = Service::parse(&format!("service : {{ f : ({}) -> () }}", "Q".repeat(500_000))).err().unwrap();
+        assert!(e.len() <= 300, "{}", e.len());
+    }
+
+    /// 189: one hex string in an array is a single blob argument.
+    #[test]
+    fn a_wrapped_hex_string_is_a_blob_argument() {
+        let s = Service::parse("service : { put : (blob) -> () }").unwrap();
+        let hex = "ab".repeat(250_000);
+        let wrapped = s.encode_args("put", &json!([hex])).unwrap().bytes;
+        assert_eq!(wrapped, s.encode_args("put", &json!(hex)).unwrap().bytes);
+        assert!(wrapped.len() > 250_000);
     }
 
     #[test]
