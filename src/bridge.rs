@@ -534,6 +534,10 @@ mod ic {
                 return Err(e); // failed moments ago: don't send the same messages again
             }
             self.reserve(&p, None)?;
+            // Committed with the outgoing messages: if parsing the reply traps, the rollback
+            // keeps this, so later requests don't send the same messages again.
+            let pending = format!("could not fetch candid for {key} (the fetch did not complete: it trapped, or is still in flight)");
+            DID_FAILED.with(|c| c.borrow_mut().insert(key.clone(), (pending, ic_cdk::api::time())));
             let fetched = self
                 .fetch_did(p)
                 .await
@@ -551,9 +555,10 @@ mod ic {
                 }
                 Err((e, remember)) => {
                     let msg = format!("could not fetch candid for {key} ({e}); a controller can register it with set_candid_override");
-                    if remember {
-                        DID_FAILED.with(|c| c.borrow_mut().insert(key, (msg.clone(), now)));
-                    }
+                    DID_FAILED.with(|c| match remember {
+                        true => c.borrow_mut().insert(key, (msg.clone(), now)),
+                        false => c.borrow_mut().remove(&key),
+                    });
                     Err(msg)
                 }
             }
@@ -587,9 +592,13 @@ mod ic {
                 format!("call {p}.{} failed: {e}{}", method.escape_debug(), if unknown { " (outcome unknown: the call may have executed)" } else { "" })
             })?;
             svc.decode_reply(&enc.func, &reply.into_bytes()).map_err(|e| {
+                let done = "the call executed on the target, but its reply could not be read";
+                if !e.stale {
+                    return format!("{done}: {}", e.msg);
+                }
                 // Most likely the target was upgraded and our copy of its interface is stale.
                 evict_interface(&p);
-                format!("{e}; the cached interface was dropped, so the next call fetches it again")
+                format!("{done}: {}; the cached interface was dropped, so the next call fetches it again", e.msg)
             })
         }
 

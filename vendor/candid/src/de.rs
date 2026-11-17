@@ -1,0 +1,2039 @@
+//! Deserialize Candid binary format to Rust data structures
+
+use super::{
+    error::{Error, Result},
+    types::internal::{
+        elide_large, text_size, type_of, TypeId, MAX_DIAGNOSTIC_LIST_LEN, MAX_DIAGNOSTIC_TYPE_LEN,
+    },
+    types::{Field, Label, SharedLabel, Type, TypeEnv, TypeInner},
+    CandidType,
+};
+#[cfg(feature = "bignum")]
+use super::{Int, Nat};
+use crate::{
+    binary_parser::{Header, Len, PrincipalBytes},
+    types::subtype::{subtype_with_config, Gamma, OptReport},
+};
+use anyhow::{anyhow, Context};
+use binrw::BinRead;
+use byteorder::{LittleEndian, ReadBytesExt};
+use serde::de::{self, Visitor};
+use std::fmt::Write;
+use std::{collections::VecDeque, io::Cursor, mem::replace, rc::Rc};
+
+/// Render a type table for a diagnostic, eliding entries too large to render and
+/// stopping once the table itself reaches its budget.
+///
+/// A table holds as many entries as `max_type_len` allows, so bounding each entry on
+/// its own would still leave the whole rendering growing with their number.
+fn describe_table(env: &TypeEnv) -> String {
+    let mut out = String::new();
+    for (i, (name, ty)) in env.0.iter().enumerate() {
+        if out.len() >= MAX_DIAGNOSTIC_LIST_LEN {
+            let _ = writeln!(&mut out, "... and {} more", env.0.len() - i);
+            break;
+        }
+        let _ = writeln!(&mut out, "type {name} = {}", elide_large(ty));
+    }
+    out
+}
+
+/// Use this struct to deserialize a sequence of Rust values (heterogeneous) from IDL binary message.
+pub struct IDLDeserialize<'de> {
+    de: Deserializer<'de>,
+}
+impl<'de> IDLDeserialize<'de> {
+    /// Create a new deserializer with IDL binary message.
+    pub fn new(bytes: &'de [u8]) -> Result<Self> {
+        let config = DecoderConfig::new();
+        Self::new_with_config(bytes, &config)
+    }
+    /// Create a new deserializer with IDL binary message. The config is used to adjust some parameters in the deserializer.
+    pub fn new_with_config(bytes: &'de [u8], config: &DecoderConfig) -> Result<Self> {
+        let mut de = Deserializer::from_bytes(bytes, config)?;
+        de.add_cost((de.input.position() as usize).saturating_mul(4))?;
+        Ok(IDLDeserialize { de })
+    }
+    /// Deserialize one value from deserializer.
+    pub fn get_value<T>(&mut self) -> Result<T>
+    where
+        T: de::Deserialize<'de> + CandidType,
+    {
+        self.de.is_untyped = false;
+        self.deserialize_with_type(T::ty())
+    }
+    #[cfg_attr(docsrs, doc(cfg(feature = "value")))]
+    #[cfg(feature = "value")]
+    /// Deserialize one value as `IDLValue` from deserializer. Note that `expected_type` should not contain `TypeInner::Knot`.
+    pub fn get_value_with_type(
+        &mut self,
+        env: &TypeEnv,
+        expected_type: &Type,
+    ) -> Result<crate::types::value::IDLValue> {
+        Rc::make_mut(&mut self.de.table).merge(env)?;
+        self.de.is_untyped = true;
+        self.deserialize_with_type(expected_type.clone())
+    }
+    fn deserialize_with_type<T>(&mut self, expected_type: Type) -> Result<T>
+    where
+        T: de::Deserialize<'de> + CandidType,
+    {
+        let expected_type = self
+            .de
+            .table
+            .trace_type_with_depth(&expected_type, &self.de.recursion_depth)?;
+        if self.de.types.is_empty() {
+            if matches!(
+                expected_type.as_ref(),
+                TypeInner::Opt(_) | TypeInner::Reserved | TypeInner::Null
+            ) {
+                self.de.expect_type = expected_type;
+                self.de.wire_type = TypeInner::Null.into();
+                return T::deserialize(&mut self.de);
+            } else if text_size(&expected_type, MAX_DIAGNOSTIC_TYPE_LEN).is_ok() {
+                return Err(Error::msg(format!(
+                    "No more values on the wire, the expected type {expected_type} is not opt, null, or reserved"
+                )));
+            } else {
+                return Err(Error::msg("No more values on the wire"));
+            }
+        }
+
+        let (ind, ty) = Rc::make_mut(&mut self.de.types).pop_front().unwrap();
+        self.de.expect_type = if matches!(expected_type.as_ref(), TypeInner::Unknown) {
+            self.de.is_untyped = true;
+            ty.clone()
+        } else {
+            expected_type.clone()
+        };
+        self.de.wire_type = ty.clone();
+
+        let mut v = T::deserialize(&mut self.de).with_context(|| {
+            if text_size(&ty, MAX_DIAGNOSTIC_TYPE_LEN).is_ok()
+                && text_size(&expected_type, MAX_DIAGNOSTIC_TYPE_LEN).is_ok()
+            {
+                format!("Fail to decode argument {ind} from {ty} to {expected_type}")
+            } else {
+                format!("Fail to decode argument {ind}")
+            }
+        });
+        if self.de.config.full_error_message {
+            v = v.with_context(|| self.de.dump_state());
+        }
+        Ok(v?)
+    }
+    /// Check if we finish deserializing all values.
+    pub fn is_done(&self) -> bool {
+        self.de.types.is_empty()
+    }
+    /// Return error if there are unprocessed bytes in the input.
+    pub fn done(&mut self) -> Result<()> {
+        while !self.is_done() {
+            self.get_value::<crate::Reserved>()?;
+        }
+        let ind = self.de.input.position() as usize;
+        let rest = &self.de.input.get_ref()[ind..];
+        if !rest.is_empty() {
+            if !self.de.config.full_error_message {
+                return Err(Error::msg("Trailing value after finishing deserialization"));
+            } else {
+                return Err(anyhow!(self.de.dump_state()))
+                    .context("Trailing value after finishing deserialization")?;
+            }
+        }
+        Ok(())
+    }
+    /// Return the current DecoderConfig, mainly to extract the remaining quota.
+    pub fn get_config(&self) -> DecoderConfig {
+        self.de.config.clone()
+    }
+}
+
+#[derive(Clone)]
+/// Config the deserialization quota, used to prevent spending too much time in decoding malicious payload.
+pub struct DecoderConfig {
+    pub decoding_quota: Option<usize>,
+    pub skipping_quota: Option<usize>,
+    pub max_type_len: Option<usize>,
+    pub max_header_len: Option<usize>,
+    full_error_message: bool,
+}
+impl DecoderConfig {
+    /// Creates a config with no quota. This allows developers to handle large Candid
+    /// data internally, e.g., persisting states to stable memory.
+    /// When using Candid in canister endpoints, we recommend setting the quota to prevent malicious payload.
+    pub fn new() -> Self {
+        Self {
+            decoding_quota: None,
+            skipping_quota: None,
+            max_type_len: None,
+            max_header_len: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            full_error_message: true,
+            #[cfg(target_arch = "wasm32")]
+            full_error_message: false,
+        }
+    }
+    /// Limit the total amount of work the deserailizer can perform. Deserialization errors out when the limit is reached.
+    /// If your canister endpoint has variable-length data types and expects that the valid data will be small,
+    /// you can set this limit to prevent spending too much time decoding invalid data.
+    ///
+    /// The cost of decoding a message = 4 * the byte length of the header (the byte before the value part) + the cost of decoding each value.
+    ///
+    /// The cost of decoding a value is roughly defined as follows
+    /// (it's not precise because the cost also depends on how Rust data types are defined),
+    /// ```text
+    /// C : <val> -> <primtype> -> nat
+    /// C(n : nat)      = |leb128(n)|
+    /// C(i : int)      = |sleb128(i)|
+    /// C(n : nat<N>)   = N / 8
+    /// C(i : int<N>)   = N / 8
+    /// C(z : float<N>) = N / 8
+    /// C(b : bool)     = 1
+    /// C(t : text)     = 1 + |t|
+    /// C(_ : null)     = 1
+    /// C(_ : reserved) = 1
+    /// C(_ : empty)    = undefined
+    ///
+    /// C : <val> -> <constype> -> nat
+    /// C(null : opt <datatype>)  = 2
+    /// C(?v   : opt <datatype>)  = 2 + C(v : <datatype>)
+    /// C(v^N  : vec <datatype>)  = 2 + 3 * N + sum_i C(v[i] : <datatype>)
+    /// C(kv*  : record {<fieldtype>*})  = 2 + sum_i C(kv : <fieldtype>*[i])
+    /// C(kv   : variant {<fieldtype>*}) = 2 + C(kv : <fieldtype>*[i])
+    ///
+    /// C : (<nat>, <val>) -> <fieldtype> -> nat
+    /// C((k,v) : k:<datatype>) = 7 + |k| + C(v : <datatype>)  // record field
+    /// C((k,v) : k:<datatype>) = 5 + |k| + C(v : <datatype>)  // variant field
+    ///
+    /// C : <val> -> <reftype> -> nat
+    /// C(id(v*)        : service <actortype>) = 2 + C(id(v*) : principal) + |type table|
+    /// C((id(v*),name) : func <functype>)     = 2 + C(id(v*) : principal) + C(name : text) + |type table|
+    /// C(id(v*)        : principal)           = max(30, |v*|)
+    ///
+    /// When a value `v : t` on the wire is skipped, due to being extra arguments, extra fields and mismatched option types,
+    /// we apply a 50x penalty on `C(v : t)` in the decoding cost.
+    /// ```
+    pub fn set_decoding_quota(&mut self, n: usize) -> &mut Self {
+        self.decoding_quota = Some(n);
+        self
+    }
+    /// Limit the amount of work for skipping unneeded data on the wire. This includes extra arguments, extra fields
+    /// and mismatched option values. Decoding values to `IDLValue` is also counted towards this limit.
+    /// For the cost model, please refer to the docs in [`set_decoding_quota`](#method.set_decoding_quota).
+    /// Note that unlike the decoding_quota, we will not apply the 50x penalty for skipped values in this counter.
+    /// When using Candid in canister endpoints, it's strongly encouraged to set this quota to a small value, e.g., 10_000.
+    pub fn set_skipping_quota(&mut self, n: usize) -> &mut Self {
+        self.skipping_quota = Some(n);
+        self
+    }
+    /// Set the max type table size
+    pub fn set_max_type_len(&mut self, n: usize) -> &mut Self {
+        self.max_type_len = Some(n);
+        self
+    }
+    /// Limit the byte length of the type-table header, the part of the message that
+    /// describes the types of the values that follow. Defaults to 64 KiB.
+    ///
+    /// Every element a header declares -- an argument, a record or variant field, a
+    /// function argument or result, a service method -- occupies at least one byte, so
+    /// this bounds each of those counts, and the work the header can demand, before any
+    /// value is read. [`set_max_type_len`](#method.set_max_type_len) separately bounds
+    /// the number of type-table entries.
+    pub fn set_max_header_len(&mut self, n: usize) -> &mut Self {
+        self.max_header_len = Some(n);
+        self
+    }
+    /// When set to false, error message only displays the concrete type when the type is small.
+    /// The error message also doesn't include the decoding states.
+    /// When set to true, error message always shows the full type and decoding states.
+    pub fn set_full_error_message(&mut self, n: bool) -> &mut Self {
+        self.full_error_message = n;
+        self
+    }
+    /// Given the original config, compute the decoding cost
+    pub fn compute_cost(&self, original: &Self) -> Self {
+        let decoding_quota = original
+            .decoding_quota
+            .and_then(|n| Some(n - self.decoding_quota?));
+        let skipping_quota = original
+            .skipping_quota
+            .and_then(|n| Some(n - self.skipping_quota?));
+        Self {
+            decoding_quota,
+            skipping_quota,
+            max_type_len: original.max_type_len,
+            max_header_len: original.max_header_len,
+            full_error_message: original.full_error_message,
+        }
+    }
+}
+impl Default for DecoderConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+macro_rules! assert {
+    ( false ) => {{
+        return Err(Error::msg(format!(
+            "Internal error at {}:{}. Please file a bug.",
+            file!(),
+            line!()
+        )));
+    }};
+    ( $pred:expr ) => {{
+        if !$pred {
+            return Err(Error::msg(format!(
+                "Internal error at {}:{}. Please file a bug.",
+                file!(),
+                line!()
+            )));
+        }
+    }};
+}
+
+macro_rules! check {
+    ( false ) => {{
+        return Err(Error::Subtype(format!(
+            "Type mismatch at {}:{}",
+            file!(),
+            line!()
+        )));
+    }};
+    ($exp:expr, $msg:expr) => {{
+        if !$exp {
+            return Err(Error::Subtype($msg.to_string()));
+        }
+    }};
+}
+
+#[derive(Clone)]
+struct Deserializer<'de> {
+    input: Cursor<&'de [u8]>,
+    table: Rc<TypeEnv>,
+    // The undecoded argument queue. It is only ever mutated at the top level
+    // (`IDLDeserialize::get_value`), never during a value sub-decode, so holding
+    // it behind an `Rc` lets the backtracking snapshot in `recoverable_visit_some`
+    // share it with a refcount bump instead of copying the whole queue.
+    types: Rc<VecDeque<(usize, Type)>>,
+    wire_type: Type,
+    expect_type: Type,
+    // Memo table for subtyping relation
+    gamma: Gamma,
+    // field_name tells deserialize_identifier which field name to process.
+    // This field should always be set by set_field_name function.
+    field_name: Option<SharedLabel>,
+    // Indicates whether to deserialize with IDLValue.
+    // It only affects the field id generation in enum type.
+    is_untyped: bool,
+    config: DecoderConfig,
+    recursion_depth: crate::utils::RecursionDepth,
+    primitive_vec_fast_path: Option<PrimitiveType>,
+    #[cfg(feature = "bignum")]
+    bignum_vec_fast_path: Option<BigNumFastPath>,
+    text_fast_path: bool,
+}
+
+/// Context attached to a header parse failure. Includes the raw input only where the
+/// configuration asks for it or the message is small enough for it to be useful.
+fn header_context(bytes: &[u8], config: &DecoderConfig) -> String {
+    if config.full_error_message || bytes.len() <= 500 {
+        format!("Cannot parse header {}", hex::encode(bytes))
+    } else {
+        "Cannot parse header".to_string()
+    }
+}
+
+impl<'de> Deserializer<'de> {
+    fn from_bytes(bytes: &'de [u8], config: &DecoderConfig) -> Result<Self> {
+        // Parse the header from a bounded prefix, so a header larger than the bound
+        // costs the bound rather than its declared size. The value section is read
+        // from the full input afterwards.
+        let max_header_len = config
+            .max_header_len
+            .unwrap_or(crate::binary_parser::DEFAULT_MAX_HEADER_LEN);
+        let bounded = bytes.len().min(max_header_len);
+        let mut probe = Cursor::new(&bytes[..bounded]);
+        let header = match Header::read_le_args(&mut probe, (config.max_type_len,)) {
+            Ok(header) => header,
+            Err(e) => {
+                // Only a parse that ran out of input inside a truncated prefix is
+                // over the bound; a malformed header keeps its own diagnosis whatever
+                // the size of the message around it.
+                if bounded < bytes.len() && crate::binary_parser::is_truncation(&e) {
+                    // No input dump: it would make rejecting an oversized header
+                    // cost a diagnostic proportional to the message, which is what
+                    // the bound prevents.
+                    return Err(Error::msg(format!(
+                        "Type table header exceeds the limit of {max_header_len} bytes"
+                    )));
+                }
+                return Err(Error::from(e))
+                    .with_context(|| header_context(bytes, config))
+                    .map_err(Error::from);
+            }
+        };
+        let mut reader = Cursor::new(bytes);
+        reader.set_position(probe.position());
+        let (env, types) = header
+            .to_types()
+            .with_context(|| header_context(bytes, config))
+            .map_err(Error::from)?;
+        Ok(Deserializer {
+            input: reader,
+            table: env.into(),
+            types: Rc::new(types.into_iter().enumerate().collect()),
+            wire_type: TypeInner::Unknown.into(),
+            expect_type: TypeInner::Unknown.into(),
+            gamma: Gamma::default(),
+            field_name: None,
+            is_untyped: false,
+            config: config.clone(),
+            recursion_depth: crate::utils::RecursionDepth::new(),
+            primitive_vec_fast_path: None,
+            #[cfg(feature = "bignum")]
+            bignum_vec_fast_path: None,
+            text_fast_path: false,
+        })
+    }
+    fn dump_state(&self) -> String {
+        let hex = hex::encode(self.input.get_ref());
+        let pos = self.input.position() as usize * 2;
+        let (before, after) = hex.split_at(pos);
+        let mut res = format!("input: {before}_{after}\n");
+        if !self.table.0.is_empty() {
+            write!(&mut res, "table: {}", describe_table(&self.table)).unwrap();
+        }
+        write!(
+            &mut res,
+            "wire_type: {}, expect_type: {}",
+            elide_large(&self.wire_type),
+            elide_large(&self.expect_type)
+        )
+        .unwrap();
+        if let Some(field) = &self.field_name {
+            write!(&mut res, ", field_name: {field:?}").unwrap();
+        }
+        res
+    }
+    #[inline]
+    fn read_leb_u64(&mut self) -> Result<u64> {
+        self.try_read_leb_u64()?
+            .ok_or_else(|| Error::msg("LEB128 overflow"))
+    }
+    /// Returns `Ok(None)` on overflow (value may not fit in u64), `Err` on I/O error (e.g. EOF).
+    /// This lets callers fall through to a bignum path on overflow without swallowing real errors.
+    ///
+    /// The fast path covers up to 9 LEB128 bytes (values that fit in 63 bits, i.e. < 2^63).
+    /// Larger values bail to the bignum path, which keeps this hot loop simple — values needing
+    /// the 10th byte may or may not fit in u64, and the boundary check would just slow it down.
+    #[inline]
+    fn try_read_leb_u64(&mut self) -> Result<Option<u64>> {
+        let slice = self.input.get_ref();
+        let mut pos = self.input.position() as usize;
+        let end = slice.len();
+        let mut result: u64 = 0;
+        let mut shift: u32 = 0;
+        loop {
+            if pos >= end {
+                return Err(Error::msg("unexpected end of LEB128"));
+            }
+            let byte = slice[pos];
+            pos += 1;
+            result |= ((byte & 0x7f) as u64) << shift;
+            if byte & 0x80 == 0 {
+                self.input.set_position(pos as u64);
+                return Ok(Some(result));
+            }
+            shift += 7;
+            if shift >= 63 {
+                return Ok(None);
+            }
+        }
+    }
+    /// Returns `Ok(None)` on overflow (value may not fit in i64), `Err` on I/O error (e.g. EOF).
+    /// This lets callers fall through to a bignum path on overflow without swallowing real errors.
+    ///
+    /// The fast path covers up to 9 LEB128 bytes (values in roughly -2^62 .. 2^62). Larger
+    /// values bail to the bignum path, keeping this hot loop simple.
+    #[inline]
+    fn try_read_leb_i64(&mut self) -> Result<Option<i64>> {
+        let slice = self.input.get_ref();
+        let mut pos = self.input.position() as usize;
+        let end = slice.len();
+        let mut result: i64 = 0;
+        let mut shift: u32 = 0;
+        let mut byte;
+        loop {
+            if pos >= end {
+                return Err(Error::msg("unexpected end of LEB128"));
+            }
+            byte = slice[pos];
+            pos += 1;
+            result |= ((byte & 0x7f) as i64) << shift;
+            shift += 7;
+            if byte & 0x80 == 0 {
+                break;
+            }
+            if shift >= 63 {
+                return Ok(None);
+            }
+        }
+        if byte & 0x40 != 0 {
+            result |= !0i64 << shift;
+        }
+        self.input.set_position(pos as u64);
+        Ok(Some(result))
+    }
+    #[inline]
+    fn read_len(&mut self) -> Result<usize> {
+        let val = self.read_leb_u64()?;
+        usize::try_from(val).map_err(|_| Error::msg("length out of usize range"))
+    }
+    #[inline]
+    fn read_bool_val(&mut self) -> Result<bool> {
+        let byte = self.input.read_u8()?;
+        match byte {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(Error::msg("Expect 00 or 01")),
+        }
+    }
+    #[inline]
+    fn borrow_bytes(&mut self, len: usize) -> Result<&'de [u8]> {
+        let pos = self.input.position() as usize;
+        let slice = self.input.get_ref();
+        if len > slice.len() || pos + len > slice.len() {
+            return Err(Error::msg(format!("Cannot read {len} bytes")));
+        }
+        let end = pos + len;
+        let res = &slice[pos..end];
+        self.input.set_position(end as u64);
+        Ok(res)
+    }
+    fn check_subtype(&mut self) -> Result<()> {
+        self.add_cost(self.table.0.len())?;
+        subtype_with_config(
+            OptReport::Silence,
+            &mut self.gamma,
+            &self.table,
+            &self.wire_type,
+            &self.expect_type,
+        )
+        .with_context(|| {
+            if text_size(&self.wire_type, MAX_DIAGNOSTIC_TYPE_LEN).is_ok()
+                && text_size(&self.expect_type, MAX_DIAGNOSTIC_TYPE_LEN).is_ok()
+            {
+                format!(
+                    "{} is not a subtype of {}",
+                    self.wire_type, self.expect_type,
+                )
+            } else {
+                "subtype mismatch".to_string()
+            }
+        })
+        .map_err(Error::subtype)?;
+        Ok(())
+    }
+    #[inline]
+    fn unroll_type(&mut self) -> Result<()> {
+        if matches!(
+            self.expect_type.as_ref(),
+            TypeInner::Var(_) | TypeInner::Knot(_)
+        ) {
+            self.add_cost(1)?;
+            self.expect_type = self
+                .table
+                .trace_type_with_depth(&self.expect_type, &self.recursion_depth)?;
+        }
+        if matches!(
+            self.wire_type.as_ref(),
+            TypeInner::Var(_) | TypeInner::Knot(_)
+        ) {
+            self.add_cost(1)?;
+            self.wire_type = self
+                .table
+                .trace_type_with_depth(&self.wire_type, &self.recursion_depth)?;
+        }
+        Ok(())
+    }
+    #[inline]
+    fn add_cost(&mut self, cost: usize) -> Result<()> {
+        if let Some(n) = self.config.decoding_quota {
+            let cost = if self.is_untyped {
+                cost.saturating_mul(50)
+            } else {
+                cost
+            };
+            if n < cost {
+                return Err(Error::msg("Decoding cost exceeds the limit"));
+            }
+            self.config.decoding_quota = Some(n - cost);
+        }
+        if self.is_untyped {
+            if let Some(n) = self.config.skipping_quota {
+                if n < cost {
+                    return Err(Error::msg("Skipping cost exceeds the limit"));
+                }
+                self.config.skipping_quota = Some(n - cost);
+            }
+        }
+        Ok(())
+    }
+    // Should always call set_field_name to set the field_name. After deserialize_identifier
+    // processed the field_name, field_name will be reset to None.
+    fn set_field_name(&mut self, field: SharedLabel) {
+        if self.field_name.is_some() {
+            unreachable!();
+        }
+        self.field_name = Some(field);
+    }
+    // Customize deserailization methods
+    // Several deserialize functions will call visit_byte_buf.
+    // We reserve the first byte to be a tag to distinguish between different callers:
+    // int(0), nat(1), principal(2), reserved(3), service(4), function(5), blob(6)
+    // This is necessary for deserializing IDLValue because
+    // it has only one visitor and we need a way to know who called the visitor.
+    #[cfg_attr(docsrs, doc(cfg(feature = "bignum")))]
+    #[cfg(feature = "bignum")]
+    fn deserialize_int<'a, V>(&'a mut self, visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        if self.bignum_vec_fast_path.is_none() {
+            self.unroll_type()?;
+            assert!(*self.expect_type == TypeInner::Int);
+        }
+        if !self.is_untyped {
+            let is_nat = matches!(self.wire_type.as_ref(), TypeInner::Nat);
+            let is_int = matches!(self.wire_type.as_ref(), TypeInner::Int);
+            if is_int {
+                let pos = self.input.position();
+                match self.try_read_leb_i64()? {
+                    Some(value) => {
+                        self.add_cost((self.input.position() - pos) as usize)?;
+                        return visitor.visit_i64(value);
+                    }
+                    None => {
+                        self.input.set_position(pos);
+                    }
+                }
+            } else if is_nat {
+                let pos = self.input.position();
+                match self.try_read_leb_u64()? {
+                    Some(value) => {
+                        self.add_cost((self.input.position() - pos) as usize)?;
+                        return visitor.visit_u64(value);
+                    }
+                    None => {
+                        self.input.set_position(pos);
+                    }
+                }
+            } else {
+                return Err(Error::subtype(format!(
+                    "{} cannot be deserialized to int",
+                    elide_large(&self.wire_type)
+                )));
+            }
+        }
+        let bignum_pos = self.input.position();
+        let mut bytes = vec![0u8];
+        let int = match self.wire_type.as_ref() {
+            TypeInner::Int => Int::decode(&mut self.input).map_err(Error::msg)?,
+            TypeInner::Nat => Int(Nat::decode(&mut self.input).map_err(Error::msg)?.0.into()),
+            _ => {
+                return Err(Error::subtype(format!(
+                    "{} cannot be deserialized to int",
+                    elide_large(&self.wire_type)
+                )))
+            }
+        };
+        self.add_cost((self.input.position() - bignum_pos) as usize)?;
+        bytes.extend_from_slice(&int.0.to_signed_bytes_le());
+        visitor.visit_byte_buf(bytes)
+    }
+    #[cfg_attr(docsrs, doc(cfg(feature = "bignum")))]
+    #[cfg(feature = "bignum")]
+    fn deserialize_nat<'a, V>(&'a mut self, visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        if self.bignum_vec_fast_path.is_none() {
+            self.unroll_type()?;
+            check!(
+                *self.expect_type == TypeInner::Nat && *self.wire_type == TypeInner::Nat,
+                "nat"
+            );
+        }
+        if !self.is_untyped {
+            let pos = self.input.position();
+            match self.try_read_leb_u64()? {
+                Some(value) => {
+                    self.add_cost((self.input.position() - pos) as usize)?;
+                    return visitor.visit_u64(value);
+                }
+                None => {
+                    self.input.set_position(pos);
+                }
+            }
+        }
+        let pos = self.input.position();
+        let mut bytes = vec![1u8];
+        let nat = Nat::decode(&mut self.input).map_err(Error::msg)?;
+        self.add_cost((self.input.position() - pos) as usize)?;
+        bytes.extend_from_slice(&nat.0.to_bytes_le());
+        visitor.visit_byte_buf(bytes)
+    }
+    fn deserialize_principal<'a, V>(&'a mut self, visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        self.unroll_type()?;
+        // Dispatched only when the expected type is `principal`. Accept exactly
+        // the two wire types that share the `PrincipalBytes` encoding: `principal`
+        // (reflexive) and `service <actortype>` (spec: `service <: principal`), so
+        // a service reference decodes as its principal. We match the wire type
+        // directly rather than calling `check_subtype()`: the general subtype
+        // relation also admits `empty` (bottom) `<: principal`, which would let a
+        // payload declare wire type `empty` yet be decoded as a principal from
+        // arbitrary trailing bytes. Matching also avoids the subtype-check
+        // overhead on this common decoding path.
+        check!(
+            matches!(
+                self.wire_type.as_ref(),
+                TypeInner::Principal | TypeInner::Service(_)
+            ),
+            "principal"
+        );
+        let mut bytes = vec![2u8];
+        let id = PrincipalBytes::read_le(&mut self.input)?;
+        self.add_cost(std::cmp::max(30, id.len as usize))?;
+        bytes.extend_from_slice(&id.inner);
+        visitor.visit_byte_buf(bytes)
+    }
+    fn deserialize_reserved<'a, V>(&'a mut self, visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        self.add_cost(1)?;
+        let bytes = vec![3u8];
+        visitor.visit_byte_buf(bytes)
+    }
+    fn deserialize_service<'a, V>(&'a mut self, visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        self.unroll_type()?;
+        self.check_subtype()?;
+        let mut bytes = vec![4u8];
+        let id = PrincipalBytes::read_le(&mut self.input)?;
+        self.add_cost(std::cmp::max(30, id.len as usize))?;
+        bytes.extend_from_slice(&id.inner);
+        visitor.visit_byte_buf(bytes)
+    }
+    fn deserialize_function<'a, V>(&'a mut self, visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        self.unroll_type()?;
+        self.check_subtype()?;
+        if !self.read_bool_val()? {
+            return Err(Error::msg("Opaque reference not supported"));
+        }
+        let mut bytes = vec![5u8];
+        let id = PrincipalBytes::read_le(&mut self.input)?;
+        let len = self.read_len()?;
+        let meth = self.borrow_bytes(len)?;
+        self.add_cost(
+            std::cmp::max(30, id.len as usize)
+                .saturating_add(len)
+                .saturating_add(2),
+        )?;
+        // TODO find a better way
+        leb128::write::unsigned(&mut bytes, len as u64)?;
+        bytes.extend_from_slice(meth);
+        bytes.extend_from_slice(&id.inner);
+        visitor.visit_byte_buf(bytes)
+    }
+    fn deserialize_blob<'a, V>(&'a mut self, visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        self.unroll_type()?;
+        check!(
+            self.expect_type.is_blob(&self.table) && self.wire_type.is_blob(&self.table),
+            "blob"
+        );
+        let len = self.read_len()?;
+        self.add_cost(len.saturating_add(1))?;
+        let blob = self.borrow_bytes(len)?;
+        let mut bytes = Vec::with_capacity(len + 1);
+        bytes.push(6u8);
+        bytes.extend_from_slice(blob);
+        visitor.visit_byte_buf(bytes)
+    }
+    fn deserialize_empty<'a, V>(&'a mut self, _visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        Err(if *self.wire_type == TypeInner::Empty {
+            Error::msg("Cannot decode empty type")
+        } else {
+            Error::subtype("Cannot decode empty type")
+        })
+    }
+    fn deserialize_future<'a, V>(&'a mut self, visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        let len = self.read_len()? as u64;
+        self.add_cost((len as usize).saturating_add(1))?;
+        self.read_len()?;
+        let slice_len = self.input.get_ref().len() as u64;
+        let pos = self.input.position();
+        if len > slice_len || pos + len > slice_len {
+            return Err(Error::msg(format!("Cannot read {len} bytes")));
+        }
+        self.input.set_position(pos + len);
+        visitor.visit_unit()
+    }
+    fn recoverable_visit_some<'a, V>(&'a mut self, visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        use de::Deserializer;
+        let tid = type_of(&visitor);
+        if tid != TypeId::of::<de::IgnoredAny>() // derive Copy
+        // OptionVisitor doesn't derive Copy, but has only PhantomData.
+        // OptionVisitor is private and we cannot get TypeId of OptionVisitor<T>,
+        // we also cannot downcast V to concrete type, because of 'de
+        // The only option left seems to be type_name, but it is not guaranteed to be stable, so there is risk here.
+            && !tid.name.starts_with("serde::de::impls::OptionVisitor<")
+            // serde v1.0.220 refactored the module path
+            // This confirms the assertion above that this is not stable.
+            && !tid.name.starts_with("serde_core::de::impls::OptionVisitor<")
+        {
+            #[cfg(feature = "value")]
+            if tid != TypeId::of::<crate::types::value::IDLValueVisitor>() {
+                // derive Copy
+                panic!("Not a valid visitor: {tid:?}");
+            }
+            #[cfg(not(feature = "value"))]
+            panic!("Not a valid visitor: {tid:?}");
+        }
+        // This is safe, because the visitor either impl Copy or is zero sized
+        let v = unsafe { std::ptr::read(&visitor) };
+        // icp-code-mode patch: the snapshot copies the subtype memo, so charge for its size.
+        // Upstream charged nothing, and a reply of many `opt` values against a large
+        // interface cost far more than the quota suggested.
+        self.add_cost(self.gamma.len())?;
+        let self_clone = self.clone();
+        match v.visit_some(&mut *self) {
+            Ok(v) => Ok(v),
+            Err(Error::Subtype(_)) => {
+                *self = Self {
+                    // Remember the backtracking cost
+                    config: self.config.clone(),
+                    ..self_clone
+                };
+                self.add_cost(10)?;
+                self.deserialize_ignored_any(serde::de::IgnoredAny)?;
+                visitor.visit_none()
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum PrimitiveType {
+    Bool,
+    Int8,
+    Int16,
+    Int32,
+    Int64,
+    Nat8,
+    Nat16,
+    Nat32,
+    Nat64,
+    Float32,
+    Float64,
+}
+
+fn primitive_byte_cost(p: PrimitiveType) -> usize {
+    match p {
+        PrimitiveType::Bool | PrimitiveType::Int8 | PrimitiveType::Nat8 => 1,
+        PrimitiveType::Int16 | PrimitiveType::Nat16 => 2,
+        PrimitiveType::Int32 | PrimitiveType::Nat32 | PrimitiveType::Float32 => 4,
+        PrimitiveType::Int64 | PrimitiveType::Nat64 | PrimitiveType::Float64 => 8,
+    }
+}
+
+#[cfg(feature = "bignum")]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum BigNumFastPath {
+    Nat,
+    Int,
+    NatAsInt,
+}
+
+fn exact_primitive_type(expect: &Type, wire: &Type) -> Option<PrimitiveType> {
+    match (expect.as_ref(), wire.as_ref()) {
+        (TypeInner::Bool, TypeInner::Bool) => Some(PrimitiveType::Bool),
+        (TypeInner::Int8, TypeInner::Int8) => Some(PrimitiveType::Int8),
+        (TypeInner::Int16, TypeInner::Int16) => Some(PrimitiveType::Int16),
+        (TypeInner::Int32, TypeInner::Int32) => Some(PrimitiveType::Int32),
+        (TypeInner::Int64, TypeInner::Int64) => Some(PrimitiveType::Int64),
+        (TypeInner::Nat8, TypeInner::Nat8) => Some(PrimitiveType::Nat8),
+        (TypeInner::Nat16, TypeInner::Nat16) => Some(PrimitiveType::Nat16),
+        (TypeInner::Nat32, TypeInner::Nat32) => Some(PrimitiveType::Nat32),
+        (TypeInner::Nat64, TypeInner::Nat64) => Some(PrimitiveType::Nat64),
+        (TypeInner::Float32, TypeInner::Float32) => Some(PrimitiveType::Float32),
+        (TypeInner::Float64, TypeInner::Float64) => Some(PrimitiveType::Float64),
+        _ => None,
+    }
+}
+
+macro_rules! primitive_impl {
+    ($ty:ident, $type:expr, $fast:expr, $cost:literal, $($value:tt)*) => {
+        paste::item! {
+            fn [<deserialize_ $ty>]<V>(self, visitor: V) -> Result<V::Value>
+            where V: Visitor<'de> {
+                if self.primitive_vec_fast_path == Some($fast) {
+                    let val = self.input.$($value)*().map_err(|_| Error::msg(format!("Cannot read {} value", stringify!($type))))?;
+                    return visitor.[<visit_ $ty>](val);
+                }
+                self.unroll_type()?;
+                check!(*self.expect_type == $type && *self.wire_type == $type, stringify!($type));
+                self.add_cost($cost)?;
+                let val = self.input.$($value)*().map_err(|_| Error::msg(format!("Cannot read {} value", stringify!($type))))?;
+                visitor.[<visit_ $ty>](val)
+            }
+        }
+    };
+}
+
+impl<'de> de::Deserializer<'de> for &mut Deserializer<'de> {
+    type Error = Error;
+    fn deserialize_any<V>(self, visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        if self.field_name.is_some() {
+            return self.deserialize_identifier(visitor);
+        }
+        #[cfg(feature = "bignum")]
+        if let Some(fast) = self.bignum_vec_fast_path {
+            return match fast {
+                BigNumFastPath::Nat => self.deserialize_nat(visitor),
+                BigNumFastPath::Int | BigNumFastPath::NatAsInt => self.deserialize_int(visitor),
+            };
+        }
+        self.unroll_type()?;
+        match self.expect_type.as_ref() {
+            #[cfg(feature = "bignum")]
+            TypeInner::Int => self.deserialize_int(visitor),
+            #[cfg(not(feature = "bignum"))]
+            TypeInner::Int => self.deserialize_i128(visitor),
+            #[cfg(feature = "bignum")]
+            TypeInner::Nat => self.deserialize_nat(visitor),
+            #[cfg(not(feature = "bignum"))]
+            TypeInner::Nat => self.deserialize_u128(visitor),
+            TypeInner::Nat8 => self.deserialize_u8(visitor),
+            TypeInner::Nat16 => self.deserialize_u16(visitor),
+            TypeInner::Nat32 => self.deserialize_u32(visitor),
+            TypeInner::Nat64 => self.deserialize_u64(visitor),
+            TypeInner::Int8 => self.deserialize_i8(visitor),
+            TypeInner::Int16 => self.deserialize_i16(visitor),
+            TypeInner::Int32 => self.deserialize_i32(visitor),
+            TypeInner::Int64 => self.deserialize_i64(visitor),
+            TypeInner::Float32 => self.deserialize_f32(visitor),
+            TypeInner::Float64 => self.deserialize_f64(visitor),
+            TypeInner::Bool => self.deserialize_bool(visitor),
+            TypeInner::Text => self.deserialize_string(visitor),
+            TypeInner::Null => self.deserialize_unit(visitor),
+            TypeInner::Reserved => {
+                if self.wire_type.as_ref() != &TypeInner::Reserved {
+                    self.deserialize_ignored_any(serde::de::IgnoredAny)?;
+                }
+                self.deserialize_reserved(visitor)
+            }
+            TypeInner::Empty => self.deserialize_empty(visitor),
+            TypeInner::Principal => self.deserialize_principal(visitor),
+            // construct types
+            TypeInner::Opt(_) => self.deserialize_option(visitor),
+            // This is an optimization for blob, mostly likely used by IDLValue, but it won't help the native Vec<u8>
+            TypeInner::Vec(_) if self.expect_type.is_blob(&self.table) => {
+                self.deserialize_blob(visitor)
+            }
+            TypeInner::Vec(_) => self.deserialize_seq(visitor),
+            TypeInner::Record(_) => self.deserialize_struct("_", &[], visitor),
+            TypeInner::Variant(_) => self.deserialize_enum("_", &[], visitor),
+            TypeInner::Service(_) => self.deserialize_service(visitor),
+            TypeInner::Func(_) => self.deserialize_function(visitor),
+            TypeInner::Future => self.deserialize_future(visitor),
+            _ => assert!(false),
+        }
+    }
+    fn deserialize_ignored_any<V>(self, visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        let is_untyped = replace(&mut self.is_untyped, true);
+        self.expect_type = self.wire_type.clone();
+        let v = self.deserialize_any(visitor);
+        self.is_untyped = is_untyped;
+        v
+    }
+
+    primitive_impl!(i8, TypeInner::Int8, PrimitiveType::Int8, 1, read_i8);
+    primitive_impl!(
+        i16,
+        TypeInner::Int16,
+        PrimitiveType::Int16,
+        2,
+        read_i16::<LittleEndian>
+    );
+    primitive_impl!(
+        i32,
+        TypeInner::Int32,
+        PrimitiveType::Int32,
+        4,
+        read_i32::<LittleEndian>
+    );
+    primitive_impl!(
+        i64,
+        TypeInner::Int64,
+        PrimitiveType::Int64,
+        8,
+        read_i64::<LittleEndian>
+    );
+    primitive_impl!(u8, TypeInner::Nat8, PrimitiveType::Nat8, 1, read_u8);
+    primitive_impl!(
+        u16,
+        TypeInner::Nat16,
+        PrimitiveType::Nat16,
+        2,
+        read_u16::<LittleEndian>
+    );
+    primitive_impl!(
+        u32,
+        TypeInner::Nat32,
+        PrimitiveType::Nat32,
+        4,
+        read_u32::<LittleEndian>
+    );
+    primitive_impl!(
+        u64,
+        TypeInner::Nat64,
+        PrimitiveType::Nat64,
+        8,
+        read_u64::<LittleEndian>
+    );
+    primitive_impl!(
+        f32,
+        TypeInner::Float32,
+        PrimitiveType::Float32,
+        4,
+        read_f32::<LittleEndian>
+    );
+    primitive_impl!(
+        f64,
+        TypeInner::Float64,
+        PrimitiveType::Float64,
+        8,
+        read_f64::<LittleEndian>
+    );
+
+    fn is_human_readable(&self) -> bool {
+        false
+    }
+    fn deserialize_i128<V>(self, visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        use crate::types::leb128::{decode_int, decode_nat};
+        self.unroll_type()?;
+        assert!(*self.expect_type == TypeInner::Int);
+        self.add_cost(16)?;
+        let value: i128 = match self.wire_type.as_ref() {
+            TypeInner::Int => decode_int(&mut self.input)?,
+            TypeInner::Nat => i128::try_from(decode_nat(&mut self.input)?)
+                .map_err(|_| Error::msg("Cannot convert nat to i128"))?,
+            _ => {
+                return Err(Error::subtype(format!(
+                    "{} cannot be deserialized to int",
+                    elide_large(&self.wire_type)
+                )))
+            }
+        };
+        visitor.visit_i128(value)
+    }
+    fn deserialize_u128<V>(self, visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        self.unroll_type()?;
+        check!(
+            *self.expect_type == TypeInner::Nat && *self.wire_type == TypeInner::Nat,
+            "nat"
+        );
+        self.add_cost(16)?;
+        let value = crate::types::leb128::decode_nat(&mut self.input)?;
+        visitor.visit_u128(value)
+    }
+    fn deserialize_unit<V>(self, visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        self.unroll_type()?;
+        check!(
+            *self.expect_type == TypeInner::Null && matches!(*self.wire_type, TypeInner::Null),
+            "unit"
+        );
+        self.add_cost(1)?;
+        visitor.visit_unit()
+    }
+    // Bool is handled separately from `primitive_impl!` because its wire encoding
+    // uses `BoolValue::read` rather than a plain numeric read.
+    fn deserialize_bool<V>(self, visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        if self.primitive_vec_fast_path == Some(PrimitiveType::Bool) {
+            let val = self.read_bool_val()?;
+            return visitor.visit_bool(val);
+        }
+        self.unroll_type()?;
+        check!(
+            *self.expect_type == TypeInner::Bool && *self.wire_type == TypeInner::Bool,
+            "bool"
+        );
+        self.add_cost(1)?;
+        let val = self.read_bool_val()?;
+        visitor.visit_bool(val)
+    }
+    fn deserialize_string<V>(self, visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        self.deserialize_str(visitor)
+    }
+    fn deserialize_str<V>(self, visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        if !self.text_fast_path {
+            self.unroll_type()?;
+            check!(
+                *self.expect_type == TypeInner::Text && *self.wire_type == TypeInner::Text,
+                "text"
+            );
+        }
+        let len = self.read_len()?;
+        self.add_cost(len.saturating_add(1))?;
+        let slice = self.borrow_bytes(len)?;
+        let value: &str = std::str::from_utf8(slice).map_err(Error::msg)?;
+        visitor.visit_borrowed_str(value)
+    }
+    fn deserialize_unit_struct<V>(self, _name: &'static str, visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        self.add_cost(1)?;
+        self.deserialize_unit(visitor)
+    }
+    fn deserialize_newtype_struct<V>(self, _name: &'static str, visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        self.add_cost(1)?;
+        visitor.visit_newtype_struct(self)
+    }
+    fn deserialize_option<V>(self, visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        self.unroll_type()?;
+        self.add_cost(1)?;
+        match (self.wire_type.as_ref(), self.expect_type.as_ref()) {
+            (TypeInner::Null | TypeInner::Reserved, TypeInner::Opt(_)) => visitor.visit_none(),
+            (TypeInner::Opt(t1), TypeInner::Opt(t2)) => {
+                self.wire_type = t1.clone();
+                self.expect_type = t2.clone();
+                if self.read_bool_val()? {
+                    let _guard = self.recursion_depth.guard()?;
+                    self.recoverable_visit_some(visitor)
+                } else {
+                    visitor.visit_none()
+                }
+            }
+            (_, TypeInner::Opt(t2)) => {
+                self.expect_type = self
+                    .table
+                    .trace_type_with_depth(t2, &self.recursion_depth)?;
+                let _guard = self.recursion_depth.guard()?;
+                self.recoverable_visit_some(visitor)
+            }
+            (_, _) => check!(false),
+        }
+    }
+    fn deserialize_seq<V>(self, visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        let _guard = self.recursion_depth.guard()?;
+        self.unroll_type()?;
+        self.add_cost(1)?;
+        match (self.expect_type.as_ref(), self.wire_type.as_ref()) {
+            (TypeInner::Vec(e), TypeInner::Vec(w)) => {
+                let expect = e.clone();
+                let wire = self.table.trace_type_with_depth(w, &self.recursion_depth)?;
+                let len = self.read_len()?;
+                let exact_primitive = exact_primitive_type(&expect, &wire);
+                if let Some(prim) = exact_primitive {
+                    let per_element_cost = 3 + primitive_byte_cost(prim);
+                    self.add_cost(
+                        len.checked_mul(per_element_cost)
+                            .ok_or_else(|| Error::msg("Vec length overflow"))?,
+                    )?;
+
+                    #[cfg(target_endian = "little")]
+                    {
+                        let byte_size = primitive_byte_cost(prim);
+                        let total_bytes = len
+                            .checked_mul(byte_size)
+                            .ok_or_else(|| Error::msg("Vec byte length overflow"))?;
+                        let pos = self.input.position() as usize;
+                        let slice = self.input.get_ref();
+                        if pos + total_bytes > slice.len() {
+                            return Err(Error::msg(format!(
+                                "Not enough bytes for primitive vec: need {total_bytes}, have {}",
+                                slice.len() - pos
+                            )));
+                        }
+                        let data = &slice[pos..pos + total_bytes];
+                        let mut access = PrimitiveVecAccess {
+                            data,
+                            offset: 0,
+                            remaining: len,
+                            element_size: byte_size,
+                            prim,
+                        };
+                        let result = visitor.visit_seq(&mut access)?;
+                        // A visitor that stops early (e.g. `[u8; N]`) would leave
+                        // elements unread and misalign everything after this vec.
+                        check_vec_consumed(access.remaining)?;
+                        self.input.set_position((pos + total_bytes) as u64);
+                        return Ok(result);
+                    }
+
+                    #[cfg(not(target_endian = "little"))]
+                    {
+                        self.primitive_vec_fast_path = exact_primitive;
+                    }
+                }
+                #[cfg(feature = "bignum")]
+                let bignum_fast = if exact_primitive.is_none() {
+                    match (expect.as_ref(), wire.as_ref()) {
+                        (TypeInner::Nat, TypeInner::Nat) => Some(BigNumFastPath::Nat),
+                        (TypeInner::Int, TypeInner::Int) => Some(BigNumFastPath::Int),
+                        (TypeInner::Int, TypeInner::Nat) => Some(BigNumFastPath::NatAsInt),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                #[cfg(feature = "bignum")]
+                if let Some(fast) = bignum_fast {
+                    self.add_cost(
+                        len.checked_mul(3)
+                            .ok_or_else(|| Error::msg("Vec length overflow"))?,
+                    )?;
+                    self.bignum_vec_fast_path = Some(fast);
+                    self.expect_type = expect.clone();
+                    self.wire_type = wire.clone();
+                }
+                let mut compound = Compound::new(
+                    self,
+                    Style::Vector {
+                        len,
+                        expect,
+                        wire,
+                        exact_primitive,
+                    },
+                );
+                let result = visitor.visit_seq(&mut compound)?;
+                compound.finish_seq()?;
+                Ok(result)
+            }
+            (TypeInner::Record(_), TypeInner::Record(_)) => {
+                let expect = self.expect_type.clone();
+                let wire = self.wire_type.clone();
+                check!(self.expect_type.is_tuple(), "seq_tuple");
+                if !self.wire_type.is_tuple() {
+                    return Err(Error::subtype(format!(
+                        "{} is not a tuple type",
+                        elide_large(&self.wire_type)
+                    )));
+                }
+                let mut compound = Compound::new(
+                    self,
+                    Style::Struct {
+                        expect,
+                        wire,
+                        expect_idx: 0,
+                        wire_idx: 0,
+                    },
+                );
+                let value = visitor.visit_seq(&mut compound)?;
+                compound.finish_seq()?;
+                Ok(value)
+            }
+            _ => check!(false),
+        }
+    }
+    fn deserialize_byte_buf<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        self.unroll_type()?;
+        check!(
+            *self.expect_type == TypeInner::Vec(TypeInner::Nat8.into())
+                && *self.wire_type == TypeInner::Vec(TypeInner::Nat8.into()),
+            "vec nat8"
+        );
+        let len = self.read_len()?;
+        self.add_cost(len.saturating_add(1))?;
+        let bytes = self.borrow_bytes(len)?.to_owned();
+        visitor.visit_byte_buf(bytes)
+    }
+    fn deserialize_bytes<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        self.unroll_type()?;
+        match self.expect_type.as_ref() {
+            TypeInner::Principal => self.deserialize_principal(visitor),
+            TypeInner::Vec(t) if **t == TypeInner::Nat8 => {
+                let len = self.read_len()?;
+                self.add_cost(len.saturating_add(1))?;
+                let slice = self.borrow_bytes(len)?;
+                visitor.visit_borrowed_bytes(slice)
+            }
+            _ => Err(Error::subtype("bytes only takes principal or vec nat8")),
+        }
+    }
+    fn deserialize_map<V>(self, visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        let _guard = self.recursion_depth.guard()?;
+        self.unroll_type()?;
+        self.add_cost(1)?;
+        match (self.expect_type.as_ref(), self.wire_type.as_ref()) {
+            (TypeInner::Vec(e), TypeInner::Vec(w)) => {
+                let e = self.table.trace_type_with_depth(e, &self.recursion_depth)?;
+                let w = self.table.trace_type_with_depth(w, &self.recursion_depth)?;
+                match (e.as_ref(), w.as_ref()) {
+                    (TypeInner::Record(ref e), TypeInner::Record(ref w)) => {
+                        match (&e[..], &w[..]) {
+                            (
+                                [Field { id: e_id0, ty: ek }, Field { id: e_id1, ty: ev }],
+                                [Field { id: w_id0, ty: wk }, Field { id: w_id1, ty: wv }],
+                            ) if **e_id0 == Label::Id(0)
+                                && **e_id1 == Label::Id(1)
+                                && **w_id0 == Label::Id(0)
+                                && **w_id1 == Label::Id(1) =>
+                            {
+                                let expect = (ek.clone(), ev.clone());
+                                let wire = (wk.clone(), wv.clone());
+                                let len = self.read_len()?;
+
+                                let key_text_fast = matches!(ek.as_ref(), TypeInner::Text)
+                                    && matches!(wk.as_ref(), TypeInner::Text);
+                                #[cfg(feature = "bignum")]
+                                let value_bignum_fast = match (ev.as_ref(), wv.as_ref()) {
+                                    (TypeInner::Nat, TypeInner::Nat) => Some(BigNumFastPath::Nat),
+                                    (TypeInner::Int, TypeInner::Int) => Some(BigNumFastPath::Int),
+                                    (TypeInner::Int, TypeInner::Nat) => {
+                                        Some(BigNumFastPath::NatAsInt)
+                                    }
+                                    _ => None,
+                                };
+                                #[cfg(feature = "bignum")]
+                                let any_fast = key_text_fast || value_bignum_fast.is_some();
+                                #[cfg(not(feature = "bignum"))]
+                                let any_fast = key_text_fast;
+
+                                if any_fast {
+                                    self.add_cost(
+                                        len.checked_mul(7)
+                                            .ok_or_else(|| Error::msg("Map length overflow"))?,
+                                    )?;
+                                    if key_text_fast {
+                                        self.text_fast_path = true;
+                                    }
+                                    #[cfg(feature = "bignum")]
+                                    if let Some(fast) = value_bignum_fast {
+                                        self.bignum_vec_fast_path = Some(fast);
+                                        self.wire_type = wv.clone();
+                                    }
+                                }
+
+                                let result = visitor.visit_map(Compound::new(
+                                    self,
+                                    Style::Map {
+                                        len,
+                                        expect,
+                                        wire,
+                                        key_text_fast,
+                                        #[cfg(feature = "bignum")]
+                                        value_bignum_fast,
+                                    },
+                                ));
+                                self.text_fast_path = false;
+                                #[cfg(feature = "bignum")]
+                                {
+                                    self.bignum_vec_fast_path = None;
+                                }
+                                result
+                            }
+                            _ => Err(Error::subtype("expect a key-value pair")),
+                        }
+                    }
+                    _ => Err(Error::subtype("expect a key-value pair")),
+                }
+            }
+            _ => check!(false),
+        }
+    }
+    fn deserialize_tuple<V>(self, _len: usize, visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        let _guard = self.recursion_depth.guard()?;
+        self.add_cost(1)?;
+        self.deserialize_seq(visitor)
+    }
+    fn deserialize_tuple_struct<V>(
+        self,
+        _name: &'static str,
+        _len: usize,
+        visitor: V,
+    ) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        let _guard = self.recursion_depth.guard()?;
+        self.add_cost(1)?;
+        self.deserialize_seq(visitor)
+    }
+    fn deserialize_struct<V>(
+        self,
+        _name: &'static str,
+        _fields: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        let _guard = self.recursion_depth.guard()?;
+        self.unroll_type()?;
+        self.add_cost(1)?;
+        match (self.expect_type.as_ref(), self.wire_type.as_ref()) {
+            (TypeInner::Record(_), TypeInner::Record(_)) => {
+                let value = visitor.visit_map(Compound::new(
+                    self,
+                    Style::Struct {
+                        expect: self.expect_type.clone(),
+                        wire: self.wire_type.clone(),
+                        expect_idx: 0,
+                        wire_idx: 0,
+                    },
+                ))?;
+                Ok(value)
+            }
+            _ => check!(false),
+        }
+    }
+    fn deserialize_enum<V>(
+        self,
+        _name: &'static str,
+        _variants: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        let _guard = self.recursion_depth.guard()?;
+        self.unroll_type()?;
+        self.add_cost(1)?;
+        match (self.expect_type.as_ref(), self.wire_type.as_ref()) {
+            (TypeInner::Variant(e), TypeInner::Variant(w)) => {
+                let index = Len::read_le(&mut self.input)?.0;
+                let len = w.len();
+                if index >= len {
+                    return Err(Error::msg(format!(
+                        "Variant index {index} larger than length {len}"
+                    )));
+                }
+                let wire = w[index].clone();
+                let expect = match e.iter().find(|f| f.id == wire.id) {
+                    Some(v) => v.clone(),
+                    None => {
+                        return Err(Error::subtype(format!("Unknown variant field {}", wire.id)));
+                    }
+                };
+                visitor.visit_enum(Compound::new(self, Style::Enum { expect, wire }))
+            }
+            _ => check!(false),
+        }
+    }
+    fn deserialize_identifier<V>(self, visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        match self.field_name.take() {
+            Some(l) => match l.as_ref() {
+                Label::Named(name) => {
+                    self.add_cost(name.len())?;
+                    visitor.visit_string(name.to_string())
+                }
+                Label::Id(hash) | Label::Unnamed(hash) => {
+                    self.add_cost(4)?;
+                    visitor.visit_u32(*hash)
+                }
+            },
+            None => assert!(false),
+        }
+    }
+
+    serde::forward_to_deserialize_any! {
+        char
+    }
+}
+
+#[derive(Debug)]
+enum Style {
+    Vector {
+        len: usize,
+        expect: Type,
+        wire: Type,
+        exact_primitive: Option<PrimitiveType>,
+    },
+    Struct {
+        expect: Type,
+        wire: Type,
+        expect_idx: usize,
+        wire_idx: usize,
+    },
+    Enum {
+        expect: Field,
+        wire: Field,
+    },
+    Map {
+        len: usize,
+        expect: (Type, Type),
+        wire: (Type, Type),
+        key_text_fast: bool,
+        #[cfg(feature = "bignum")]
+        value_bignum_fast: Option<BigNumFastPath>,
+    },
+}
+
+#[cfg(target_endian = "little")]
+struct PrimitiveVecAccess<'de> {
+    data: &'de [u8],
+    offset: usize,
+    remaining: usize,
+    element_size: usize,
+    prim: PrimitiveType,
+}
+
+/// Adapts serde's value deserializers to candid's contract in the two places they
+/// differ from the main `Deserializer`:
+///
+/// * they have no `deserialize_newtype_struct`, so a newtype element (e.g.
+///   `struct EventIndex(u32)`) failed to decode; it now forwards through
+///   `visit_newtype_struct` as the main `Deserializer` does, which also makes
+///   nested newtypes unwrap recursively;
+/// * they inherit serde's default `is_human_readable() == true`, which would send
+///   an impl that branches on it down its human-readable path even though candid
+///   is a binary format.
+#[cfg(target_endian = "little")]
+struct NewtypeCompat<D>(D);
+
+#[cfg(target_endian = "little")]
+impl<'de, D: de::Deserializer<'de, Error = Error>> de::Deserializer<'de> for NewtypeCompat<D> {
+    type Error = Error;
+    fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
+        self.0.deserialize_any(visitor)
+    }
+    fn deserialize_newtype_struct<V: Visitor<'de>>(
+        self,
+        _name: &'static str,
+        visitor: V,
+    ) -> Result<V::Value> {
+        visitor.visit_newtype_struct(self)
+    }
+    fn is_human_readable(&self) -> bool {
+        false
+    }
+    serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+        bytes byte_buf option unit unit_struct seq tuple
+        tuple_struct map struct enum identifier ignored_any
+    }
+}
+
+#[cfg(target_endian = "little")]
+fn newtype_compat<'de, T: de::IntoDeserializer<'de, Error>>(
+    value: T,
+) -> NewtypeCompat<T::Deserializer> {
+    NewtypeCompat(value.into_deserializer())
+}
+
+#[cfg(target_endian = "little")]
+impl<'de> de::SeqAccess<'de> for PrimitiveVecAccess<'de> {
+    type Error = Error;
+
+    fn next_element_seed<T>(&mut self, seed: T) -> Result<Option<T::Value>>
+    where
+        T: de::DeserializeSeed<'de>,
+    {
+        if self.remaining == 0 {
+            return Ok(None);
+        }
+        self.remaining -= 1;
+        let bytes = &self.data[self.offset..self.offset + self.element_size];
+        self.offset += self.element_size;
+
+        match self.prim {
+            PrimitiveType::Bool => match bytes[0] {
+                0 => seed.deserialize(newtype_compat(false)).map(Some),
+                1 => seed.deserialize(newtype_compat(true)).map(Some),
+                _ => Err(Error::msg("Expect 00 or 01")),
+            },
+            PrimitiveType::Nat8 => seed.deserialize(newtype_compat(bytes[0])).map(Some),
+            PrimitiveType::Int8 => seed.deserialize(newtype_compat(bytes[0] as i8)).map(Some),
+            PrimitiveType::Nat16 => {
+                let v = u16::from_le_bytes(bytes.try_into().unwrap());
+                seed.deserialize(newtype_compat(v)).map(Some)
+            }
+            PrimitiveType::Int16 => {
+                let v = i16::from_le_bytes(bytes.try_into().unwrap());
+                seed.deserialize(newtype_compat(v)).map(Some)
+            }
+            PrimitiveType::Nat32 => {
+                let v = u32::from_le_bytes(bytes.try_into().unwrap());
+                seed.deserialize(newtype_compat(v)).map(Some)
+            }
+            PrimitiveType::Int32 => {
+                let v = i32::from_le_bytes(bytes.try_into().unwrap());
+                seed.deserialize(newtype_compat(v)).map(Some)
+            }
+            PrimitiveType::Float32 => {
+                let v = f32::from_le_bytes(bytes.try_into().unwrap());
+                seed.deserialize(newtype_compat(v)).map(Some)
+            }
+            PrimitiveType::Nat64 => {
+                let v = u64::from_le_bytes(bytes.try_into().unwrap());
+                seed.deserialize(newtype_compat(v)).map(Some)
+            }
+            PrimitiveType::Int64 => {
+                let v = i64::from_le_bytes(bytes.try_into().unwrap());
+                seed.deserialize(newtype_compat(v)).map(Some)
+            }
+            PrimitiveType::Float64 => {
+                let v = f64::from_le_bytes(bytes.try_into().unwrap());
+                seed.deserialize(newtype_compat(v)).map(Some)
+            }
+        }
+    }
+
+    fn size_hint(&self) -> Option<usize> {
+        Some(self.remaining)
+    }
+}
+
+struct Compound<'a, 'de> {
+    de: &'a mut Deserializer<'de>,
+    style: Style,
+}
+
+impl Style {
+    fn struct_remaining(&self) -> Option<usize> {
+        match self {
+            Style::Struct {
+                expect,
+                wire,
+                expect_idx,
+                wire_idx,
+            } => {
+                let remaining = |ty: &Type, idx: usize| match ty.as_ref() {
+                    TypeInner::Record(fields) => fields.len().saturating_sub(idx),
+                    _ => 0,
+                };
+                Some(remaining(expect, *expect_idx).min(remaining(wire, *wire_idx)))
+            }
+            _ => None,
+        }
+    }
+}
+
+impl<'a, 'de> Compound<'a, 'de> {
+    fn new(de: &'a mut Deserializer<'de>, style: Style) -> Self {
+        Compound { de, style }
+    }
+    /// Called after a visitor returns from `visit_seq`. Serde visitors for
+    /// fixed-size types (`[T; N]`, tuples) stop after N elements without
+    /// draining the rest, so the remaining input must be handled here or the
+    /// values that follow are decoded from the wrong offset.
+    fn finish_seq(&mut self) -> Result<()> {
+        match self.style {
+            // A vector longer than the Rust type can hold has no valid value.
+            Style::Vector { len, .. } => check_vec_consumed(len),
+            // Extra trailing tuple fields are allowed by subtyping: skip them.
+            Style::Struct { .. } => {
+                while de::SeqAccess::next_element::<de::IgnoredAny>(self)?.is_some() {}
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+fn check_vec_consumed(remaining: usize) -> Result<()> {
+    if remaining == 0 {
+        Ok(())
+    } else {
+        Err(Error::msg(format!(
+            "invalid length: vec has {remaining} more element(s) than the expected type can hold"
+        )))
+    }
+}
+
+impl<'de> de::SeqAccess<'de> for Compound<'_, 'de> {
+    type Error = Error;
+
+    fn next_element_seed<T>(&mut self, seed: T) -> Result<Option<T::Value>>
+    where
+        T: de::DeserializeSeed<'de>,
+    {
+        match self.style {
+            Style::Vector {
+                ref mut len,
+                ref expect,
+                ref wire,
+                exact_primitive,
+            } => {
+                if *len == 0 {
+                    return Ok(None);
+                }
+                *len -= 1;
+                self.de.expect_type = expect.clone();
+                self.de.wire_type = wire.clone();
+                #[cfg(feature = "bignum")]
+                let is_fast = exact_primitive.is_some() || self.de.bignum_vec_fast_path.is_some();
+                #[cfg(not(feature = "bignum"))]
+                let is_fast = exact_primitive.is_some();
+                if !is_fast {
+                    self.de.add_cost(3)?;
+                }
+                seed.deserialize(&mut *self.de).map(Some)
+            }
+            Style::Struct {
+                ref expect,
+                ref wire,
+                ref mut expect_idx,
+                ref mut wire_idx,
+            } => {
+                self.de.add_cost(3)?;
+                let expect_fields = match expect.as_ref() {
+                    TypeInner::Record(fields) => fields,
+                    _ => unreachable!(),
+                };
+                let wire_fields = match wire.as_ref() {
+                    TypeInner::Record(fields) => fields,
+                    _ => unreachable!(),
+                };
+                if *expect_idx >= expect_fields.len() && *wire_idx >= wire_fields.len() {
+                    return Ok(None);
+                }
+                self.de.expect_type = expect_fields
+                    .get(*expect_idx)
+                    .map(|f| {
+                        *expect_idx += 1;
+                        f.ty.clone()
+                    })
+                    .unwrap_or_else(|| TypeInner::Reserved.into());
+                self.de.wire_type = wire_fields
+                    .get(*wire_idx)
+                    .map(|f| {
+                        *wire_idx += 1;
+                        f.ty.clone()
+                    })
+                    .unwrap_or_else(|| TypeInner::Null.into());
+                seed.deserialize(&mut *self.de).map(Some)
+            }
+            _ => Err(Error::subtype("expect vector or tuple")),
+        }
+    }
+
+    fn size_hint(&self) -> Option<usize> {
+        match &self.style {
+            Style::Vector { len, .. } => Some(*len),
+            _ => self.style.struct_remaining(),
+        }
+    }
+}
+
+impl Drop for Compound<'_, '_> {
+    fn drop(&mut self) {
+        self.de.primitive_vec_fast_path = None;
+        self.de.text_fast_path = false;
+        #[cfg(feature = "bignum")]
+        {
+            self.de.bignum_vec_fast_path = None;
+        }
+    }
+}
+
+impl<'de> de::MapAccess<'de> for Compound<'_, 'de> {
+    type Error = Error;
+    fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>>
+    where
+        K: de::DeserializeSeed<'de>,
+    {
+        self.de.add_cost(4)?;
+        match self.style {
+            Style::Struct {
+                ref expect,
+                ref wire,
+                ref mut expect_idx,
+                ref mut wire_idx,
+            } => {
+                let expect_fields = match expect.as_ref() {
+                    TypeInner::Record(fields) => fields,
+                    _ => unreachable!(),
+                };
+                let wire_fields = match wire.as_ref() {
+                    TypeInner::Record(fields) => fields,
+                    _ => unreachable!(),
+                };
+                match (expect_fields.get(*expect_idx), wire_fields.get(*wire_idx)) {
+                    (Some(e), Some(w)) => {
+                        use std::cmp::Ordering;
+                        match e.id.get_id().cmp(&w.id.get_id()) {
+                            Ordering::Equal => {
+                                self.de.set_field_name(e.id.clone());
+                                self.de.expect_type = e.ty.clone();
+                                self.de.wire_type = w.ty.clone();
+                                *expect_idx += 1;
+                                *wire_idx += 1;
+                            }
+                            Ordering::Less => {
+                                // by subtyping rules, expect_type can only be opt, reserved or null.
+                                let field = e.id.clone();
+                                self.de.set_field_name(field.clone());
+                                let expect = e.ty.clone();
+                                *expect_idx += 1;
+                                self.de.expect_type = self
+                                    .de
+                                    .table
+                                    .trace_type_with_depth(&expect, &self.de.recursion_depth)?;
+                                check!(
+                                    matches!(
+                                        self.de.expect_type.as_ref(),
+                                        TypeInner::Opt(_) | TypeInner::Reserved | TypeInner::Null
+                                    ),
+                                    format!("field {field} is not optional field")
+                                );
+                                self.de.wire_type = TypeInner::Null.into();
+                            }
+                            Ordering::Greater => {
+                                self.de.set_field_name(Label::Named("_".to_owned()).into());
+                                self.de.wire_type = w.ty.clone();
+                                self.de.expect_type = TypeInner::Reserved.into();
+                                *wire_idx += 1;
+                            }
+                        }
+                    }
+                    (None, Some(_)) => {
+                        self.de.set_field_name(Label::Named("_".to_owned()).into());
+                        self.de.wire_type = wire_fields[*wire_idx].ty.clone();
+                        self.de.expect_type = TypeInner::Reserved.into();
+                        *wire_idx += 1;
+                    }
+                    (Some(e), None) => {
+                        self.de.set_field_name(e.id.clone());
+                        self.de.expect_type = e.ty.clone();
+                        self.de.wire_type = TypeInner::Null.into();
+                        *expect_idx += 1;
+                    }
+                    (None, None) => return Ok(None),
+                }
+                seed.deserialize(&mut *self.de).map(Some)
+            }
+            Style::Map {
+                ref mut len,
+                ref expect,
+                ref wire,
+                key_text_fast,
+                #[cfg(feature = "bignum")]
+                value_bignum_fast,
+            } => {
+                if *len == 0 {
+                    return Ok(None);
+                }
+                *len -= 1;
+                #[cfg(feature = "bignum")]
+                let any_fast = key_text_fast || value_bignum_fast.is_some();
+                #[cfg(not(feature = "bignum"))]
+                let any_fast = key_text_fast;
+                if !any_fast {
+                    self.de.add_cost(4)?;
+                }
+                // Always set text_fast_path based on THIS map's key type. The global
+                // text_fast_path may be true from an enclosing map with text keys; using
+                // it directly would skip setting expect_type/wire_type for non-text keys
+                // of this (inner) map, leading to a "Type mismatch" when deserializing
+                // those keys.
+                self.de.text_fast_path = key_text_fast;
+                // The bignum fast path is derived from the map's *value* type and applies
+                // only to values, so it stays off for the duration of the key. This keeps
+                // a key decoding under its own declared type, through the regular
+                // deserialize_* entry point and its subtype check, whatever the value type
+                // happens to be. next_value_seed restores it for the value.
+                #[cfg(feature = "bignum")]
+                {
+                    self.de.bignum_vec_fast_path = None;
+                }
+                if !key_text_fast {
+                    self.de.expect_type = expect.0.clone();
+                    self.de.wire_type = wire.0.clone();
+                }
+                seed.deserialize(&mut *self.de).map(Some)
+            }
+            _ => Err(Error::msg("expect struct or map")),
+        }
+    }
+    fn next_value_seed<V>(&mut self, seed: V) -> Result<V::Value>
+    where
+        V: de::DeserializeSeed<'de>,
+    {
+        match &self.style {
+            Style::Map {
+                expect,
+                wire,
+                #[cfg(feature = "bignum")]
+                value_bignum_fast,
+                ..
+            } => {
+                #[cfg(feature = "bignum")]
+                let value_bignum_fast = *value_bignum_fast;
+                #[cfg(feature = "bignum")]
+                let any_fast = self.de.text_fast_path || value_bignum_fast.is_some();
+                #[cfg(not(feature = "bignum"))]
+                let any_fast = self.de.text_fast_path;
+                if !any_fast {
+                    self.de.add_cost(3)?;
+                }
+                // Re-establish the value's types unconditionally: the key is decoded under
+                // the key type, and the bignum fast path still reads according to
+                // wire_type, so the value needs its own types in place here.
+                self.de.expect_type = expect.1.clone();
+                self.de.wire_type = wire.1.clone();
+                // The text fast path is the mirror image: it is derived from the map's key
+                // type, so it too applies only to its own half of the entry. Left on, it
+                // lets a value be read as text without its subtype check -- `blob` shares
+                // text's length-prefixed encoding, so it would be accepted in a text
+                // value's place. next_key_seed sets it again for the following key.
+                self.de.text_fast_path = false;
+                #[cfg(feature = "bignum")]
+                {
+                    self.de.bignum_vec_fast_path = value_bignum_fast;
+                }
+                seed.deserialize(&mut *self.de)
+            }
+            _ => {
+                self.de.add_cost(1)?;
+                seed.deserialize(&mut *self.de)
+            }
+        }
+    }
+
+    fn size_hint(&self) -> Option<usize> {
+        match &self.style {
+            Style::Map { len, .. } => Some(*len),
+            _ => self.style.struct_remaining(),
+        }
+    }
+}
+
+impl<'de> de::EnumAccess<'de> for Compound<'_, 'de> {
+    type Error = Error;
+    type Variant = Self;
+
+    fn variant_seed<V>(self, seed: V) -> Result<(V::Value, Self::Variant)>
+    where
+        V: de::DeserializeSeed<'de>,
+    {
+        self.de.add_cost(4)?;
+        match &self.style {
+            Style::Enum { expect, wire } => {
+                self.de.expect_type = expect.ty.clone();
+                self.de.wire_type = wire.ty.clone();
+                let (mut label, label_type) = match expect.id.as_ref() {
+                    Label::Named(name) => (name.clone(), "name"),
+                    Label::Id(hash) | Label::Unnamed(hash) => (hash.to_string(), "id"),
+                };
+                if self.de.is_untyped {
+                    let accessor = match expect.ty.as_ref() {
+                        TypeInner::Null => "unit",
+                        TypeInner::Record(_) => "struct",
+                        _ => "newtype",
+                    };
+                    write!(&mut label, ",{label_type},{accessor}").map_err(Error::msg)?;
+                }
+                self.de.set_field_name(Label::Named(label).into());
+                let field = seed.deserialize(&mut *self.de)?;
+                Ok((field, self))
+            }
+            _ => Err(Error::subtype("expect enum")),
+        }
+    }
+}
+
+impl<'de> de::VariantAccess<'de> for Compound<'_, 'de> {
+    type Error = Error;
+
+    fn unit_variant(self) -> Result<()> {
+        check!(
+            *self.de.expect_type == TypeInner::Null && *self.de.wire_type == TypeInner::Null,
+            "unit_variant"
+        );
+        self.de.add_cost(1)?;
+        Ok(())
+    }
+
+    fn newtype_variant_seed<T>(self, seed: T) -> Result<T::Value>
+    where
+        T: de::DeserializeSeed<'de>,
+    {
+        self.de.add_cost(1)?;
+        seed.deserialize(&mut *self.de)
+    }
+
+    fn tuple_variant<V>(self, len: usize, visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        self.de.add_cost(1)?;
+        de::Deserializer::deserialize_tuple(&mut *self.de, len, visitor)
+    }
+
+    fn struct_variant<V>(self, fields: &'static [&'static str], visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        self.de.add_cost(1)?;
+        de::Deserializer::deserialize_struct(&mut *self.de, "_", fields, visitor)
+    }
+}
