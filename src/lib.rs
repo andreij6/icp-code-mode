@@ -29,7 +29,8 @@ pub struct PolicyView {
     pub allowlist: Vec<(Principal, Vec<String>)>,
     /// (token hash prefix, label)
     pub tokens: Vec<(String, String)>,
-    /// Scripts running right now (at most `MAX_CONCURRENT_RUNS`).
+    /// Run slots taken (at most `MAX_CONCURRENT_RUNS`): scripts and searches that fetch,
+    /// in flight or lingering after a trap.
     pub active_runs: u32,
     /// Runs (by `run_id`) that have sent messages and not ended: still waiting on a reply.
     pub pending_run_ids: Vec<u64>,
@@ -60,10 +61,57 @@ const SKIP_CERT_DATA: [u8; 32] = [
     2, 114, 167, 214, 66, 145,
 ];
 
-// All state lives in stable structures, so no pre_upgrade serialization is needed;
-// post_upgrade accepts the same (optional) args to adjust policy during an upgrade.
+/// Install, upgrade and admin arguments must match their declared types exactly.
+/// Candid's subtyping would otherwise decode a value under `opt` that does not fit (an
+/// untyped `5` for a `nat32`, a misspelled field, `opt blob` for `opt text`) as `null`,
+/// which these methods read as "not supplied" or "clear". Unknown record fields are refused
+/// too, so a misspelled optional field is not skipped.
+fn strict_args(bytes: &[u8], expected: impl FnOnce(&mut candid::types::internal::TypeContainer) -> Vec<candid::types::Type>) -> Result<(), String> {
+    use binrw::BinRead;
+    use candid::types::subtype::{Gamma, OptReport, subtype_with_config};
+    use candid::types::{Field, Label, Type, TypeInner};
+    let bytes = if bytes.is_empty() { b"DIDL\x00\x00".as_slice() } else { bytes };
+    let bad = |e: &dyn std::fmt::Display| format!("arguments do not match the method's Candid types: {e}");
+    let header = candid::binary_parser::Header::read_le_args(&mut std::io::Cursor::new(bytes), (None,)).map_err(|e| bad(&e))?;
+    let (wire_env, wire) = header.to_types().map_err(|e| bad(&e))?;
+    let tuple = |ts: Vec<Type>| -> Type {
+        TypeInner::Record(ts.into_iter().enumerate().map(|(i, ty)| Field { id: Label::Unnamed(i as u32).into(), ty }).collect()).into()
+    };
+    let mut c = candid::types::internal::TypeContainer::new();
+    let want = tuple(expected(&mut c));
+    let mut env = c.env;
+    let wire = env.merge_type(wire_env, tuple(wire));
+    subtype_with_config(OptReport::Error, &mut Gamma::default(), &env, &wire, &want).map_err(|e| bad(&e))?;
+    // Subtyping lets extra record fields through; ours are not recursive, so this ends.
+    fn no_extra_fields(env: &candid::TypeEnv, w: &Type, t: &Type) -> Result<(), String> {
+        let (w, t) = (env.trace_type(w).map_err(|e| e.to_string())?, env.trace_type(t).map_err(|e| e.to_string())?);
+        match (w.as_ref(), t.as_ref()) {
+            (TypeInner::Opt(a) | TypeInner::Vec(a), TypeInner::Opt(b) | TypeInner::Vec(b)) => no_extra_fields(env, a, b),
+            (_, TypeInner::Opt(b)) => no_extra_fields(env, &w, b),
+            (TypeInner::Record(wf), TypeInner::Record(tf)) | (TypeInner::Variant(wf), TypeInner::Variant(tf)) => wf.iter().try_for_each(|f| {
+                match tf.iter().find(|g| g.id == f.id) {
+                    Some(g) => no_extra_fields(env, &f.ty, &g.ty),
+                    None => Err(format!("unknown field {}", f.id)),
+                }
+            }),
+            _ => Ok(()),
+        }
+    }
+    no_extra_fields(&env, &wire, &want).map_err(|e| bad(&e))
+}
+
+fn strict_limits_args() -> Result<(), String> {
+    strict_args(&ic_cdk::api::msg_arg_data(), |c| vec![c.add::<Limits>()])
+}
+
+fn strict_override_args() -> Result<(), String> {
+    strict_args(&ic_cdk::api::msg_arg_data(), |c| vec![c.add::<Principal>(), c.add::<Option<String>>()])
+}
+
+// All state lives in stable structures, so no pre_upgrade serialization is needed.
 #[ic_cdk::init]
 fn init(args: Option<InitArgs>) {
+    strict_args(&ic_cdk::api::msg_arg_data(), |c| vec![c.add::<Option<InitArgs>>()]).unwrap_or_else(|e| ic_cdk::trap(e));
     apply(args);
     set_certified_data();
 }
@@ -80,17 +128,36 @@ fn set_certified_data() {
 /// Upgrade arguments are accepted (the same `opt InitArgs` type keeps old deploy scripts
 /// working) and ignored: re-applying them would bring back revoked tokens, re-add removed
 /// allowlist entries and replace the limits. Change state with the admin methods.
+/// An upgrade is recorded in the audit log (language `upgrade`, caller `controller`).
 #[ic_cdk::post_upgrade]
 fn post_upgrade(_: Option<InitArgs>) {
     set_certified_data(); // certified data resets on upgrade
+    policy::append_audit(AuditEntry {
+        id: 0,
+        timestamp_ns: ic_cdk::api::time(),
+        caller: "controller".into(),
+        language: "upgrade".into(),
+        script_sha256: String::new(),
+        canisters: vec![],
+        calls: 0,
+        instructions: 0,
+        status: AuditStatus::Ok,
+        violations: vec![],
+        error: None,
+        run_id: None,
+        methods: None,
+    });
 }
 
 /// A run waiting on a reply would get it in the new module, where its callback traps and
 /// it never gets a closing entry. Stopping the canister first lets those replies arrive.
+/// (`skip_pre_upgrade` in `install_code` bypasses this.)
 #[ic_cdk::pre_upgrade]
 fn pre_upgrade() {
     let pending = bridge::pending_run_ids();
-    if !pending.is_empty() {
+    // A stopped canister has no call outstanding, whatever the heap-only list still holds
+    // (a run lingering after a trap, an entry restored by a snapshot).
+    if !pending.is_empty() && ic_cdk::api::canister_status() != ic_cdk::api::CanisterStatusCode::Stopped {
         ic_cdk::trap(format!(
             "{} script run(s) are waiting on replies (run ids {pending:?}); stop the canister before upgrading",
             pending.len()
@@ -129,6 +196,14 @@ fn http_request(req: HttpRequest) -> HttpResponse {
     r
 }
 
+/// How the `#[update]` macro decodes `http_request_update`'s argument; `inspect_message`
+/// uses the same, so it admits exactly what the method can decode.
+fn decode_update_req(bytes: &[u8]) -> Result<HttpUpdateRequest, candid::Error> {
+    let mut c = candid::DecoderConfig::new();
+    c.set_skipping_quota(10000);
+    candid::utils::decode_one_with_config(bytes, &c)
+}
+
 #[ic_cdk::update]
 async fn http_request_update(req: HttpUpdateRequest) -> HttpResponse {
     mcp::http_update(&req, run_tool).await
@@ -146,11 +221,12 @@ async fn run_tool(caller_hash: &str, req: ToolRequest) -> serde_json::Value {
     }
 }
 
-/// Search from cached interfaces only; `None` if one must be fetched (needs an update).
+/// Search from cached interfaces only; `None` if one must be fetched, or a remembered
+/// fetch failure must be reported (both need an update, which writes the audit entry).
 fn search_cached(args: &SearchArgs) -> Option<serde_json::Value> {
     let entries = search::scope(args, policy::list_allowed())
         .into_iter()
-        .map(|(canister, allowed)| Some(Entry { service: bridge::cached_service(&canister, false)?.map(Some), canister, allowed }))
+        .map(|(canister, allowed)| Some(Entry { service: Ok(Some(bridge::cached_service(&canister, false)?.ok()?)), canister, allowed }))
         .collect::<Option<Vec<_>>>()?;
     Some(search::render(args, &entries))
 }
@@ -158,16 +234,28 @@ fn search_cached(args: &SearchArgs) -> Option<serde_json::Value> {
 /// Update-path search: fetch the interfaces that are not cached yet (counted and
 /// audited like script calls), then render.
 async fn run_search(caller_hash: &str, args: SearchArgs) -> serde_json::Value {
+    let scope = search::scope(&args, policy::list_allowed());
+    // A search that has to fetch waits on replies like a script: it takes a run slot.
+    let needs_fetch = scope.iter().any(|(c, _)| bridge::cached_service(c, true).is_none());
+    let _slot = match search_slot(needs_fetch, caller_hash) {
+        Ok(s) => s,
+        Err(e) => return mcp::tool_result(Err(e), vec![]),
+    };
     let caller = caller_hash.get(..16).unwrap_or(caller_hash).to_string();
-    let key = format!("search:{}:{}", args.query.as_deref().unwrap_or(""), args.canister_id.as_deref().unwrap_or(""));
-    let script_sha256 = policy::sha256_hex(key.as_bytes());
+    let script_sha256 = policy::sha256_hex(search_key(&args).as_bytes());
     let bridge = IcBridge::new(caller.clone(), "search", script_sha256.clone());
     let mut entries = vec![];
     let mut fetch_errors = vec![];
     let mut halted: Option<String> = None;
-    for (canister, allowed) in search::scope(&args, policy::list_allowed()) {
+    for (canister, allowed) in scope {
         let service = match (bridge::cached_service(&canister, true), &halted) {
-            (Some(s), _) => s.map(Some),
+            (Some(s), _) => {
+                // A failure remembered from a recent fetch: report it in the audit log too.
+                if let Err(e) = &s {
+                    fetch_errors.push(e.clone());
+                }
+                s.map(Some)
+            }
             // After a policy refusal (call cap, budget) every further fetch would be refused
             // too; don't try, and don't log one violation per remaining canister.
             (None, Some(why)) => Err(format!("not fetched: {why}; search with canister_id")),
@@ -186,25 +274,23 @@ async fn run_search(caller_hash: &str, args: SearchArgs) -> serde_json::Value {
         };
         entries.push(Entry { canister, allowed, service });
     }
-    let mut result = Ok(search::render(&args, &entries));
     let (used, max) = (bridge.instructions_used(), policy::limits().max_instructions);
-    if used > max {
-        result = Err(bridge.deny(format!("policy: instruction budget exceeded ({used} > {max})")));
-    }
+    let (result, deny) = close_over_budget(Ok(search::render(&args, &entries)), used, max, &bridge.messages());
+    let result = result.map_err(|e| if deny { bridge.deny(e) } else { e });
     let mut violations = bridge.violations.take();
     if let n @ 1.. = bridge.violations_dropped.get() {
         violations.push(format!("…and {n} more"));
     }
-    // Audit whenever a fetch was attempted: sent messages (a `Started` entry is open) or
-    // was refused by policy (refusals must be logged even though nothing was sent).
-    if bridge.calls() > 0 || !violations.is_empty() {
-        let status = match (violations.is_empty(), fetch_errors.is_empty()) {
+    // Audit whenever a fetch was attempted or failed: sent messages (a `Started` entry is
+    // open), was refused by policy or by the system, or a remembered failure was served.
+    if bridge.calls() > 0 || !violations.is_empty() || !fetch_errors.is_empty() {
+        let status = match (violations.is_empty(), fetch_errors.is_empty() && result.is_ok()) {
             (false, _) => AuditStatus::PolicyViolation,
             (true, false) => AuditStatus::Error,
             (true, true) => AuditStatus::Ok,
         };
-        let error = (!fetch_errors.is_empty()).then(|| {
-            let mut e = fetch_errors.join("; ");
+        let error = (!fetch_errors.is_empty() || result.is_err()).then(|| {
+            let mut e = result.as_ref().err().into_iter().chain(&fetch_errors).cloned().collect::<Vec<_>>().join("; ");
             bridge::truncate(&mut e, MAX_AUDIT_ERROR_BYTES);
             e
         });
@@ -226,6 +312,31 @@ async fn run_search(caller_hash: &str, args: SearchArgs) -> serde_json::Value {
     }
     bridge.finish();
     mcp::tool_result(result, vec![])
+}
+
+/// The text whose SHA-256 is a search's `script_sha256`: `search:<query>:<canister id>`,
+/// with the id in canonical principal text, so every spelling of one canister hashes alike.
+fn search_key(args: &SearchArgs) -> String {
+    let id = args.canister_id.as_deref().map(str::trim).unwrap_or("");
+    let id = Principal::from_text(id).map_or_else(|_| id.to_string(), |p| p.to_text());
+    format!("search:{}:{id}", args.query.as_deref().unwrap_or("").trim())
+}
+
+/// A run slot for a search that has to fetch an interface; none for one answered from cache.
+fn search_slot(needs_fetch: bool, token: &str) -> Result<Option<RunSlot>, String> {
+    needs_fetch.then(|| RunSlot::take(token)).transpose()
+}
+
+/// Applies the instruction budget to a run's outcome. Over budget with nothing sent, it is
+/// a policy refusal (the `bool`: record a violation). Once messages went out it is not:
+/// the error says so and lists them, since their effects may stand.
+fn close_over_budget(out: Result<serde_json::Value, String>, used: u64, max: u64, sent: &[String]) -> (Result<serde_json::Value, String>, bool) {
+    let over = used > max || out.as_ref().is_err_and(|e| e.starts_with("policy: instruction budget exceeded"));
+    match (over, sent.len()) {
+        (false, _) => (out, false),
+        (true, 0) => (Err(format!("policy: instruction budget exceeded ({used} > {max})")), true),
+        (true, n) => (Err(format!("instruction budget exceeded ({used} > {max}) after {n} message(s) were sent: {}", sent.join(", "))), false),
+    }
 }
 
 // Tool calls per token in the current minute: (minute, count). Heap only: an upgrade
@@ -258,50 +369,70 @@ fn rate_count(token_hash: &str, minute: u64) {
 /// Audit `error` cap; the full text already went to the client (truncated there too).
 const MAX_AUDIT_ERROR_BYTES: usize = 4096;
 
-/// Scripts allowed in flight at once. Each one suspended on a call keeps its VM heap
-/// alive (up to 64 MiB for Python), so an unlimited number could exhaust the canister's
-/// memory and trap every request.
+/// Runs (scripts, and searches that fetch) allowed in flight at once. Each script
+/// suspended on a call keeps its VM heap alive (up to 64 MiB for Python), so an unlimited
+/// number could exhaust the canister's memory and trap every request.
 pub const MAX_CONCURRENT_RUNS: u32 = 8;
-
-thread_local!(static ACTIVE_RUNS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) });
-
-/// One of the `MAX_CONCURRENT_RUNS` slots, given back on drop. If a run traps after an
-/// await, ic-cdk drops its future in the cleanup callback, so the slot is still returned.
-struct RunSlot(String);
 
 /// Slots one token may hold, so one client cannot keep every other one "busy".
 pub const MAX_RUNS_PER_TOKEN: u32 = 4;
 
-thread_local!(static RUNS_BY_TOKEN: std::cell::RefCell<std::collections::BTreeMap<String, u32>> = Default::default());
+// Slots taken: slot id -> (token, time in ms after which the slot is stale and freed).
+// Heap only. A slot normally ends with its run; the expiry frees one whose run can no
+// longer end (a snapshot restored with runs in flight) and ends the linger after a trap.
+type Runs = (u64, std::collections::BTreeMap<u64, (String, u64)>);
+thread_local!(static RUNS: std::cell::RefCell<Runs> = Default::default());
+
+/// One of the `MAX_CONCURRENT_RUNS` slots, given back on drop.
+struct RunSlot(u64);
 
 impl RunSlot {
     fn take(token: &str) -> Result<Self, String> {
-        let mine = RUNS_BY_TOKEN.with(|m| m.borrow().get(token).copied().unwrap_or(0));
-        if mine >= MAX_RUNS_PER_TOKEN {
-            return Err(format!("busy: this token already has {MAX_RUNS_PER_TOKEN} scripts running; retry shortly"));
-        }
-        if ACTIVE_RUNS.with(|a| a.get()) >= MAX_CONCURRENT_RUNS {
-            return Err(format!("busy: {MAX_CONCURRENT_RUNS} scripts are already running; retry shortly"));
-        }
-        ACTIVE_RUNS.with(|a| a.set(a.get() + 1));
-        RUNS_BY_TOKEN.with(|m| *m.borrow_mut().entry(token.to_string()).or_default() += 1);
-        Ok(RunSlot(token.to_string()))
+        Self::take_at(token, bridge::now_ms())
+    }
+
+    fn take_at(token: &str, now: u64) -> Result<Self, String> {
+        RUNS.with(|r| {
+            let (next, runs) = &mut *r.borrow_mut();
+            runs.retain(|_, (_, until)| *until > now);
+            if runs.values().filter(|(t, _)| t == token).count() as u32 >= MAX_RUNS_PER_TOKEN {
+                return Err(format!("busy: this token already has {MAX_RUNS_PER_TOKEN} runs in flight; retry shortly"));
+            }
+            if runs.len() as u32 >= MAX_CONCURRENT_RUNS {
+                return Err(format!("busy: {MAX_CONCURRENT_RUNS} runs are already in flight; retry shortly"));
+            }
+            *next += 1;
+            runs.insert(*next, (token.to_string(), now + bridge::STALE_RUN_MS));
+            Ok(RunSlot(*next))
+        })
+    }
+
+    /// Give the slot back, or, after a trap (ic-cdk drops the run's future in the cleanup
+    /// callback), keep it `TRAP_LINGER_SECONDS` more: calls the run sent alongside the one
+    /// that trapped may still be outstanding, and each must end within its timeout.
+    // ponytail: lingers even when no sibling call is outstanding (which one trapped is not
+    // known here); a trapping run costs its token a slot for up to 6 minutes.
+    fn release(id: u64, trapped: bool, now: u64) {
+        RUNS.with(|r| {
+            let runs = &mut r.borrow_mut().1;
+            match (trapped, runs.get_mut(&id)) {
+                (true, Some((_, until))) => *until = now + bridge::TRAP_LINGER_SECONDS * 1000,
+                _ => _ = runs.remove(&id),
+            }
+        });
     }
 }
 
 impl Drop for RunSlot {
     fn drop(&mut self) {
-        ACTIVE_RUNS.with(|a| a.set(a.get().saturating_sub(1)));
-        RUNS_BY_TOKEN.with(|m| {
-            let mut m = m.borrow_mut();
-            if let Some(n) = m.get_mut(&self.0) {
-                *n -= 1;
-                if *n == 0 {
-                    m.remove(&self.0);
-                }
-            }
-        });
+        Self::release(self.0, ic_cdk::futures::is_recovering_from_trap(), bridge::now_ms());
     }
+}
+
+/// Slots taken now (running, or lingering after a trap).
+fn active_runs() -> u32 {
+    let now = bridge::now_ms();
+    RUNS.with(|r| r.borrow().1.values().filter(|(_, until)| *until > now).count() as u32)
 }
 
 async fn run_script(caller_hash: &str, call: ToolCall) -> serde_json::Value {
@@ -314,17 +445,13 @@ async fn run_script(caller_hash: &str, call: ToolCall) -> serde_json::Value {
     let bridge = IcBridge::new(caller.clone(), call.language.as_str(), script_sha256.clone());
     let mut out = LanguageRouter::execute(call.language, &call.code, &bridge).await;
     // A result too big to send is an error, and recorded as one.
-    if let Ok(v) = &out {
-        if let Err(e) = mcp::result_text(v.clone()) {
+    if let Ok(v) = &out
+        && let Err(e) = mcp::result_text(v.clone()) {
             out = Err(e);
         }
-    }
     let instructions = bridge.instructions_used();
-    let max = policy::limits().max_instructions;
-    if instructions > max {
-        let e = format!("policy: instruction budget exceeded ({instructions} > {max})");
-        out = Err(bridge.deny(e));
-    }
+    let (out, deny) = close_over_budget(out, instructions, policy::limits().max_instructions, &bridge.messages());
+    let out = out.map_err(|e| if deny { bridge.deny(e) } else { e });
     let mut violations = bridge.violations.take();
     if let n @ 1.. = bridge.violations_dropped.get() {
         violations.push(format!("…and {n} more"));
@@ -365,13 +492,14 @@ async fn run_script(caller_hash: &str, call: ToolCall) -> serde_json::Value {
 /// well-formed, containing a `tools/call`), and controller calls to other methods, are
 /// let in.
 ///
-/// This is a cost filter, not the security boundary: a dishonest replica can skip it and
-/// calls from other canisters never pass through it (they pay for themselves), so every
-/// method still does its own check.
+/// This is a cost filter for ingress only, not the security boundary: a dishonest replica
+/// can skip it, and calls from other canisters never pass through it. Such a call is paid
+/// for by this canister (the base update fee plus decoding, about 5-6M cycles to refuse
+/// one without a token), so every method still does its own check.
 #[ic_cdk::inspect_message]
 fn inspect_message() {
     let allowed = match ic_cdk::api::msg_method_name().as_str() {
-        "http_request_update" => candid::decode_one::<HttpUpdateRequest>(&ic_cdk::api::msg_arg_data())
+        "http_request_update" => decode_update_req(&ic_cdk::api::msg_arg_data())
             .ok()
             .and_then(|r| mcp::may_upgrade(&r, policy::limits().certified_reads == Some(true)))
             .is_some_and(|hash| rate_limited(&hash).is_none()),
@@ -406,14 +534,25 @@ fn remove_allowlist(canister: Principal) -> bool {
     policy::remove_allowed(canister)
 }
 
-/// Replaces every field (an omitted `opt` field is `null`, which means its default) and
-/// returns the previous limits.
-#[ic_cdk::update(guard = "controller")]
+/// Sets the limits and returns the previous ones. An omitted or `null` optional field
+/// keeps its current value; give it explicitly to change it (`opt 300`, `opt false`,
+/// `opt 120` are the defaults). Arguments that do not match the types are refused.
+#[ic_cdk::update(guard = "controller", guard = "strict_limits_args")]
 fn set_limits(limits: Limits) -> Limits {
     let old = policy::limits();
-    policy::set_limits(limits);
+    policy::set_limits(merge_limits(limits, &old));
     set_certified_data();
     old
+}
+
+/// `new`, with each `null` optional field taken from `old`.
+fn merge_limits(new: Limits, old: &Limits) -> Limits {
+    Limits {
+        call_timeout_seconds: new.call_timeout_seconds.or(old.call_timeout_seconds),
+        certified_reads: new.certified_reads.or(old.certified_reads),
+        tool_calls_per_minute: new.tool_calls_per_minute.or(old.tool_calls_per_minute),
+        ..new
+    }
 }
 
 #[ic_cdk::update(guard = "controller")]
@@ -428,8 +567,8 @@ fn revoke_api_token_hash(sha256_hex: String) -> bool {
 
 /// Register (or clear, with `null`) a `.did` for a target. While set it takes precedence:
 /// the target's own interface is not fetched or refreshed. `remove_allowlist` does not
-/// clear it.
-#[ic_cdk::update(guard = "controller")]
+/// clear it. Arguments that do not match the types (`opt blob`) are refused.
+#[ic_cdk::update(guard = "controller", guard = "strict_override_args")]
 fn set_candid_override(canister: Principal, did: Option<String>) -> Result<(), String> {
     if let Some(d) = &did {
         if d.len() > bridge::MAX_DID_BYTES {
@@ -448,10 +587,49 @@ fn get_policy() -> PolicyView {
         limits: policy::limits(),
         allowlist: policy::list_allowed(),
         tokens: policy::list_tokens(),
-        active_runs: ACTIVE_RUNS.with(|a| a.get()),
+        active_runs: active_runs(),
         pending_run_ids: bridge::pending_run_ids(),
         candid_overrides: policy::list_candid_overrides(),
     }
+}
+
+#[derive(CandidType, Deserialize)]
+pub struct Metrics {
+    pub cycle_balance: candid::Nat,
+    /// Wasm (heap) memory in bytes, as the IC counts it: it grows and never shrinks.
+    pub wasm_memory_bytes: u64,
+    /// Heap bytes in use now; allocation fails past 1 GiB (see `HEAP_CEILING`).
+    pub live_heap_bytes: u64,
+    pub stable_memory_bytes: u64,
+    pub audit_log_len: u64,
+    pub active_runs: u32,
+    pub pending_runs: u32,
+}
+
+/// Cycles, memory and run counts for operators. Like every query, it is refused while the
+/// canister is frozen or stopping; `icp canister status` still works then.
+#[ic_cdk::query(guard = "controller")]
+fn get_metrics() -> Metrics {
+    #[cfg(target_arch = "wasm32")]
+    let wasm_memory_bytes = core::arch::wasm32::memory_size(0) as u64 * 65536;
+    #[cfg(not(target_arch = "wasm32"))]
+    let wasm_memory_bytes = 0;
+    Metrics {
+        cycle_balance: ic_cdk::api::canister_cycle_balance().into(),
+        wasm_memory_bytes,
+        live_heap_bytes: counting_alloc::live() as u64,
+        stable_memory_bytes: ic_cdk::stable::stable_size() * 65536,
+        audit_log_len: policy::audit_len(),
+        active_runs: active_runs(),
+        pending_runs: bridge::pending_run_ids().len() as u32,
+    }
+}
+
+/// Runs when free Wasm memory falls below the canister's `wasm_memory_threshold` (set in
+/// icp.yaml): leaves a line in the canister log, next to the traps that usually follow.
+#[ic_cdk::on_low_wasm_memory]
+fn on_low_wasm_memory() {
+    ic_cdk::println!("low wasm memory: {} live heap bytes, {} runs in flight", counting_alloc::live(), active_runs());
 }
 
 /// Newest first; `limit` is capped at 100.
@@ -498,6 +676,10 @@ pub(crate) mod counting_alloc {
     /// the growth back. Room for `MAX_CONCURRENT_RUNS` Python heaps and then some.
     // ponytail: one global ceiling, not per run; per-run accounting if runs ever need more.
     pub const HEAP_CEILING: usize = 1 << 30;
+
+    pub fn live() -> usize {
+        LIVE_MEMORY.load(Relaxed)
+    }
 
     pub fn over_ceiling(live: usize, extra: usize) -> bool {
         live.saturating_add(extra) > HEAP_CEILING
@@ -593,6 +775,142 @@ unsafe extern "Rust" fn __getrandom_v03_custom(dest: *mut u8, len: usize) -> Res
 
 #[cfg(test)]
 mod tests {
+    /// 104: a record without the optional fields keeps their stored values.
+    #[test]
+    fn set_limits_keeps_omitted_options() {
+        let old = super::Limits { call_timeout_seconds: Some(60), certified_reads: Some(true), tool_calls_per_minute: Some(7), ..Default::default() };
+        let new = super::Limits { max_calls_per_script: 3, max_instructions: 9, call_timeout_seconds: None, certified_reads: None, tool_calls_per_minute: None };
+        let m = super::merge_limits(new, &old);
+        assert_eq!((m.max_calls_per_script, m.max_instructions), (3, 9));
+        assert_eq!((m.call_timeout_seconds, m.certified_reads, m.tool_calls_per_minute), (Some(60), Some(true), Some(7)));
+        // Defaults stay reachable when given explicitly.
+        let m = super::merge_limits(super::Limits { call_timeout_seconds: Some(300), certified_reads: Some(false), ..Default::default() }, &old);
+        assert_eq!((m.call_timeout_seconds, m.certified_reads), (Some(300), Some(false)));
+    }
+
+    /// 144: arguments that Candid would silently turn into `null` are refused.
+    #[test]
+    fn install_and_admin_args_are_decoded_strictly() {
+        use super::{InitArgs, Limits, strict_args};
+        use candid::Principal;
+        let bytes = |t: &str| candid_parser::parse_idl_args(t).unwrap().to_bytes().unwrap();
+        let init = |t: &str| strict_args(&bytes(t), |c| vec![c.add::<Option<InitArgs>>()]);
+        let limits = |t: &str| strict_args(&bytes(t), |c| vec![c.add::<Limits>()]);
+        let over = |t: &str| strict_args(&bytes(t), |c| vec![c.add::<Principal>(), c.add::<Option<String>>()]);
+        // Untyped ints (as icp-cli passes init_args), a misspelled required field.
+        assert!(init("(opt record { token_sha256 = vec {}; allowlist = vec {}; limits = opt record { max_calls_per_script = 5; max_instructions = 1_000_000_000 } })").is_err());
+        assert!(init("(opt record { token_sha25 = vec {}; allowlist = vec {} })").is_err());
+        let typed = "(opt record { token_sha256 = vec {}; allowlist = vec {}; limits = opt record { max_calls_per_script = 5 : nat32; max_instructions = 1_000_000_000 : nat64 } })";
+        assert_eq!(init(typed), Ok(()));
+        let args: Option<InitArgs> = candid::decode_one(&bytes(typed)).unwrap();
+        assert_eq!(args.unwrap().limits.unwrap().max_calls_per_script, 5);
+        assert_eq!(init("(null)"), Ok(()));
+        assert_eq!(strict_args(&[], |c| vec![c.add::<Option<InitArgs>>()]), Ok(()), "no arguments at all");
+        // An untyped `opt 60`, and a misspelled optional field.
+        let base = "max_calls_per_script = 5 : nat32; max_instructions = 9 : nat64";
+        assert!(limits(&format!("(record {{ {base}; call_timeout_seconds = opt 60 }})")).is_err());
+        assert!(limits(&format!("(record {{ {base}; call_timeout_second = opt (60 : nat32) }})")).unwrap_err().contains("unknown field"));
+        assert_eq!(limits(&format!("(record {{ {base}; call_timeout_seconds = opt (60 : nat32) }})")), Ok(()));
+        assert_eq!(limits(&format!("(record {{ {base} }})")), Ok(()));
+        // `opt blob` does not clear an override.
+        assert!(over("(principal \"aaaaa-aa\", opt blob \"x\")").is_err());
+        assert_eq!(over("(principal \"aaaaa-aa\", opt \"service : {}\")"), Ok(()));
+        assert_eq!(over("(principal \"aaaaa-aa\", null)"), Ok(()));
+    }
+
+    /// 178: one canister, one hash, however its id is spelled.
+    #[test]
+    fn search_key_canonicalises_the_canister_id() {
+        let key = |id: &str| super::search_key(&crate::search::SearchArgs { canister_id: Some(id.into()), query: Some(" icrc1 ".into()) });
+        let k = key("ryjl3-tyaaa-aaaaa-aaaba-cai");
+        assert_eq!(k, "search:icrc1:ryjl3-tyaaa-aaaaa-aaaba-cai");
+        assert_eq!(key("  ryjl3-tyaaa-aaaaa-aaaba-cai\t"), k);
+        assert_eq!(key("RYJL3-TYAAA-AAAAA-AAABA-CAI"), k);
+    }
+
+    /// 153: a search that must fetch takes a run slot; one answered from cache does not.
+    #[test]
+    fn fetching_searches_take_run_slots() {
+        use super::{MAX_RUNS_PER_TOKEN, RunSlot, search_slot};
+        let held: Vec<RunSlot> = (0..MAX_RUNS_PER_TOKEN).map(|_| RunSlot::take("s").unwrap()).collect();
+        assert!(search_slot(true, "s").err().unwrap().contains("busy"));
+        assert!(search_slot(false, "s").unwrap().is_none());
+        drop(held);
+        assert!(search_slot(true, "s").unwrap().is_some());
+    }
+
+    /// 77: once messages went out, running out of budget is not reported as a refusal.
+    #[test]
+    fn budget_overrun_after_sends_is_not_a_policy_refusal() {
+        use super::close_over_budget;
+        let ok = || Ok(serde_json::json!(1));
+        assert_eq!(close_over_budget(ok(), 5, 10, &[]), (ok(), false));
+        let (out, deny) = close_over_budget(ok(), 11, 10, &[]);
+        assert!(deny && out.unwrap_err().starts_with("policy: instruction budget exceeded (11 > 10)"));
+        let sent = ["ryjl3-tyaaa-aaaaa-aaaba-cai.icrc1_transfer".to_string()];
+        let (out, deny) = close_over_budget(ok(), 11, 10, &sent);
+        let e = out.unwrap_err();
+        assert!(!deny && !e.starts_with("policy:") && e.contains("1 message(s)") && e.contains("icrc1_transfer"), "{e}");
+        // A runtime's own budget stop after sends is rewritten the same way.
+        let (out, deny) = close_over_budget(Err("policy: instruction budget exceeded".into()), 10, 10, &sent);
+        assert!(!deny && out.unwrap_err().contains("icrc1_transfer"));
+        assert_eq!(close_over_budget(Err("boom".into()), 1, 10, &sent), (Err("boom".into()), false));
+    }
+
+    /// 187: `inspect_message` decodes exactly what the method's macro decoder accepts.
+    #[test]
+    fn inspect_message_decoder_matches_the_method() {
+        #[derive(candid::CandidType)]
+        struct Padded {
+            method: String,
+            url: String,
+            headers: Vec<(String, String)>,
+            body: serde_bytes::ByteBuf,
+            extra: serde_bytes::ByteBuf,
+        }
+        for n in [0, 9_999, 10_001, 20_000] {
+            let req = Padded { method: "POST".into(), url: "/mcp".into(), headers: vec![], body: Default::default(), extra: vec![0; n].into() };
+            let bytes = candid::encode_one(&req).unwrap();
+            let mut cfg = candid::DecoderConfig::new();
+            cfg.set_skipping_quota(10000);
+            let method = candid::utils::decode_args_with_config::<(super::HttpUpdateRequest,)>(&bytes, &cfg).is_ok();
+            assert_eq!(super::decode_update_req(&bytes).is_ok(), method, "{n} bytes");
+            if n == 0 || n == 20_000 {
+                assert_eq!(method, n == 0, "{n} bytes");
+            }
+        }
+    }
+
+    /// 120, 128: a trapped run keeps its slot for the linger time; a slot nobody can end
+    /// (restored by a snapshot) is freed once stale.
+    #[test]
+    fn run_slots_linger_after_a_trap_and_expire_when_stale() {
+        use super::{MAX_CONCURRENT_RUNS, RunSlot};
+        use crate::bridge::{STALE_RUN_MS, TRAP_LINGER_SECONDS};
+        let t = 1_000;
+        let s = RunSlot::take_at("a", t).unwrap();
+        RunSlot::release(s.0, true, t);
+        std::mem::forget(s);
+        let linger = t + TRAP_LINGER_SECONDS * 1000;
+        let more: Vec<_> = (1..MAX_CONCURRENT_RUNS).map(|i| RunSlot::take_at(&format!("t{i}"), t).unwrap()).collect();
+        assert!(RunSlot::take_at("z", linger - 1).is_err(), "the trapped run still holds its slot");
+        let z = RunSlot::take_at("z", linger).unwrap();
+        std::mem::forget(more); // never dropped, as after a snapshot load
+        assert!(RunSlot::take_at("y", t + STALE_RUN_MS - 1).is_err());
+        assert!(RunSlot::take_at("y", t + STALE_RUN_MS).is_ok(), "stale slots are freed");
+        drop(z);
+    }
+
+    /// 121: no call outlives the run's wall-clock limit.
+    #[test]
+    fn calls_are_cut_to_the_run_deadline() {
+        use crate::bridge::{MAX_RUN_SECONDS, run_call_timeout};
+        assert_eq!(run_call_timeout(0, 0, None), Ok(300));
+        assert_eq!(run_call_timeout(0, 0, Some(60)), Ok(60));
+        assert_eq!(run_call_timeout(1_000, 1_000 + (MAX_RUN_SECONDS - 10) * 1000, None), Ok(10));
+        assert!(run_call_timeout(0, MAX_RUN_SECONDS * 1000 - 999, Some(60)).unwrap_err().contains("run time limit"));
+    }
+
     #[test]
     fn run_slots_are_capped_and_returned() {
         use super::{MAX_CONCURRENT_RUNS, MAX_RUNS_PER_TOKEN, RunSlot};

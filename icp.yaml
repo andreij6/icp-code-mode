@@ -19,7 +19,16 @@ canisters:
             - ic-wasm "$ICP_WASM_OUTPUT_PATH" -o "$ICP_WASM_OUTPUT_PATH" shrink
     # `opt InitArgs`, applied at install only (an upgrade ignores it, so it cannot bring
     # back revoked tokens); tokens and allowlist are managed after deploy (see README).
+    # Install arguments must match their Candid types exactly: icp-cli does not type
+    # init_args, so annotate numbers, or the install is refused. For example:
+    #   (opt record { token_sha256 = vec {}; allowlist = vec {};
+    #     limits = opt record { max_calls_per_script = 5 : nat32; max_instructions = 1_000_000_000 : nat64 } })
     init_args: "(null)"
+    settings:
+      freezing_threshold: 2592000 # 30 days of idle burn before the canister freezes
+      # The canister logs a line (on_low_wasm_memory) once less than 1 GiB of its Wasm
+      # memory limit is left.
+      wasm_memory_threshold: 1073741824
 
   # Demo target: a small store with 10 methods and seeded data (see demo_store/).
   # After deploy, run scripts/demo-setup.sh to allowlist it in icp_code_mode.

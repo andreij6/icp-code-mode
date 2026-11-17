@@ -139,6 +139,26 @@ pub fn text_bytes(v: &Value) -> usize {
 
 pub use ic::{IcBridge, MAX_DID_BYTES, cached_service, evict_interface, pending_run_ids, remember_override};
 
+/// Wall-clock limit for one run (script or search). Each call's timeout is cut to the time
+/// left, so no run holds a slot, or this canister's stop, for longer.
+pub const MAX_RUN_SECONDS: u64 = 600;
+/// How long a run's bookkeeping (slot, pending id) is kept after the run trapped: its other
+/// calls may still be outstanding, and every call is bounded-wait (at most 300 s, plus margin).
+pub const TRAP_LINGER_SECONDS: u64 = 360;
+/// Past this age a run's bookkeeping is stale (left by a snapshot load, for instance): no run
+/// lasts longer than `MAX_RUN_SECONDS`, then lingers at most `TRAP_LINGER_SECONDS`.
+pub const STALE_RUN_MS: u64 = (MAX_RUN_SECONDS + TRAP_LINGER_SECONDS) * 1000;
+
+/// Timeout for a call sent now by a run that started at `started_ms`: the configured one
+/// (`null`: 300 s), cut to the run's remaining time; `Err` once that is spent.
+pub fn run_call_timeout(started_ms: u64, now_ms: u64, configured: Option<u32>) -> Result<u32, String> {
+    let left = (MAX_RUN_SECONDS * 1000).saturating_sub(now_ms.saturating_sub(started_ms)) / 1000;
+    if left == 0 {
+        return Err(format!("policy: run time limit of {MAX_RUN_SECONDS} s reached; no new calls"));
+    }
+    Ok(configured.unwrap_or(crate::policy::DEFAULT_CALL_TIMEOUT_SECONDS).min(left as u32))
+}
+
 /// Instructions executed so far in this call context (0 off-chain).
 pub fn instruction_counter() -> u64 {
     #[cfg(target_arch = "wasm32")]
@@ -205,9 +225,10 @@ mod ic {
         // (re-fetched on demand); bounded by the allowlist size.
         // Value: (.did text, parsed service, fetch time in ns).
         static DID_CACHE: RefCell<BTreeMap<String, (String, Rc<Service>, u64)>> = RefCell::default();
-        // Runs that wrote a `Started` entry and have not ended. Lets an auditor tell a run
-        // still waiting on a reply from one that ended without a final entry.
-        static PENDING_RUNS: RefCell<BTreeSet<u64>> = RefCell::default();
+        // Runs that wrote a `Started` entry and have not ended, with the time (ms) after which
+        // the entry is dropped as stale. Lets an auditor tell a run still waiting on a reply
+        // from one that ended without a final entry.
+        static PENDING_RUNS: RefCell<BTreeMap<u64, u64>> = RefCell::default();
         // Recent fetch failures: (error, time in ns).
         static DID_FAILED: RefCell<BTreeMap<String, (String, u64)>> = RefCell::default();
         // Parsed admin overrides: (.did text it was parsed from, service).
@@ -253,10 +274,16 @@ mod ic {
     }
 
     /// Run ids (see `AuditEntry::run_id`) with outbound messages sent and no end yet. Kept
-    /// in memory: a run leaves the list when it finishes or when its trap is cleaned up,
-    /// and the list is empty after an upgrade.
+    /// in memory: a run leaves the list when it finishes, `TRAP_LINGER_SECONDS` after its
+    /// trap is cleaned up (its other calls may still be outstanding), or once stale; the
+    /// list is empty after an upgrade.
     pub fn pending_run_ids() -> Vec<u64> {
-        PENDING_RUNS.with(|r| r.borrow().iter().copied().collect())
+        let now = now_ms();
+        PENDING_RUNS.with(|r| {
+            let mut r = r.borrow_mut();
+            r.retain(|_, until| *until > now);
+            r.keys().copied().collect()
+        })
     }
 
     /// The run is over, however it ended: normally, or by ic-cdk dropping the future while
@@ -269,8 +296,14 @@ mod ic {
     impl Drop for IcBridge {
         fn drop(&mut self) {
             let Some(id) = self.started.get() else { return };
-            PENDING_RUNS.with(|r| r.borrow_mut().remove(&id));
-            if self.finished.get() || !ic_cdk::futures::is_recovering_from_trap() {
+            let trapped = ic_cdk::futures::is_recovering_from_trap();
+            PENDING_RUNS.with(|r| match trapped {
+                // Sibling calls of a batch may still be outstanding: keep the run listed
+                // until they must have ended.
+                true => r.borrow_mut().insert(id, now_ms() + TRAP_LINGER_SECONDS * 1000).map(|_| ()),
+                false => r.borrow_mut().remove(&id).map(|_| ()),
+            });
+            if self.finished.get() || !trapped {
                 return;
             }
             let (caller, language, sha) = self.audit_key.clone();
@@ -323,6 +356,8 @@ mod ic {
         finished: Cell<bool>,
         base_instructions: u64,
         max_instructions: u64,
+        /// Block time (ms) the run started, for `MAX_RUN_SECONDS`.
+        started_ms: u64,
         /// (caller, language, script sha) for the provisional audit entry.
         audit_key: (String, String, String),
         /// Id of this run's `Started` audit entry, once one is written.
@@ -343,6 +378,7 @@ mod ic {
                 finished: Cell::new(false),
                 base_instructions: instruction_counter(),
                 max_instructions: policy::limits().max_instructions,
+                started_ms: now_ms(),
                 audit_key: (caller, language.to_string(), script_sha256),
                 started: Cell::new(None),
                 messages: RefCell::default(),
@@ -398,6 +434,7 @@ mod ic {
             if ic_cdk::api::canister_status() != ic_cdk::api::CanisterStatusCode::Running {
                 return Err(self.deny("policy: the canister is stopping; no new calls".into()));
             }
+            self.timeout()?;
             let n = self.slots.get();
             let used = self.instructions_used();
             match method {
@@ -407,6 +444,11 @@ mod ic {
             .map_err(|e| self.deny(e))?;
             self.slots.set(n + 1);
             Ok(())
+        }
+
+        /// Timeout for a message sent now (see `run_call_timeout`); a refusal is a violation.
+        fn timeout(&self) -> Result<u32, String> {
+            run_call_timeout(self.started_ms, now_ms(), self.call_timeout).map_err(|e| self.deny(e))
         }
 
         /// Await an inter-canister call, writing its audit entry at the moment the system
@@ -447,7 +489,7 @@ mod ic {
             });
             if run.is_none() {
                 self.started.set(Some(id));
-                PENDING_RUNS.with(|r| r.borrow_mut().insert(id));
+                PENDING_RUNS.with(|r| r.borrow_mut().insert(id, now_ms() + STALE_RUN_MS));
             }
         }
 
@@ -462,6 +504,7 @@ mod ic {
         async fn fetch_did(&self, p: Principal) -> Result<String, (String, bool)> {
             let mgmt = Principal::management_canister();
             let meta = Call::bounded_wait(mgmt, "canister_metadata")
+                .change_timeout(self.timeout().map_err(|e| (e, false))?)
                 .with_arg(MetadataArgs { canister_id: p, name: "candid:service".into() })
                 .into_future();
             if let Ok(r) = self.sent(&p, format!("{mgmt}.canister_metadata({p})"), meta).await
@@ -470,7 +513,7 @@ mod ic {
                 }
             self.reserve(&p, None).map_err(|e| (e, false))?;
             let sent_before = self.calls();
-            let hack = Call::bounded_wait(p, "__get_candid_interface_tmp_hack").into_future();
+            let hack = Call::bounded_wait(p, "__get_candid_interface_tmp_hack").change_timeout(self.timeout().map_err(|e| (e, false))?).into_future();
             let reply = self
                 .sent(&p, format!("{p}.__get_candid_interface_tmp_hack"), hack)
                 .await
@@ -576,10 +619,10 @@ mod ic {
             if enc.bytes.len() > MAX_ARG_BYTES {
                 return Err(format!("arguments are {} bytes encoded, over the {MAX_ARG_BYTES}-byte message limit", enc.bytes.len()));
             }
-            // Always a bounded wait: a target that never answers cannot hold a run slot, or
-            // this canister's stop, for longer than the timeout. A timed-out call may still
-            // have executed on the target; the error says so.
-            let secs = self.call_timeout.unwrap_or(policy::DEFAULT_CALL_TIMEOUT_SECONDS);
+            // Always a bounded wait, cut to the run's remaining time: a target that never
+            // answers cannot hold a run slot, or this canister's stop, for longer. A timed-out
+            // call may still have executed on the target; the error says so.
+            let secs = self.timeout()?;
             let call = Call::bounded_wait(p, method).change_timeout(secs);
             let label = format!("{p}.{}", method.escape_debug());
             let reply = self.sent(&p, label, call.with_raw_args(&enc.bytes).into_future()).await.map_err(|e| {

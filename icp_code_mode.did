@@ -83,6 +83,17 @@ type Limits = record {
   // by fast query calls, which a single malicious node could alter.
   certified_reads : opt bool;
 };
+type Metrics = record {
+  stable_memory_bytes : nat64;
+  // Wasm (heap) memory in bytes, as the IC counts it: it grows and never shrinks.
+  wasm_memory_bytes : nat64;
+  pending_runs : nat32;
+  // Heap bytes in use now; allocation fails past 1 GiB (see `HEAP_CEILING`).
+  live_heap_bytes : nat64;
+  cycle_balance : nat;
+  active_runs : nat32;
+  audit_log_len : nat64;
+};
 type PolicyView = record {
   // Runs (by `run_id`) that have sent messages and not ended: still waiting on a reply.
   pending_run_ids : vec nat64;
@@ -92,7 +103,8 @@ type PolicyView = record {
   // used instead of fetching that canister's own interface.
   candid_overrides : vec record { text; nat64; text };
   allowlist : vec record { principal; vec text };
-  // Scripts running right now (at most `MAX_CONCURRENT_RUNS`).
+  // Run slots taken (at most `MAX_CONCURRENT_RUNS`): scripts and searches that fetch,
+  // in flight or lingering after a trap.
   active_runs : nat32;
   limits : Limits;
 };
@@ -102,6 +114,9 @@ service : (opt InitArgs) -> {
   get_audit_log_len : () -> (nat64) query;
   // Newest first; `limit` is capped at 100.
   get_audit_logs : (nat64, nat64) -> (vec AuditEntry) query;
+  // Cycles, memory and run counts for operators. Like every query, it is refused while the
+  // canister is frozen or stopping; `icp canister status` still works then.
+  get_metrics : () -> (Metrics) query;
   get_policy : () -> (PolicyView) query;
   http_request : (HttpRequest) -> (HttpResponse) query;
   http_request_update : (HttpUpdateRequest) -> (HttpResponse);
@@ -110,9 +125,10 @@ service : (opt InitArgs) -> {
   set_allowlist : (principal, vec text) -> ();
   // Register (or clear, with `null`) a `.did` for a target. While set it takes precedence:
   // the target's own interface is not fetched or refreshed. `remove_allowlist` does not
-  // clear it.
+  // clear it. Arguments that do not match the types (`opt blob`) are refused.
   set_candid_override : (principal, opt text) -> (Result);
-  // Replaces every field (an omitted `opt` field is `null`, which means its default) and
-  // returns the previous limits.
+  // Sets the limits and returns the previous ones. An omitted or `null` optional field
+  // keeps its current value; give it explicitly to change it (`opt 300`, `opt false`,
+  // `opt 120` are the defaults). Arguments that do not match the types are refused.
   set_limits : (Limits) -> (Limits);
 }
