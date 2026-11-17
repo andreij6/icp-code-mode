@@ -1,0 +1,26 @@
+# yaml-language-server: $schema=https://github.com/dfinity/icp-cli/raw/refs/tags/v1.7.0/docs/schemas/icp-yaml-schema.json
+#
+# Explicit build steps instead of the @dfinity/rust recipe so Cargo features can
+# select the embedded runtimes. Default: all-in-one router (js + python + rhai).
+# For a dedicated worker, copy the entry, rename it, and build with e.g.
+#   cargo build ... --no-default-features --features rhai --target-dir target/rhai
+canisters:
+  - name: icp_code_mode
+    build:
+      steps:
+        - type: script
+          commands:
+            - "command -v ic-wasm >/dev/null 2>&1 || { echo >&2 'ic-wasm not found, see https://github.com/dfinity/ic-wasm'; exit 1; }"
+            - cargo build --package icp_code_mode --target wasm32-unknown-unknown --release --locked
+            - cp target/wasm32-unknown-unknown/release/icp_code_mode.wasm "$ICP_WASM_OUTPUT_PATH"
+            - ic-wasm "$ICP_WASM_OUTPUT_PATH" -o "$ICP_WASM_OUTPUT_PATH" metadata candid:service -f icp_code_mode.did -v public
+            - ic-wasm "$ICP_WASM_OUTPUT_PATH" -o "$ICP_WASM_OUTPUT_PATH" shrink
+    # `opt InitArgs`; tokens and allowlist can also be managed after deploy (see README).
+    init_args: "(null)"
+
+# Local network on 8010 so it can run beside other projects' networks (default 8000).
+networks:
+  - name: local
+    mode: managed
+    gateway:
+      port: 8010

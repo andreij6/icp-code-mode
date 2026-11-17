@@ -1,0 +1,9 @@
+# ICP replicas expose no JS host and no OS RNG. `wasm_js` would add wasm-bindgen
+# imports (uninstallable canister), so getrandom 0.3/0.4 use the "custom" backend,
+# implemented deterministically in src/lib.rs (`__getrandom_v03_custom`).
+#
+# The stack is raised from Rust's 1 MiB wasm default to 8 MiB: the script engines
+# recurse natively on some inputs (e.g. Rhai's data-size check on nested arrays,
+# Monty's parser), and a stack overflow is a trap that discards the audit entry.
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg', 'getrandom_backend="custom"', '-C', 'link-arg=-zstack-size=8388608']

@@ -1,0 +1,75 @@
+type AuditEntry = record {
+  id : nat64;
+  status : AuditStatus;
+  timestamp_ns : nat64;
+  calls : nat32;
+  violations : vec text;
+  instructions : nat64;
+  error : opt text;
+  language : text;
+  canisters : vec text;
+  // First 16 hex chars of the bearer token's SHA-256 (never the token itself).
+  caller : text;
+  script_sha256 : text;
+};
+type AuditStatus = variant {
+  Ok;
+  // Written before a script's first outbound message; a `Started` entry with no
+  // later entry for the same script hash means the run trapped after reaching the network.
+  Started;
+  Error;
+  PolicyViolation;
+};
+type HttpRequest = record {
+  url : text;
+  method : text;
+  body : blob;
+  headers : vec record { text; text };
+  certificate_version : opt nat16;
+};
+type HttpResponse = record {
+  body : blob;
+  headers : vec record { text; text };
+  upgrade : opt bool;
+  status_code : nat16;
+};
+type HttpUpdateRequest = record {
+  url : text;
+  method : text;
+  body : blob;
+  headers : vec record { text; text };
+};
+type InitArgs = record {
+  // SHA-256 hex digests of bearer tokens: `echo -n "$TOKEN" | shasum -a 256`.
+  token_sha256 : vec text;
+  allowlist : vec record { principal; vec text };
+  limits : opt Limits;
+};
+type Limits = record {
+  max_calls_per_script : nat32;
+  // Checked against `call_context_instruction_counter()` before every call and after the run.
+  max_instructions : nat64;
+};
+type PolicyView = record {
+  // (token hash prefix, label)
+  tokens : vec record { text; text };
+  allowlist : vec record { principal; vec text };
+  limits : Limits;
+};
+type Result = variant { Ok; Err : text };
+service : (opt InitArgs) -> {
+  add_api_token_hash : (text, text) -> (Result);
+  get_audit_log_len : () -> (nat64) query;
+  // Newest first; `limit` is capped at 100.
+  get_audit_logs : (nat64, nat64) -> (vec AuditEntry) query;
+  get_policy : () -> (PolicyView) query;
+  http_request : (HttpRequest) -> (HttpResponse) query;
+  http_request_update : (HttpUpdateRequest) -> (HttpResponse);
+  remove_allowlist : (principal) -> (bool);
+  revoke_api_token_hash : (text) -> (bool);
+  set_allowlist : (principal, vec text) -> ();
+  // Register (or clear, with `null`) a `.did` for a target that does not expose
+  // `__get_candid_interface_tmp_hack`.
+  set_candid_override : (principal, opt text) -> (Result);
+  set_limits : (Limits) -> ();
+}

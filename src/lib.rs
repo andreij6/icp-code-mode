@@ -1,0 +1,358 @@
+//! ICP canister exposing a single MCP "Code Mode" tool, `execute_icp_script`,
+//! over the HTTP gateway. See README.md for deployment and curl examples.
+
+pub mod bridge;
+pub mod candid_bridge;
+pub mod mcp;
+pub mod policy;
+pub mod runtimes;
+pub mod search;
+
+use bridge::IcBridge;
+use candid::{CandidType, Deserialize, Principal};
+use mcp::{HttpRequest, HttpResponse, HttpUpdateRequest, ToolCall, ToolRequest};
+use search::{Entry, SearchArgs};
+use policy::{AuditEntry, AuditStatus, Limits};
+use runtimes::LanguageRouter;
+
+#[derive(CandidType, Deserialize, Default)]
+pub struct InitArgs {
+    /// SHA-256 hex digests of bearer tokens: `echo -n "$TOKEN" | shasum -a 256`.
+    pub token_sha256: Vec<String>,
+    pub allowlist: Vec<(Principal, Vec<String>)>,
+    pub limits: Option<Limits>,
+}
+
+#[derive(CandidType, Deserialize)]
+pub struct PolicyView {
+    pub limits: Limits,
+    pub allowlist: Vec<(Principal, Vec<String>)>,
+    /// (token hash prefix, label)
+    pub tokens: Vec<(String, String)>,
+}
+
+fn apply(args: Option<InitArgs>) {
+    let Some(a) = args else { return };
+    for h in a.token_sha256 {
+        policy::add_token_hash(&h, "init".into()).unwrap_or_else(|e| ic_cdk::trap(e));
+    }
+    for (c, m) in a.allowlist {
+        policy::set_allowed(c, m);
+    }
+    if let Some(l) = a.limits {
+        policy::set_limits(l);
+    }
+}
+
+/// `ic_http_certification::utils::skip_certification_certified_data()`: lets the
+/// gateway accept uncertified *query* responses (initialize, tools/list) on the
+/// certified domain. Script results come from `http_request_update`, which is
+/// certified by consensus anyway.
+const SKIP_CERT_DATA: [u8; 32] = [
+    85, 236, 195, 28, 62, 128, 71, 252, 21, 143, 32, 234, 10, 160, 96, 154, 172, 199, 181, 126, 6, 234, 64, 220, 65, 134,
+    2, 114, 167, 214, 66, 145,
+];
+
+// All state lives in stable structures, so no pre_upgrade serialization is needed;
+// post_upgrade accepts the same (optional) args to adjust policy during an upgrade.
+#[ic_cdk::init]
+fn init(args: Option<InitArgs>) {
+    ic_cdk::api::certified_data_set(SKIP_CERT_DATA);
+    apply(args);
+}
+
+#[ic_cdk::post_upgrade]
+fn post_upgrade(args: Option<InitArgs>) {
+    ic_cdk::api::certified_data_set(SKIP_CERT_DATA); // certified data resets on upgrade
+    apply(args);
+}
+
+// ---------- HTTP gateway ----------
+
+#[ic_cdk::query]
+fn http_request(req: HttpRequest) -> HttpResponse {
+    use base64::Engine;
+    let mut r = mcp::http_query(&req, search_cached);
+    // Only available in non-replicated queries.
+    if let (None, Some(cert)) = (r.upgrade, ic_cdk::api::data_certificate()) {
+        let cert = base64::engine::general_purpose::STANDARD.encode(cert);
+        r.headers.push((
+            "IC-Certificate".into(),
+            format!(
+                "certificate=:{cert}:, tree=:2dn3gwJJaHR0cF9leHBygwJDPCo+gwJYIMMautvQsFn51GT9bfTani3Ah659C0BGjTNyJtQTszcjggNA:, expr_path=:2dn3gmlodHRwX2V4cHJjPCo+:, version=2"
+            ),
+        ));
+        r.headers.push((
+            "IC-CertificateExpression".into(),
+            "default_certification(ValidationArgs{no_certification:Empty{}})".into(),
+        ));
+    }
+    r
+}
+
+#[ic_cdk::update]
+async fn http_request_update(req: HttpUpdateRequest) -> HttpResponse {
+    mcp::http_update(&req, run_tool).await
+}
+
+async fn run_tool(caller_hash: &str, req: ToolRequest) -> serde_json::Value {
+    match req {
+        ToolRequest::Execute(call) => run_script(caller_hash, call).await,
+        ToolRequest::Search(args) => run_search(caller_hash, args).await,
+    }
+}
+
+/// Search from cached interfaces only; `None` if one must be fetched (needs an update).
+fn search_cached(args: &SearchArgs) -> Option<serde_json::Value> {
+    let entries = search::scope(args, policy::list_allowed())
+        .into_iter()
+        .map(|(canister, allowed)| Some(Entry { service: Ok(Some(bridge::cached_service(&canister)?)), canister, allowed }))
+        .collect::<Option<Vec<_>>>()?;
+    Some(search::render(args, &entries))
+}
+
+/// Update-path search: fetch the interfaces that are not cached yet (counted and
+/// audited like script calls), then render.
+async fn run_search(caller_hash: &str, args: SearchArgs) -> serde_json::Value {
+    let caller = caller_hash.get(..16).unwrap_or(caller_hash).to_string();
+    let key = format!("search:{}:{}", args.query.as_deref().unwrap_or(""), args.canister_id.as_deref().unwrap_or(""));
+    let script_sha256 = policy::sha256_hex(key.as_bytes());
+    let bridge = IcBridge::new(caller.clone(), "search", script_sha256.clone());
+    let mut entries = vec![];
+    for (canister, allowed) in search::scope(&args, policy::list_allowed()) {
+        let service = match bridge::cached_service(&canister) {
+            Some(s) => Ok(Some(s)),
+            None => {
+                use bridge::HostBridge;
+                bridge.candid(&canister.to_text()).await.map(|_| bridge::cached_service(&canister))
+            }
+        };
+        entries.push(Entry { canister, allowed, service });
+    }
+    let result = search::render(&args, &entries);
+    // Fetching sent messages (and wrote a `Started` entry): close it like a script run.
+    if bridge.calls() > 0 {
+        let violations = bridge.violations.take();
+        policy::append_audit(AuditEntry {
+            id: 0,
+            timestamp_ns: ic_cdk::api::time(),
+            caller,
+            language: "search".into(),
+            script_sha256,
+            canisters: bridge.touched.take().into_iter().collect(),
+            calls: bridge.calls(),
+            instructions: bridge.instructions_used(),
+            status: if violations.is_empty() { AuditStatus::Ok } else { AuditStatus::PolicyViolation },
+            violations,
+            error: None,
+        });
+    }
+    mcp::tool_result(Ok(result), vec![])
+}
+
+/// Audit `error` cap; the full text already went to the client (truncated there too).
+const MAX_AUDIT_ERROR_BYTES: usize = 4096;
+
+async fn run_script(caller_hash: &str, call: ToolCall) -> serde_json::Value {
+    let caller = caller_hash.get(..16).unwrap_or(caller_hash).to_string();
+    let script_sha256 = policy::sha256_hex(call.code.as_bytes());
+    let bridge = IcBridge::new(caller.clone(), call.language.as_str(), script_sha256.clone());
+    let mut out = LanguageRouter::execute(call.language, &call.code, &bridge).await;
+    let instructions = bridge.instructions_used();
+    let max = policy::limits().max_instructions;
+    if instructions > max {
+        let e = format!("policy: instruction budget exceeded ({instructions} > {max})");
+        out = Err(bridge.deny(e));
+    }
+    let mut violations = bridge.violations.take();
+    if let n @ 1.. = bridge.violations_dropped.get() {
+        violations.push(format!("…and {n} more"));
+    }
+    let status = match (&out, violations.is_empty()) {
+        (_, false) => AuditStatus::PolicyViolation,
+        (Err(_), true) => AuditStatus::Error,
+        (Ok(_), true) => AuditStatus::Ok,
+    };
+    let error = out.as_ref().err().map(|e| {
+        let mut e = e.clone();
+        bridge::truncate(&mut e, MAX_AUDIT_ERROR_BYTES);
+        e
+    });
+    policy::append_audit(AuditEntry {
+        id: 0,
+        timestamp_ns: ic_cdk::api::time(),
+        caller,
+        language: call.language.as_str().into(),
+        script_sha256,
+        canisters: bridge.touched.take().into_iter().collect(),
+        calls: bridge.calls(),
+        instructions,
+        status,
+        violations,
+        error,
+    });
+    mcp::tool_result(out, bridge.logs.take())
+}
+
+// ---------- admin (controllers only) ----------
+
+fn controller() -> Result<(), String> {
+    if ic_cdk::api::is_controller(&ic_cdk::api::msg_caller()) {
+        Ok(())
+    } else {
+        Err("caller is not a controller".into())
+    }
+}
+
+#[ic_cdk::update(guard = "controller")]
+fn set_allowlist(canister: Principal, methods: Vec<String>) {
+    policy::set_allowed(canister, methods);
+}
+
+#[ic_cdk::update(guard = "controller")]
+fn remove_allowlist(canister: Principal) -> bool {
+    policy::remove_allowed(canister)
+}
+
+#[ic_cdk::update(guard = "controller")]
+fn set_limits(limits: Limits) {
+    policy::set_limits(limits);
+}
+
+#[ic_cdk::update(guard = "controller")]
+fn add_api_token_hash(sha256_hex: String, label: String) -> Result<(), String> {
+    policy::add_token_hash(&sha256_hex, label)
+}
+
+#[ic_cdk::update(guard = "controller")]
+fn revoke_api_token_hash(sha256_hex: String) -> bool {
+    policy::revoke_token_hash(&sha256_hex)
+}
+
+/// Register (or clear, with `null`) a `.did` for a target that does not expose
+/// `__get_candid_interface_tmp_hack`.
+#[ic_cdk::update(guard = "controller")]
+fn set_candid_override(canister: Principal, did: Option<String>) -> Result<(), String> {
+    if let Some(d) = &did {
+        candid_bridge::Service::parse(d)?;
+    }
+    policy::set_candid_override(canister, did);
+    Ok(())
+}
+
+#[ic_cdk::query(guard = "controller")]
+fn get_policy() -> PolicyView {
+    PolicyView { limits: policy::limits(), allowlist: policy::list_allowed(), tokens: policy::list_tokens() }
+}
+
+/// Newest first; `limit` is capped at 100.
+#[ic_cdk::query(guard = "controller")]
+fn get_audit_logs(offset: u64, limit: u64) -> Vec<AuditEntry> {
+    policy::audit_page(offset, limit)
+}
+
+#[ic_cdk::query(guard = "controller")]
+fn get_audit_log_len() -> u64 {
+    policy::audit_len()
+}
+
+/// Monty's `ResourceLimits::max_memory` is only enforced when the global
+/// allocator reports into `monty_types::LIVE_MEMORY`.
+#[cfg(feature = "python")]
+pub(crate) mod counting_alloc {
+    use monty_types::LIVE_MEMORY;
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::Ordering::Relaxed;
+
+    // Native tests run in parallel threads; only count the thread running Python so
+    // other tests' heap traffic cannot skew the limit. The canister is single-threaded.
+    #[cfg(test)]
+    thread_local!(pub static COUNT_THIS_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) });
+
+    fn counted() -> bool {
+        #[cfg(test)]
+        return COUNT_THIS_THREAD.try_with(|c| c.get()).unwrap_or(false);
+        #[cfg(not(test))]
+        true
+    }
+
+    fn add(n: usize) {
+        if counted() {
+            LIVE_MEMORY.fetch_add(n, Relaxed);
+        }
+    }
+
+    fn sub(n: usize) {
+        if counted() {
+            let _ = LIVE_MEMORY.try_update(Relaxed, Relaxed, |v| Some(v.saturating_sub(n)));
+        }
+    }
+
+    struct Counting;
+
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            let p = unsafe { System.alloc(l) };
+            if !p.is_null() {
+                add(l.size());
+            }
+            p
+        }
+        unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+            let p = unsafe { System.alloc_zeroed(l) };
+            if !p.is_null() {
+                add(l.size());
+            }
+            p
+        }
+        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+            unsafe { System.dealloc(p, l) };
+            sub(l.size());
+        }
+        unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
+            let q = unsafe { System.realloc(p, l, new) };
+            if !q.is_null() {
+                add(new);
+                sub(l.size());
+            }
+            q
+        }
+    }
+
+    #[global_allocator]
+    static ALLOC: Counting = Counting;
+}
+
+ic_cdk::export_candid!();
+
+/// ICP replicas have no OS RNG. getrandom 0.3 and 0.4 (pulled in by ahash and
+/// boa's `rand`) both resolve the "custom" backend (see .cargo/config.toml) to this
+/// symbol. Replicas must agree bit-for-bit, so it is a fixed deterministic stream:
+/// fine for hash seeding, never use it for secrets.
+#[cfg(target_arch = "wasm32")]
+#[unsafe(no_mangle)]
+unsafe extern "Rust" fn __getrandom_v03_custom(dest: *mut u8, len: usize) -> Result<(), getrandom::Error> {
+    use std::cell::Cell;
+    thread_local!(static STATE: Cell<u64> = const { Cell::new(0x9E37_79B9_7F4A_7C15) });
+    STATE.with(|s| {
+        for i in 0..len {
+            // splitmix64
+            let mut z = s.get().wrapping_add(0x9E37_79B9_7F4A_7C15);
+            s.set(z);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            unsafe { *dest.add(i) = (z ^ (z >> 31)) as u8 };
+        }
+    });
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn did_file_matches_exported_interface() {
+        let expected = super::__export_service();
+        let actual = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/icp_code_mode.did")).unwrap();
+        assert_eq!(actual.trim(), expected.trim(), "regenerate icp_code_mode.did (see README)");
+    }
+}
