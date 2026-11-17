@@ -191,7 +191,7 @@ pub fn text_bytes(v: &Value) -> usize {
     }
 }
 
-pub use ic::{IcBridge, MAX_DID_BYTES, MAX_RUN_SECONDS, cached_service, evict_interface, pending_run_ids, remember_override};
+pub use ic::{IcBridge, MAX_DID_BYTES, cached_service, evict_interface, pending_run_ids, remember_override};
 
 /// Whether a refusal from an interface fetch would refuse every further fetch of the run too
 /// (call cap, budget, stopping, revoked token, time limit, in-flight or cycles limit), as
@@ -200,6 +200,16 @@ pub use ic::{IcBridge, MAX_DID_BYTES, MAX_RUN_SECONDS, cached_service, evict_int
 pub fn refuses_whole_run(e: &str) -> bool {
     e.starts_with("policy:") && !e.contains("is not allowlisted")
 }
+
+/// Wall-clock limit for one run (script or search). Each call's timeout is cut to the time
+/// left, so no run holds a slot, or this canister's stop, for longer.
+pub const MAX_RUN_SECONDS: u64 = 600;
+/// How long a run's bookkeeping (slot, pending id) is kept after the run trapped: its other
+/// calls may still be outstanding, and every call is bounded-wait (at most 300 s, plus margin).
+pub const TRAP_LINGER_SECONDS: u64 = 360;
+/// Past this age a run's bookkeeping is stale (left by a snapshot load, for instance): no run
+/// lasts longer than `MAX_RUN_SECONDS`, then lingers at most `TRAP_LINGER_SECONDS`.
+pub const STALE_RUN_MS: u64 = (MAX_RUN_SECONDS + TRAP_LINGER_SECONDS) * 1000;
 
 /// Instructions executed so far in this call context (0 off-chain).
 pub fn instruction_counter() -> u64 {
@@ -260,9 +270,6 @@ mod ic {
     // ponytail: fixed floor of about two calls' reply reservation; make it a Limits field
     // if operators need to tune it.
     const MIN_LIQUID_CYCLES: u128 = 100_000_000_000;
-    /// Wall-clock limit for one run: no message is sent after it, and each message's
-    /// timeout is cut to what is left. Bounds how long a run holds its slot.
-    pub const MAX_RUN_SECONDS: u64 = 600;
 
     /// (.did text, parsed service, fetch time in ns).
     type Fetched = (String, Rc<Service>, u64);
@@ -274,9 +281,10 @@ mod ic {
         // ponytail: heap cache keyed by canonical principal text, emptied on upgrade
         // (re-fetched on demand); bounded by the allowlist size.
         static DID_CACHE: RefCell<BTreeMap<String, Fetched>> = RefCell::default();
-        // Runs that wrote a `Started` entry and have not ended. Lets an auditor tell a run
-        // still waiting on a reply from one that ended without a final entry.
-        static PENDING_RUNS: RefCell<BTreeSet<u64>> = RefCell::default();
+        // Runs that wrote a `Started` entry and have not ended, with the time (ms) after which
+        // the entry is dropped as stale. Lets an auditor tell a run still waiting on a reply
+        // from one that ended without a final entry.
+        static PENDING_RUNS: RefCell<BTreeMap<u64, u64>> = RefCell::default();
         // Recent fetch failures: (error, time in ns).
         static DID_FAILED: RefCell<BTreeMap<String, (String, u64)>> = RefCell::default();
         // Parsed admin overrides: (.did text it was parsed from, service).
@@ -417,10 +425,16 @@ mod ic {
     }
 
     /// Run ids (see `AuditEntry::run_id`) with outbound messages sent and no end yet. Kept
-    /// in memory: a run leaves the list when it finishes or when its trap is cleaned up,
-    /// and the list is empty after an upgrade.
+    /// in memory: a run leaves the list when it finishes, `TRAP_LINGER_SECONDS` after its
+    /// trap is cleaned up (its other calls may still be outstanding), or once stale; the
+    /// list is empty after an upgrade.
     pub fn pending_run_ids() -> Vec<u64> {
-        PENDING_RUNS.with(|r| r.borrow().iter().copied().collect())
+        let now = now_ms();
+        PENDING_RUNS.with(|r| {
+            let mut r = r.borrow_mut();
+            r.retain(|_, until| *until > now);
+            r.keys().copied().collect()
+        })
     }
 
     /// The run is over, however it ended: normally, or by ic-cdk dropping the future while
@@ -433,8 +447,14 @@ mod ic {
     impl Drop for IcBridge {
         fn drop(&mut self) {
             let Some(id) = self.started.get() else { return };
-            PENDING_RUNS.with(|r| r.borrow_mut().remove(&id));
-            if self.finished.get() || !ic_cdk::futures::is_recovering_from_trap() {
+            let trapped = ic_cdk::futures::is_recovering_from_trap();
+            PENDING_RUNS.with(|r| match trapped {
+                // Sibling calls of a batch may still be outstanding: keep the run listed
+                // until they must have ended.
+                true => r.borrow_mut().insert(id, now_ms() + TRAP_LINGER_SECONDS * 1000).map(|_| ()),
+                false => r.borrow_mut().remove(&id).map(|_| ()),
+            });
+            if self.finished.get() || !trapped {
                 return;
             }
             // Must not trap: that would also undo the slot and pending-id release above.
@@ -671,7 +691,12 @@ mod ic {
 
         /// Record a refusal. Past `MAX_VIOLATIONS`, the first half is kept and the second
         /// half slides, so a script cannot hide a late refusal behind early junk ones.
+        /// Running out of budget once messages went out is not a violation: the run closes
+        /// as `Error` (see `close_over_budget` in lib.rs).
         pub fn deny(&self, e: String) -> String {
+            if self.calls() > 0 && e.starts_with("policy: instruction budget exceeded") {
+                return e;
+            }
             let mut short = e.clone();
             truncate(&mut short, MAX_VIOLATION_BYTES);
             let mut v = self.violations.borrow_mut();
@@ -805,7 +830,7 @@ mod ic {
             });
             if run.is_none() {
                 self.started.set(Some(id));
-                PENDING_RUNS.with(|r| r.borrow_mut().insert(id));
+                PENDING_RUNS.with(|r| r.borrow_mut().insert(id, now_ms() + STALE_RUN_MS));
             }
         }
 
@@ -1130,7 +1155,7 @@ mod ic {
             assert!(timeout_left(5 * s, 5 * s + (MAX_RUN_SECONDS * s) - 1, 300).is_err());
 
             // Through the gate: an allowlisted call is refused once the run is too old.
-            policy::set_allowed(fx(), vec!["*".into()]);
+            policy::set_allowed(fx(), vec!["*".into()]).unwrap();
             let b = bridge();
             assert!(b.reserve(&fx(), Some("m")).is_ok());
             TEST_NOW.set(MAX_RUN_SECONDS * s);
@@ -1173,12 +1198,12 @@ mod ic {
         fn removal_and_revocation_during_an_await_are_honoured() {
             let b = bridge();
             let svc = Rc::new(Service::parse("service : { tick : () -> () }").unwrap());
-            policy::set_allowed(fx(), vec!["*".into()]);
+            policy::set_allowed(fx(), vec!["*".into()]).unwrap();
             assert!(b.reserve(&fx(), Some("tick")).is_ok());
             policy::remove_allowed(fx()); // during the fetch
             assert!(b.keep(&fx(), "did".into(), svc.clone()).unwrap_err().contains("not allowlisted"));
             assert!(cached_service(&fx(), true).is_none(), "nothing cached for a removed canister");
-            policy::set_allowed(fx(), vec!["*".into()]);
+            policy::set_allowed(fx(), vec!["*".into()]).unwrap();
             assert!(b.keep(&fx(), "did".into(), svc).is_ok());
 
             assert!(b.recheck(&fx(), Some("tick")).is_ok());
@@ -1193,7 +1218,7 @@ mod ic {
         #[test]
         fn run_keeps_the_limits_it_started_with() {
             policy::set_limits(Limits::default());
-            policy::set_allowed(fx(), vec!["*".into()]);
+            policy::set_allowed(fx(), vec!["*".into()]).unwrap();
             let b = bridge();
             policy::set_limits(Limits { max_calls_per_script: 0, max_instructions: 1, call_timeout_seconds: Some(5), ..Limits::default() });
             assert_eq!(b.recheck(&fx(), Some("m")), Ok(policy::DEFAULT_CALL_TIMEOUT_SECONDS));
@@ -1221,7 +1246,7 @@ mod ic {
         /// its share, the rest stay open to other tokens, and the global cap still holds.
         #[test]
         fn in_flight_messages_are_capped_per_token_and_overall() {
-            policy::set_allowed(fx(), vec!["*".into()]);
+            policy::set_allowed(fx(), vec!["*".into()]).unwrap();
             let (a, b, c) = (bridge_for(b"a"), bridge_for(b"b"), bridge_for(b"c"));
             let pending = || -> Msg<'static> { Box::pin(std::future::pending()) };
             let x = fx();
@@ -1257,7 +1282,7 @@ mod ic {
         /// outcome, also a failure that is not remembered (a stopped target).
         #[test]
         fn concurrent_requests_share_one_fetch_and_its_failure() {
-            policy::set_allowed(fx(), vec!["*".into()]);
+            policy::set_allowed(fx(), vec!["*".into()]).unwrap();
             net(|_, _| reject(RejectCode::CanisterError, "Canister x is stopped"));
             let b = bridge();
             let (r1, r2) = block_on(futures::future::join(b.candid(FX), b.candid(FX)));
@@ -1283,7 +1308,7 @@ mod ic {
         /// remembered, however lasting it looks; after a good canister_info it is.
         #[test]
         fn fallback_failure_after_a_failed_canister_info_is_not_remembered() {
-            policy::set_allowed(fx(), vec!["*".into()]);
+            policy::set_allowed(fx(), vec!["*".into()]).unwrap();
             let no_method = || reject(RejectCode::CanisterError, "Canister x has no query method '__get_candid_interface_tmp_hack'");
             net(move |_, m| match m {
                 "canister_info" => reject(RejectCode::SysUnknown, "deadline expired"),
@@ -1309,7 +1334,7 @@ mod ic {
         /// re-fetch fails transiently.
         #[test]
         fn expired_interface_is_served_when_the_refetch_fails_transiently() {
-            policy::set_allowed(fx(), vec!["*".into()]);
+            policy::set_allowed(fx(), vec!["*".into()]).unwrap();
             let svc = Rc::new(Service::parse(DID).unwrap());
             DID_CACHE.with(|c| c.borrow_mut().insert(FX.into(), (DID.into(), svc, 0)));
             TEST_NOW.set(DID_CACHE_TTL_NS + 1);
@@ -1325,7 +1350,7 @@ mod ic {
         /// fetch's replies, not from another message's reply in the same run.
         #[test]
         fn only_a_trap_in_this_fetchs_reply_is_remembered() {
-            policy::set_allowed(fx(), vec!["*".into()]);
+            policy::set_allowed(fx(), vec!["*".into()]).unwrap();
             for replied in [false, true] {
                 let ready = Rc::new(Cell::new(false));
                 let r = ready.clone();
@@ -1352,7 +1377,7 @@ mod ic {
         /// is not cached by `candid`.
         #[test]
         fn candid_does_not_cache_for_a_canister_removed_during_the_fetch() {
-            policy::set_allowed(fx(), vec!["*".into()]);
+            policy::set_allowed(fx(), vec!["*".into()]).unwrap();
             net(|_, m| match m {
                 "canister_info" => Ok(candid::encode_one(InfoResult { controllers: vec![] }).unwrap()),
                 _ => {
@@ -1369,13 +1394,13 @@ mod ic {
         /// 191: `call` refuses a composite_query before encoding its arguments.
         #[test]
         fn call_refuses_composite_query_before_encoding() {
-            policy::set_allowed(fx(), vec!["*".into()]);
-            policy::set_candid_override(fx(), Some("service : { c : (nat) -> (nat) composite_query }".into()));
+            policy::set_allowed(fx(), vec!["*".into()]).unwrap();
+            policy::set_candid_override(fx(), Some("service : { c : (nat) -> (nat) composite_query }".into())).unwrap();
             let b = bridge();
             let e = block_on(b.call(FX, "c", json!("not-a-number"))).unwrap_err();
             assert!(e.contains("composite_query"), "{e}");
             assert_eq!(b.calls(), 0);
-            policy::set_candid_override(fx(), None);
+            policy::set_candid_override(fx(), None).unwrap();
             reset();
         }
 
@@ -1387,6 +1412,21 @@ mod ic {
             assert!(refuses_whole_run("policy: the canister is stopping; no new calls"));
             assert!(!refuses_whole_run("could not fetch candid for x (y)"));
         }
+    }
+
+    /// 77: a budget refusal at send time is a violation only while nothing was sent.
+    #[cfg(test)]
+    #[test]
+    fn budget_refusal_after_sends_is_not_a_violation() {
+        let b = IcBridge::new("c".into(), "javascript", "h".into());
+        let over = || "policy: instruction budget exceeded (11 > 10)".to_string();
+        b.deny(over());
+        assert_eq!(b.violations.borrow().len(), 1);
+        b.messages.borrow_mut().push("x.icrc1_transfer".into());
+        b.deny(over());
+        assert_eq!(b.violations.borrow().len(), 1, "not recorded once a message went out");
+        b.deny("policy: method `m` on x is not allowlisted".into());
+        assert_eq!(b.violations.borrow().len(), 2, "other refusals still are");
     }
 }
 

@@ -739,7 +739,7 @@ mod tests {
         assert!(allowed_entry_ok(&Principal::from_text(LEDGER).unwrap(), &["*".into()], Some(me)).is_ok());
         // An entry stored before the check: refused at call time.
         ALLOWLIST.with(|m| m.borrow_mut().insert(mgmt, AllowedMethods(vec!["*".into()])));
-        assert!(check_call(&mgmt, "stop_canister", 0, 0).unwrap_err().contains("management canister"));
+        assert!(check_call(&mgmt, "stop_canister", 0, 0, &limits()).unwrap_err().contains("management canister"));
         remove_allowed(mgmt);
     }
 
