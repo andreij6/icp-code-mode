@@ -24,6 +24,9 @@ pub const MAX_REPLY_BYTES: usize = 1_900_000;
 /// Messages per JSON-RPC batch. Without a cap, thousands of tiny invalid messages
 /// inflate the reply past the limit, and the resulting trap rolls back the audit entry.
 pub const MAX_BATCH: usize = 50;
+/// Searches per HTTP request. Each one may fetch interfaces under its own call cap, so
+/// an uncapped batch would multiply outbound messages and audit entries.
+pub const MAX_SEARCHES: usize = 5;
 
 #[derive(CandidType, Deserialize, Clone, Debug)]
 pub struct HttpRequest {
@@ -379,6 +382,7 @@ pub async fn http_update(req: &HttpUpdateRequest, exec: impl AsyncFn(&str, ToolR
     };
     let mut replies = vec![];
     let mut ran_script = false;
+    let mut searches = 0;
     for m in &msgs {
         match classify(m) {
             Msg::Done(r) => replies.extend(r),
@@ -388,8 +392,12 @@ pub async fn http_update(req: &HttpUpdateRequest, exec: impl AsyncFn(&str, ToolR
             Msg::ToolCall(id, Ok(ToolRequest::Execute(_))) if ran_script => {
                 replies.push(rpc_error(id, -32600, "only one execute_icp_script call per HTTP request"))
             }
+            Msg::ToolCall(id, Ok(ToolRequest::Search(_))) if searches >= MAX_SEARCHES => {
+                replies.push(rpc_error(id, -32600, format!("at most {MAX_SEARCHES} searches per HTTP request")))
+            }
             Msg::ToolCall(id, Ok(req)) => {
                 ran_script |= matches!(req, ToolRequest::Execute(_));
+                searches += usize::from(matches!(req, ToolRequest::Search(_)));
                 replies.push(rpc_ok(id, exec(&caller, req).await));
             }
         }
@@ -664,5 +672,9 @@ mod tests {
         assert_eq!(b[1]["result"]["content"][0]["text"], "42");
         assert!(b[2]["result"].is_object(), "search after the script still runs");
         assert_eq!(b[3]["error"]["code"], -32600);
+        // Searches are capped too: each may fetch interfaces under its own call budget.
+        let b = body(&update(Value::Array((0..7).map(search).collect())));
+        let ok = b.as_array().unwrap().iter().filter(|r| r["result"].is_object()).count();
+        assert_eq!((ok, b[6]["error"]["code"].clone()), (MAX_SEARCHES, json!(-32600)));
     }
 }

@@ -152,7 +152,8 @@ fn num_text(v: &Value) -> Option<String> {
     match v {
         // Integral floats (JS numbers) are accepted as integers: 3e9 -> "3000000000".
         Value::Number(n) if n.is_f64() => match n.as_f64() {
-            Some(f) if f.fract() == 0.0 && f.abs() < 1e19 => Some(format!("{f:.0}")),
+            // `+ 0.0` turns JS's -0 into 0, which would otherwise print as "-0".
+            Some(f) if f.fract() == 0.0 && f.abs() < 1e19 => Some(format!("{:.0}", f + 0.0)),
             _ => Some(n.to_string()),
         },
         Value::Number(n) => Some(n.to_string()),
@@ -454,6 +455,7 @@ mod tests {
         // JS hands integers > 2^31 over as floats.
         let out = roundtrip("set_status", json!(["aaaaa-aa", { "Count": 3_000_000_000.0 }]));
         assert_eq!(out[1], json!({ "Count": 3_000_000_000u64 }));
+        assert!(Service::parse(DID).unwrap().encode_args("many", &json!([-0.0, null])).is_ok(), "-0 is a valid nat8");
         assert_eq!(f64_json(f64::NAN), json!("NaN"));
         assert_eq!(float(&f64_json(f64::INFINITY)).unwrap(), f64::INFINITY);
     }

@@ -29,6 +29,8 @@ pub struct PolicyView {
     pub allowlist: Vec<(Principal, Vec<String>)>,
     /// (token hash prefix, label)
     pub tokens: Vec<(String, String)>,
+    /// Scripts running right now (at most `MAX_CONCURRENT_RUNS`).
+    pub active_runs: u32,
 }
 
 fn apply(args: Option<InitArgs>) {
@@ -143,7 +145,11 @@ async fn run_search(caller_hash: &str, args: SearchArgs) -> serde_json::Value {
         };
         entries.push(Entry { canister, allowed, service });
     }
-    let result = search::render(&args, &entries);
+    let mut result = Ok(search::render(&args, &entries));
+    let (used, max) = (bridge.instructions_used(), policy::limits().max_instructions);
+    if used > max {
+        result = Err(bridge.deny(format!("policy: instruction budget exceeded ({used} > {max})")));
+    }
     let mut violations = bridge.violations.take();
     if let n @ 1.. = bridge.violations_dropped.get() {
         violations.push(format!("…and {n} more"));
@@ -177,13 +183,39 @@ async fn run_search(caller_hash: &str, args: SearchArgs) -> serde_json::Value {
             methods: Some(bridge.messages()),
         });
     }
-    mcp::tool_result(Ok(result), vec![])
+    mcp::tool_result(result, vec![])
 }
 
 /// Audit `error` cap; the full text already went to the client (truncated there too).
 const MAX_AUDIT_ERROR_BYTES: usize = 4096;
 
+/// Scripts allowed in flight at once. Each one suspended on a call keeps its VM heap
+/// alive (up to 64 MiB for Python), so an unlimited number could exhaust the canister's
+/// memory and trap every request.
+pub const MAX_CONCURRENT_RUNS: u32 = 8;
+
+thread_local!(static ACTIVE_RUNS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) });
+
+/// One of the `MAX_CONCURRENT_RUNS` slots, given back on drop. If a run traps after an
+/// await, ic-cdk drops its future in the cleanup callback, so the slot is still returned.
+struct RunSlot;
+
+impl RunSlot {
+    fn take() -> Option<Self> {
+        ACTIVE_RUNS.with(|a| (a.get() < MAX_CONCURRENT_RUNS).then(|| a.set(a.get() + 1))).map(|()| RunSlot)
+    }
+}
+
+impl Drop for RunSlot {
+    fn drop(&mut self) {
+        ACTIVE_RUNS.with(|a| a.set(a.get().saturating_sub(1)));
+    }
+}
+
 async fn run_script(caller_hash: &str, call: ToolCall) -> serde_json::Value {
+    let Some(_slot) = RunSlot::take() else {
+        return mcp::tool_result(Err(format!("busy: {MAX_CONCURRENT_RUNS} scripts are already running; retry shortly")), vec![]);
+    };
     let caller = caller_hash.get(..16).unwrap_or(caller_hash).to_string();
     let script_sha256 = policy::sha256_hex(call.code.as_bytes());
     let bridge = IcBridge::new(caller.clone(), call.language.as_str(), script_sha256.clone());
@@ -263,6 +295,7 @@ fn set_allowlist(canister: Principal, methods: Vec<String>) {
 
 #[ic_cdk::update(guard = "controller")]
 fn remove_allowlist(canister: Principal) -> bool {
+    bridge::evict_interface(&canister);
     policy::remove_allowed(canister)
 }
 
@@ -286,6 +319,9 @@ fn revoke_api_token_hash(sha256_hex: String) -> bool {
 #[ic_cdk::update(guard = "controller")]
 fn set_candid_override(canister: Principal, did: Option<String>) -> Result<(), String> {
     if let Some(d) = &did {
+        if d.len() > bridge::MAX_DID_BYTES {
+            return Err(format!("interface is {} bytes, over the {}-byte limit", d.len(), bridge::MAX_DID_BYTES));
+        }
         candid_bridge::Service::parse(d)?;
     }
     policy::set_candid_override(canister, did);
@@ -294,7 +330,12 @@ fn set_candid_override(canister: Principal, did: Option<String>) -> Result<(), S
 
 #[ic_cdk::query(guard = "controller")]
 fn get_policy() -> PolicyView {
-    PolicyView { limits: policy::limits(), allowlist: policy::list_allowed(), tokens: policy::list_tokens() }
+    PolicyView {
+        limits: policy::limits(),
+        allowlist: policy::list_allowed(),
+        tokens: policy::list_tokens(),
+        active_runs: ACTIVE_RUNS.with(|a| a.get()),
+    }
 }
 
 /// Newest first; `limit` is capped at 100.
@@ -364,8 +405,11 @@ pub(crate) mod counting_alloc {
         unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
             let q = unsafe { System.realloc(p, l, new) };
             if !q.is_null() {
-                add(new);
-                sub(l.size());
+                // Apply the net change, so the counter never shows old + new at once.
+                match new.checked_sub(l.size()) {
+                    Some(grown) => add(grown),
+                    None => sub(l.size() - new),
+                }
             }
             q
         }
@@ -401,6 +445,16 @@ unsafe extern "Rust" fn __getrandom_v03_custom(dest: *mut u8, len: usize) -> Res
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn run_slots_are_capped_and_returned() {
+        use super::{MAX_CONCURRENT_RUNS, RunSlot};
+        let mut held: Vec<RunSlot> = (0..MAX_CONCURRENT_RUNS).map(|_| RunSlot::take().expect("free slot")).collect();
+        assert!(RunSlot::take().is_none(), "no slot beyond the cap");
+        held.pop(); // a finished (or trapped and cleaned-up) run gives its slot back
+        let again = RunSlot::take();
+        assert!(again.is_some() && RunSlot::take().is_none());
+    }
+
     #[test]
     fn did_file_matches_exported_interface() {
         let expected = super::__export_service();

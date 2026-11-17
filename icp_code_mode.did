@@ -76,6 +76,8 @@ type PolicyView = record {
   // (token hash prefix, label)
   tokens : vec record { text; text };
   allowlist : vec record { principal; vec text };
+  // Scripts running right now (at most `MAX_CONCURRENT_RUNS`).
+  active_runs : nat32;
   limits : Limits;
 };
 type Result = variant { Ok; Err : text };

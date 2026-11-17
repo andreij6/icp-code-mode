@@ -40,6 +40,39 @@ pub fn budget_error(deadline: u64) -> Result<(), String> {
     }
 }
 
+/// Limits on any value crossing between a script and the host (results, call arguments,
+/// printed values), shared by all three runtimes. Depth and element count alone are not
+/// enough: one 1 MB string referenced 5,000 times is a small value inside the engine and a
+/// 5 GB one once copied out.
+pub const MAX_VALUE_NODES: usize = 200_000;
+pub const MAX_VALUE_BYTES: usize = 4 << 20;
+
+/// Running totals for one conversion.
+#[derive(Default)]
+pub struct ValueBudget {
+    nodes: usize,
+    bytes: usize,
+}
+
+impl ValueBudget {
+    /// Count one value (of any kind).
+    pub fn node(&mut self) -> Result<(), String> {
+        self.nodes += 1;
+        if self.nodes > MAX_VALUE_NODES {
+            return Err(format!("value has more than {MAX_VALUE_NODES} elements"));
+        }
+        Ok(())
+    }
+    /// Count string/key/blob payload.
+    pub fn bytes(&mut self, n: usize) -> Result<(), String> {
+        self.bytes += n;
+        if self.bytes > MAX_VALUE_BYTES {
+            return Err(format!("value holds more than {MAX_VALUE_BYTES} bytes of text"));
+        }
+        Ok(())
+    }
+}
+
 /// Deterministic "now" for script clocks: block time on-chain, 0 off-chain (tests).
 pub fn now_ms() -> u64 {
     #[cfg(target_arch = "wasm32")]
@@ -89,7 +122,7 @@ impl LogBuf {
     }
 }
 
-pub use ic::{IcBridge, cached_service};
+pub use ic::{IcBridge, MAX_DID_BYTES, cached_service, evict_interface};
 
 /// Instructions executed so far in this call context (0 off-chain).
 pub fn instruction_counter() -> u64 {
@@ -127,6 +160,12 @@ mod ic {
     const MAX_METHOD_LEN: usize = 256;
     /// How long a fetched interface is trusted before it is fetched again.
     const DID_CACHE_TTL_NS: u64 = 3600 * 1_000_000_000;
+    /// How long a failed fetch is remembered. Without this, every search or script would
+    /// repeat the same outbound calls to a target that exposes no interface.
+    const DID_FAIL_TTL_NS: u64 = 300 * 1_000_000_000;
+    /// Largest interface accepted from a target or as an override (the ICP ledger's is
+    /// 17 KB). Parsing megabytes of hostile Candid would only burn instructions.
+    pub const MAX_DID_BYTES: usize = 512 * 1024;
     /// Violations kept per script; the rest are only counted.
     const MAX_VIOLATIONS: usize = 16;
     const MAX_VIOLATION_BYTES: usize = 512;
@@ -136,16 +175,47 @@ mod ic {
         // (re-fetched on demand); bounded by the allowlist size.
         // Value: (.did text, parsed service, fetch time in ns).
         static DID_CACHE: RefCell<BTreeMap<String, (String, Rc<Service>, u64)>> = RefCell::default();
+        // Recent fetch failures: (error, time in ns).
+        static DID_FAILED: RefCell<BTreeMap<String, (String, u64)>> = RefCell::default();
+        // Parsed admin overrides: (.did text it was parsed from, service).
+        static OVERRIDES: RefCell<BTreeMap<String, (String, Rc<Service>)>> = RefCell::default();
     }
 
     /// The interface for `p` without any outbound message: an admin override, or the
     /// cache filled by an earlier fetch. `None` means it has to be fetched.
     pub fn cached_service(p: &Principal) -> Option<Rc<Service>> {
         let key = p.to_text();
-        if let Some(did) = policy::candid_override(&key) {
-            return Service::parse(&did).ok().map(Rc::new);
+        if let Some(r) = override_service(&key) {
+            return r.ok();
         }
         cache_get(&key).map(|(_, s)| s)
+    }
+
+    /// The admin override for `key`, parsed once and reused until its text changes.
+    fn override_service(key: &str) -> Option<Result<Rc<Service>, String>> {
+        let did = policy::candid_override(key)?;
+        let hit = OVERRIDES.with(|c| c.borrow().get(key).filter(|(d, _)| *d == did).map(|(_, s)| s.clone()));
+        Some(match hit {
+            Some(s) => Ok(s),
+            None => Service::parse(&did).map(|s| {
+                let s = Rc::new(s);
+                OVERRIDES.with(|c| c.borrow_mut().insert(key.to_string(), (did, s.clone())));
+                s
+            }),
+        })
+    }
+
+    /// Forget everything cached about a canister (called when it leaves the allowlist).
+    pub fn evict_interface(p: &Principal) {
+        let key = p.to_text();
+        DID_CACHE.with(|c| c.borrow_mut().remove(&key));
+        DID_FAILED.with(|c| c.borrow_mut().remove(&key));
+        OVERRIDES.with(|c| c.borrow_mut().remove(&key));
+    }
+
+    fn failed_get(key: &str) -> Option<String> {
+        let now = ic_cdk::api::time();
+        DID_FAILED.with(|c| c.borrow().get(key).filter(|(_, at)| now.saturating_sub(*at) <= DID_FAIL_TTL_NS).map(|(e, _)| e.clone()))
     }
 
     /// A cached interface, unless it is older than `DID_CACHE_TTL_NS` (then it is
@@ -269,8 +339,8 @@ mod ic {
 
         async fn service(&self, p: &Principal) -> Result<Rc<Service>, String> {
             let key = p.to_text();
-            if let Some(did) = policy::candid_override(&key) {
-                return Ok(Rc::new(Service::parse(&did)?));
+            if let Some(r) = override_service(&key) {
+                return r;
             }
             if let Some((_, s)) = cache_get(&key) {
                 return Ok(s);
@@ -327,13 +397,30 @@ mod ic {
             }
             // Fetching an interface sends messages: allowlisted canisters only, and it
             // counts against the per-script call cap.
+            if let Some(e) = failed_get(&key) {
+                return Err(e); // failed moments ago: don't send the same messages again
+            }
             self.reserve(&p, None)?;
-            let did = fetch_did(p).await.map_err(|e| {
-                format!("could not fetch candid for {key} ({e}); a controller can register it with set_candid_override")
-            })?;
-            let svc = Rc::new(Service::parse(&did)?);
-            DID_CACHE.with(|c| c.borrow_mut().insert(key, (did.clone(), svc, ic_cdk::api::time())));
-            Ok(did)
+            let fetched = fetch_did(p)
+                .await
+                .and_then(|did| match did.len() {
+                    n if n > MAX_DID_BYTES => Err(format!("interface is {n} bytes, over the {MAX_DID_BYTES}-byte limit")),
+                    _ => Ok(did),
+                })
+                .and_then(|did| Service::parse(&did).map(|svc| (did, Rc::new(svc))));
+            let now = ic_cdk::api::time();
+            match fetched {
+                Ok((did, svc)) => {
+                    DID_FAILED.with(|c| c.borrow_mut().remove(&key));
+                    DID_CACHE.with(|c| c.borrow_mut().insert(key, (did.clone(), svc, now)));
+                    Ok(did)
+                }
+                Err(e) => {
+                    let msg = format!("could not fetch candid for {key} ({e}); a controller can register it with set_candid_override");
+                    DID_FAILED.with(|c| c.borrow_mut().insert(key, (msg.clone(), now)));
+                    Err(msg)
+                }
+            }
         }
 
         async fn call(&self, canister_id: &str, method: &str, args: Value) -> Result<Value, String> {

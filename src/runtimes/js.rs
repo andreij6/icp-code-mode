@@ -6,7 +6,7 @@ use crate::bridge::{HostBridge, MAX_LOG_BYTES, budget_error, check_budget, norma
 use boa_engine::builtins::promise::{PromiseState, ResolvingFunctions};
 use boa_engine::context::time::FixedClock;
 use boa_engine::context::{ContextBuilder, HostHooks};
-use boa_engine::job::SimpleJobExecutor;
+use boa_engine::job::{GenericJob, Job, JobExecutor, PromiseJob};
 use boa_engine::module::IdleModuleLoader;
 use boa_engine::object::ObjectInitializer;
 use boa_engine::object::builtins::{JsFunction, JsPromise};
@@ -15,6 +15,8 @@ use boa_engine::realm::Realm;
 use boa_engine::{Context, JsError, JsNativeError, JsResult, JsString, JsValue, NativeFunction, Source, js_string};
 use boa_gc::{Finalize, Gc, GcRefCell, Trace};
 use serde_json::Value;
+use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::rc::Rc;
 
 pub const LOOP_ITERATION_LIMIT: u64 = 1_000_000;
@@ -28,41 +30,134 @@ pub const MAX_PENDING: usize = 64;
 /// these bounds; Boa's own `to_json` / `JSON.stringify` recurse without a limit and
 /// would overflow the wasm stack.
 pub const MAX_VALUE_DEPTH: usize = crate::candid_bridge::MAX_DEPTH;
-pub const MAX_VALUE_NODES: usize = 200_000;
+pub const MAX_VALUE_NODES: usize = crate::bridge::MAX_VALUE_NODES;
+pub const MAX_VALUE_BYTES: usize = crate::bridge::MAX_VALUE_BYTES;
+/// Promise jobs (microtasks) per script. A chain like `f = () => Promise.resolve().then(f)`
+/// has no loop and no call depth, so the loop and recursion limits never see it.
+pub const MAX_PROMISE_JOBS: u64 = 100_000;
 
 /// Installed before user code, so it only holds pristine builtins. Reads every value
 /// exactly once (getters cannot hand `to_json` a different, deeper value later), and
-/// returns a plain copy: own data properties only, depth/size bounded, `toJSON`
-/// honoured, functions/symbols dropped like `JSON.stringify` does. Also wraps
-/// `JSON.stringify` with the same bounds.
+/// returns a plain copy: own data properties only, bounded in depth, element count
+/// (every value counts, primitives included) and total text size, `toJSON` honoured,
+/// functions/symbols dropped like `JSON.stringify` does. Also wraps `JSON.stringify`
+/// with the same bounds, replacer included.
 const SNAPSHOT_JS: &str = r#"(() => {
-  const keys = Object.keys, isArray = Array.isArray, def = Object.defineProperty, str = JSON.stringify;
-  const MAXD = __MAXD__, MAXN = __MAXN__;
-  const snapshot = (root) => {
-    let nodes = 0;
+  const keys = Object.keys, isArray = Array.isArray, def = Object.defineProperty, str = JSON.stringify, apply = Reflect.apply;
+  const MAXD = __MAXD__, MAXN = __MAXN__, MAXB = __MAXB__;
+  // `replacer`: optional JSON.stringify replacer function, applied here (inside the bounds)
+  // in the order the spec gives: toJSON, then the replacer, then the type rules.
+  const snapshot = (root, replacer) => {
+    let nodes = 0, bytes = 0;
     const put = (o, k, v) => def(o, k, { value: v, writable: true, enumerable: true, configurable: true });
-    const walk = (x, d) => {
-      const t = typeof x;
+    const walk = (x, d, holder, key) => {
+      let t = typeof x;
+      if ((t === "object" && x !== null) || t === "bigint") {
+        const tj = x.toJSON;
+        if (typeof tj === "function") { x = apply(tj, x, [key]); t = typeof x; }
+      }
+      if (replacer) { x = apply(replacer, holder, [key, x]); t = typeof x; }
+      if (++nodes > MAXN) throw new RangeError("value has more than " + MAXN + " elements");
       if (t === "bigint") throw new TypeError("BigInt values cannot cross into the host; convert to string");
       if (t === "function" || t === "symbol") return undefined;
+      if (t === "string") {
+        bytes += x.length;
+        if (bytes > MAXB) throw new RangeError("value holds more than " + MAXB + " bytes of text");
+        return x;
+      }
       if (x === null || t !== "object") return x;
       if (d >= MAXD) throw new RangeError("value nested deeper than " + MAXD + " levels");
-      if (++nodes > MAXN) throw new RangeError("value has more than " + MAXN + " elements");
-      if (typeof x.toJSON === "function") { const j = x.toJSON(); if (j !== x) return walk(j, d + 1); }
       if (isArray(x)) {
         const out = [], n = x.length;
-        for (let i = 0; i < n; i++) { const v = walk(x[i], d + 1); put(out, i, v === undefined ? null : v); }
+        for (let i = 0; i < n; i++) { const v = walk(x[i], d + 1, x, "" + i); put(out, i, v === undefined ? null : v); }
         return out;
       }
       const out = {}, ks = keys(x);
-      for (let i = 0; i < ks.length; i++) { const v = walk(x[ks[i]], d + 1); if (v !== undefined) put(out, ks[i], v); }
+      for (let i = 0; i < ks.length; i++) {
+        const k = ks[i];
+        bytes += k.length;
+        const v = walk(x[k], d + 1, x, k);
+        if (v !== undefined) put(out, k, v);
+      }
       return out;
     };
-    return walk(root, 0);
+    return walk(root, 0, { "": root }, "");
   };
-  def(JSON, "stringify", { value: function stringify(v, r, s) { return str(snapshot(v), r, s); }, writable: true, configurable: true });
+  // Native JSON.stringify recurses without a limit, so it only ever sees a bounded snapshot.
+  // A function replacer runs inside the snapshot; an array replacer (a key filter) is safe
+  // to pass through.
+  def(JSON, "stringify", { value: function stringify(v, r, s) {
+    const fn = typeof r === "function" ? r : undefined;
+    return str(snapshot(v, fn), fn ? undefined : r, s);
+  }, writable: true, configurable: true });
   return snapshot;
 })()"#;
+
+/// Job queue with a ceiling. Boa's own executor runs promise jobs until none are left,
+/// with no count and no budget check, so a self-rescheduling promise chain would spin
+/// until the IC's instruction limit trapped the canister.
+#[derive(Default)]
+struct BoundedJobs {
+    promise: RefCell<VecDeque<PromiseJob>>,
+    generic: RefCell<VecDeque<GenericJob>>,
+    ran: Cell<u64>,
+    deadline: u64,
+}
+
+impl BoundedJobs {
+    fn tick(&self) -> JsResult<()> {
+        let n = self.ran.get() + 1;
+        self.ran.set(n);
+        if n > MAX_PROMISE_JOBS {
+            return Err(JsNativeError::range().with_message(format!("script ran more than {MAX_PROMISE_JOBS} promise jobs")).into());
+        }
+        if n % 256 == 0 {
+            budget_error(self.deadline).map_err(|e| JsNativeError::range().with_message(e))?;
+        }
+        Ok(())
+    }
+
+    fn drain(&self, ctx: &mut Context) -> JsResult<()> {
+        loop {
+            let job = self.promise.borrow_mut().pop_front(); // borrow released before the job runs
+            if let Some(job) = job {
+                self.tick()?;
+                job.call(ctx)?;
+                continue;
+            }
+            let job = self.generic.borrow_mut().pop_front();
+            match job {
+                Some(job) => {
+                    self.tick()?;
+                    job.call(ctx)?;
+                }
+                None => return Ok(()),
+            }
+        }
+    }
+}
+
+impl JobExecutor for BoundedJobs {
+    fn enqueue_job(self: Rc<Self>, job: Job, _: &mut Context) {
+        match job {
+            Job::PromiseJob(p) => self.promise.borrow_mut().push_back(p),
+            Job::GenericJob(g) => self.generic.borrow_mut().push_back(g),
+            // Async, timer and finalization jobs: nothing in the sandbox can create them (no
+            // host async functions, no timers; Atomics and FinalizationRegistry are removed).
+            _ => {}
+        }
+    }
+
+    fn run_jobs(self: Rc<Self>, ctx: &mut Context) -> JsResult<()> {
+        let r = self.drain(ctx);
+        if r.is_err() {
+            self.promise.borrow_mut().clear();
+            self.generic.borrow_mut().clear();
+        }
+        ctx.clear_kept_objects();
+        r
+    }
+}
 
 /// No local timezone, no `eval` / `new Function`.
 struct Hooks;
@@ -183,7 +278,7 @@ fn new_context(state: &Shared) -> JsResult<Context> {
         .clock(Rc::new(FixedClock::from_millis(now_ms())))
         .host_hooks(Rc::new(Hooks))
         .module_loader(Rc::new(IdleModuleLoader))
-        .job_executor(Rc::new(SimpleJobExecutor::new()))
+        .job_executor(Rc::new(BoundedJobs { deadline: state.borrow().deadline, ..BoundedJobs::default() }))
         .build()?;
     let limits = ctx.runtime_limits_mut();
     limits.set_loop_iteration_limit(LOOP_ITERATION_LIMIT);
@@ -220,7 +315,8 @@ fn new_context(state: &Shared) -> JsResult<Context> {
         global.delete_property_or_throw(JsString::from(name), &mut ctx)?;
     }
 
-    let src = SNAPSHOT_JS.replace("__MAXD__", &MAX_VALUE_DEPTH.to_string()).replace("__MAXN__", &MAX_VALUE_NODES.to_string());
+    let src = SNAPSHOT_JS.replace("__MAXD__", &MAX_VALUE_DEPTH.to_string()).replace("__MAXN__", &MAX_VALUE_NODES.to_string())
+        .replace("__MAXB__", &MAX_VALUE_BYTES.to_string());
     let snapshot = ctx.eval(Source::from_bytes(src.as_bytes()))?;
     state.borrow_mut().snapshot = snapshot.as_object().and_then(JsFunction::from_object);
     Ok(ctx)
@@ -370,6 +466,31 @@ mod tests {
         // JSON semantics preserved.
         assert_eq!(js("return JSON.stringify({a: [1, undefined, () => 1], d: new Date(0)})").unwrap(), json!("{\"a\":[1,null,null],\"d\":\"1970-01-01T00:00:00.000Z\"}"));
         assert!(js("return {n: 1n}").unwrap_err().contains("BigInt"));
+    }
+
+    #[test]
+    fn promise_chains_are_bounded() {
+        let e = js("const f = () => Promise.resolve().then(f); return f();").unwrap_err();
+        assert!(e.contains("promise jobs"), "{e}");
+        // Ordinary async code is unaffected.
+        assert_eq!(js("let n = 0; for (let i = 0; i < 2000; i++) n += await Promise.resolve(1); return n;").unwrap(), json!(2000));
+    }
+
+    #[test]
+    fn stringify_replacer_and_size_limits() {
+        // A replacer cannot smuggle an unbounded value into the native serializer.
+        let deep = "let d = 1; for (let i = 0; i < 100000; i++) d = [d];";
+        assert!(js(&format!("{deep} return JSON.stringify({{a: 1}}, (k, v) => k === 'a' ? d : v)")).unwrap_err().contains("nested deeper"));
+        // Replacer semantics are preserved: functions, key-filter arrays, `this`, toJSON-then-replacer.
+        assert_eq!(js("return JSON.stringify({a: 1, b: 2, c: [1, 2]}, (k, v) => k === 'b' ? undefined : v)").unwrap(), json!("{\"a\":1,\"c\":[1,2]}"));
+        assert_eq!(js("return JSON.stringify({a: 1, b: 2}, ['a'])").unwrap(), json!("{\"a\":1}"));
+        assert_eq!(js("return JSON.stringify({n: 5n}, (k, v) => typeof v === 'bigint' ? v.toString() : v)").unwrap(), json!("{\"n\":\"5\"}"));
+        assert_eq!(js("return JSON.stringify({a: 1}, null, 1)").unwrap(), json!("{\n \"a\": 1\n}"));
+        // Every element counts, primitives included.
+        assert!(js("return new Array(900000).fill(0)").unwrap_err().contains("elements"));
+        assert_eq!(js("return new Array(1000).fill(0).length").unwrap(), json!(1000));
+        // One big string referenced many times is small in the engine, huge when copied out.
+        assert!(js("const s = 'x'.repeat(1000000); return new Array(300).fill(s)").unwrap_err().contains("bytes of text"));
     }
 
     #[test]

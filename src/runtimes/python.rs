@@ -6,7 +6,7 @@
 //! * `icp.call_async(...)` is awaitable, so `await asyncio.gather(...)` puts several
 //!   calls in flight; the host dispatches them together when the VM blocks.
 
-use crate::bridge::{HostBridge, now_ms};
+use crate::bridge::{HostBridge, ValueBudget, instruction_counter, now_ms};
 use monty::{MontyRun, RunProgress};
 use monty_types::{
     CompileOptions, DateTimeSource, ExcType, ExtFunctionResult, MontyException, MontyObject, MontyUuid,
@@ -26,6 +26,21 @@ const MAX_PRINT_BYTES: usize = crate::bridge::MAX_LOG_BYTES;
 /// a clean `TimeoutError` well before the IC's 40B per-message trap. Natively it
 /// is wall time.
 pub const EXECUTION_BUDGET: Duration = Duration::from_secs(if cfg!(target_arch = "wasm32") { 10 } else { 2 });
+/// Longest single stretch between suspensions, in instructions: below the IC's 40B limit
+/// per message, whatever the policy budget is.
+const MAX_TURN_INSTRUCTIONS: u64 = 30_000_000_000;
+const MAX_VALUE_DEPTH: usize = crate::candid_bridge::MAX_DEPTH;
+
+/// The VM budget for this run. On-chain it is what is left of the policy's instruction
+/// budget (`set_limits`), so Python obeys the same limit as JavaScript and Rhai; the
+/// web-time shim makes one "nanosecond" one instruction. Off-chain it is wall time.
+fn vm_budget<B: HostBridge>(bridge: &B) -> Duration {
+    if cfg!(target_arch = "wasm32") {
+        Duration::from_nanos(bridge.instruction_deadline().saturating_sub(instruction_counter()))
+    } else {
+        EXECUTION_BUDGET
+    }
+}
 
 fn icp_module() -> MontyObject {
     let s = MontyObject::string;
@@ -41,33 +56,51 @@ fn icp_module() -> MontyObject {
     )
 }
 
-fn to_json(o: ObjectRef<'_>) -> Value {
-    match o.type_name() {
+/// Python value -> JSON, bounded in depth, element count and text size. Monty itself cuts
+/// exported values at the recursion limit and substitutes a `<deeply nested>` marker; the
+/// depth check here is lower, so deep data is an error instead of silently truncated.
+fn to_json(o: ObjectRef<'_>, depth: usize, budget: &mut ValueBudget) -> Result<Value, String> {
+    if depth > MAX_VALUE_DEPTH {
+        return Err(format!("value nested deeper than {MAX_VALUE_DEPTH} levels"));
+    }
+    budget.node()?;
+    Ok(match o.type_name() {
         "NoneType" => Value::Null,
         "bool" => Value::Bool(o.as_bool().unwrap_or_default()),
         // Beyond i64: exact decimal string (matches how nat/int come back from candid).
         "int" => o.as_int().map_or_else(|| Value::String(o.py_repr()), Value::from),
         "float" => o.as_float().and_then(Number::from_f64).map_or(Value::Null, Value::Number),
-        "str" => Value::String(o.as_str().unwrap_or_default().to_owned()),
+        "str" => {
+            let s = o.as_str().unwrap_or_default();
+            budget.bytes(s.len())?;
+            Value::String(s.to_owned())
+        }
         // bytes / bytearray -> byte array (what candid `blob` accepts).
         "bytes" | "bytearray" => match monty_types::unstable::node(o) {
-            monty_types::unstable::MontyNode::Bytes(b) => Value::Array(b.iter().map(|x| Value::from(*x)).collect()),
+            monty_types::unstable::MontyNode::Bytes(b) => {
+                budget.bytes(b.len())?;
+                Value::Array(b.iter().map(|x| Value::from(*x)).collect())
+            }
             _ => Value::String(o.py_repr()),
         },
-        "list" | "tuple" | "set" | "frozenset" => {
-            Value::Array(o.items().unwrap_or_default().into_iter().map(to_json).collect())
-        }
-        "dict" => Value::Object(
-            o.pairs()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(k, v)| (k.as_str().map_or_else(|| k.py_repr(), str::to_owned), to_json(v)))
-                .collect::<Map<_, _>>(),
+        "list" | "tuple" | "set" | "frozenset" => Value::Array(
+            o.items().unwrap_or_default().into_iter().map(|x| to_json(x, depth + 1, budget)).collect::<Result<_, _>>()?,
         ),
+        "dict" => {
+            let mut out = Map::new();
+            for (k, v) in o.pairs().unwrap_or_default() {
+                let key = k.as_str().map_or_else(|| k.py_repr(), str::to_owned);
+                budget.bytes(key.len())?;
+                out.insert(key, to_json(v, depth + 1, budget)?);
+            }
+            Value::Object(out)
+        }
         _ => Value::String(o.py_repr()),
-    }
+    })
 }
 
+// Input here is always JSON decoded from a Candid reply, which `candid_bridge` already
+// limits to `MAX_DEPTH` levels and the reply-size quota.
 fn from_json(v: &Value) -> MontyObject {
     match v {
         Value::Null => MontyObject::none(),
@@ -123,7 +156,47 @@ async fn rebased<T>(f: impl std::future::Future<Output = T>) -> T {
     out
 }
 
+/// Monty's memory counter is one process-wide number. The canister has a single thread,
+/// but `cargo test` runs tests on several, so Python runs on different test threads would
+/// see each other's allocations. Tests therefore take turns: a thread holds this lock while
+/// it has any Python run in flight (several may interleave on one thread).
+#[cfg(test)]
+mod test_serial {
+    use std::cell::RefCell;
+    use std::sync::{Mutex, MutexGuard};
+
+    static LOCK: Mutex<()> = Mutex::new(());
+    thread_local!(static HELD: RefCell<(usize, Option<MutexGuard<'static, ()>>)> = const { RefCell::new((0, None)) });
+
+    pub struct Turn;
+    impl Turn {
+        pub fn take() -> Self {
+            HELD.with(|h| {
+                let mut h = h.borrow_mut();
+                if h.0 == 0 {
+                    h.1 = Some(LOCK.lock().unwrap_or_else(|e| e.into_inner()));
+                }
+                h.0 += 1;
+            });
+            Turn
+        }
+    }
+    impl Drop for Turn {
+        fn drop(&mut self) {
+            HELD.with(|h| {
+                let mut h = h.borrow_mut();
+                h.0 -= 1;
+                if h.0 == 0 {
+                    h.1 = None;
+                }
+            });
+        }
+    }
+}
+
 pub async fn run<B: HostBridge>(code: &str, bridge: &B) -> Result<Value, String> {
+    #[cfg(test)]
+    let _turn = test_serial::Turn::take();
     #[cfg(test)]
     crate::counting_alloc::COUNT_THIS_THREAD.with(|c| c.set(true));
     let mut out = String::new();
@@ -143,10 +216,12 @@ async fn drive<B: HostBridge>(code: &str, bridge: &B, out: &mut String) -> Resul
         random_start: RandomStart::Seed(RandomSeed::Int(0x1C9.into())),
         ..OsPolicy::default()
     };
+    let budget = vm_budget(bridge);
     let limits = ResourceLimits::default()
         .max_recursion_depth(MAX_RECURSION_DEPTH)
         .max_suspensions(MAX_SUSPENSIONS)
-        .max_feed_duration(EXECUTION_BUDGET)
+        .max_feed_duration(budget)
+        .max_turn_duration(budget.min(Duration::from_nanos(MAX_TURN_INSTRUCTIONS)))
         .max_memory(MAX_MEMORY_BYTES);
     // max_memory counts LIVE_MEMORY - BASELINE_MEMORY (counting allocator in lib.rs).
     // The baseline is process-global and other requests run while we await, so it is
@@ -163,9 +238,10 @@ async fn drive<B: HostBridge>(code: &str, bridge: &B, out: &mut String) -> Resul
     let mut queued: Vec<(u32, String, Vec<Value>)> = vec![];
     for _ in 0..MAX_SUSPENSIONS {
         let next = match progress {
-            RunProgress::Complete(v) => return Ok(to_json(v.as_ref())),
+            RunProgress::Complete(v) => return to_json(v.as_ref(), 0, &mut ValueBudget::default()),
             RunProgress::FunctionCall(c) => {
-                let args: Vec<Value> = c.args.args().map(to_json).collect();
+                let mut vb = ValueBudget::default();
+                let args: Vec<Value> = c.args.args().map(|a| to_json(a, 0, &mut vb)).collect::<Result<_, _>>()?;
                 if c.args.kwargs().next().is_some() {
                     let e = exc(ExcType::TypeError, "icp functions take positional arguments only");
                     c.resume(ExtFunctionResult::Error(e), PrintWriter::CollectString(out, Some(MAX_PRINT_BYTES)))
@@ -245,6 +321,19 @@ mod tests {
         assert!(py("icp.call('a', 'b', args=1)").0.unwrap_err().contains("positional"));
         assert_eq!(py("from icp import principal\nprincipal()").0.unwrap(), json!("aaaaa-aa"));
         assert_eq!(py("b'\\x01\\x02'").0.unwrap(), json!([1, 2]));
+    }
+
+    #[test]
+    fn values_are_bounded() {
+        // Deep data is an error, not a silently truncated result with a marker inside.
+        let e = py("x = 1\nfor _ in range(100000):\n    x = [x]\nx").0.unwrap_err();
+        assert!(e.contains("nested deeper"), "{e}");
+        assert!(py("x = 1\nfor _ in range(100):\n    x = [x]\nx").0.is_ok());
+        // One big string referenced many times is small in the VM, huge when copied out.
+        assert!(py("s = 'x' * 1000000\n[s] * 300").0.unwrap_err().contains("bytes of text"));
+        assert!(py("[0] * 900000").0.unwrap_err().contains("elements"));
+        // The same limits apply to call arguments.
+        assert!(py(&format!("s = 'x' * 1000000\nicp.call('{L}', 'icrc1_balance_of', [s] * 300)")).0.unwrap_err().contains("bytes of text"));
     }
 
     #[test]

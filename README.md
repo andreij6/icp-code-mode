@@ -365,9 +365,10 @@ How values are encoded:
 | Allowlist | `Principal → ["method" \| "*"]`, deny by default. Checked before any message is sent, including the interface fetch |
 | Calls per script | 25 (`set_limits`). Counts `icp.call` and every interface fetch that misses the cache. Reserved before the await, so concurrent batches count |
 | Instruction budget | 20B per script, measured from the script's own start. Checked before each host request, between JS rounds, and on every Rhai operation; Python has its own 10B VM budget |
-| Requests | At most 50 messages per JSON-RPC batch. One `execute_icp_script` per HTTP request (further ones in a batch get `-32600`; searches are exempt). JS: at most 64 concurrent requests per round and 64 rounds. Rhai: at most 64 requests |
-| JS (Boa) | 1M loop iterations, recursion 256. `Math.random`, `eval`/`Function`, `Atomics`, `SharedArrayBuffer` and `WeakRef` removed. Fixed clock = block time, UTC. Values crossing into the host, and `JSON.stringify`, are limited to 128 levels and 200k elements |
-| Python (Monty) | Recursion 200, 64 MiB memory, 10B-instruction execution budget, 256 suspensions. Fixed `datetime`, zero sleep, seeded `random`, no OS access |
+| Requests | At most 50 messages per JSON-RPC batch. One `execute_icp_script` and five searches per HTTP request (further ones get `-32600`). At most 8 scripts run at once across all requests; more get a "busy" error. JS: at most 64 concurrent requests per round and 64 rounds. Rhai: at most 64 requests |
+| Values | Any value leaving a script (result, call arguments, printed values) is limited to 128 levels, 200k elements and 4 MiB of text, in all three languages |
+| JS (Boa) | 1M loop iterations, recursion 256, 100k promise jobs. `Math.random`, `eval`/`Function`, `Atomics`, `SharedArrayBuffer` and `WeakRef` removed. Fixed clock = block time, UTC. `JSON.stringify` is held to the value limits too, replacer included |
+| Python (Monty) | Recursion 200, 64 MiB memory, 256 suspensions. The VM stops when the policy's instruction budget is spent. Fixed `datetime`, zero sleep, seeded `random`, no OS access |
 | Rhai | 1M operations per run, 32 call levels, size limits on strings/arrays/maps. `eval` and modules disabled |
 | Output | Script source ≤ 100 KiB. Captured logs ≤ 64 KiB, enforced while running. Result ≤ 1 MB of *escaped* JSON. Any reply that would exceed 1.9 MB, whatever it contains, is replaced by a small error, so replying can never trap |
 | Audit | Append-only `StableLog`: time, token-hash prefix, language, script SHA-256, canisters, methods, calls, instructions, status, violations (≤ 16, each ≤ 512 B), error (≤ 4 KiB). One entry is written before every outbound message, plus a final entry per run |
@@ -402,13 +403,18 @@ that never reaches the network writes a single entry whose `run_id` is its own i
   switched off. Read the audit log with an update call for the same reason.
 
 Fetched interfaces are cached for one hour, then fetched again, so a target's interface
-change is picked up without upgrading this canister.
+change is picked up without upgrading this canister. A failed fetch is remembered for five
+minutes, so searches and scripts don't repeat the same calls to a target that exposes no
+interface. Interfaces over 512 KiB are refused.
 
 Canister ids are canonicalised (`RYJL3-…` and `ryjl3-…` are the same principal) before the
 allowlist check, the interface cache and the override lookup.
 
 ## Known limitations
 
+- **JavaScript has no memory cap.** Python is limited to 64 MiB and Rhai by its size
+  limits, but Boa offers no memory limit, so a script that hoards memory ends in a trap
+  (a 503 for the client). The cap of 8 concurrent scripts limits how far this can spread.
 - **One built-in call can still hit the IC's 40B-instruction trap.** Boa cannot be
   interrupted inside a single native operation, such as `new Array(2e8).fill(0)`. Every other
   path stops with a clean error. If this happens before any outbound message, nothing changed,

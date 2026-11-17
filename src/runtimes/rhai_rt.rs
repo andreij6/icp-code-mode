@@ -10,7 +10,7 @@
 //! Note: `call` is a reserved Rhai keyword, so the call function is named
 //! `icp::call_canister(...)`.
 
-use crate::bridge::{HostBridge, MAX_LOG_BYTES, budget_error};
+use crate::bridge::{HostBridge, MAX_LOG_BYTES, ValueBudget, budget_error};
 use rhai::packages::{Package, StandardPackage};
 use rhai::{Dynamic, Engine, EvalAltResult, FuncRegistration, ImmutableString, Module, NativeCallContext, Position};
 use serde_json::Value;
@@ -83,25 +83,35 @@ fn request(st: &Shared, req: Request, pos: Position) -> Result<Dynamic, Box<Eval
 }
 
 /// Blobs are not JSON; hand them over as byte arrays (what candid `blob` accepts).
-fn to_json_value(d: &Dynamic, depth: usize) -> Result<Value, Box<EvalAltResult>> {
+/// Bounded like every other value leaving a script: Rhai strings are shared, so an array
+/// of references to one large string is small in the engine and huge once copied out.
+fn to_json_value(d: &Dynamic, depth: usize, budget: &mut ValueBudget) -> Result<Value, Box<EvalAltResult>> {
     if depth > MAX_VALUE_DEPTH {
         return Err(format!("value nested deeper than {MAX_VALUE_DEPTH} levels").into());
     }
+    budget.node()?;
     if d.is_blob() {
         let b = d.clone().into_blob().unwrap_or_default();
+        budget.bytes(b.len())?;
         return Ok(Value::Array(b.into_iter().map(Value::from).collect()));
     }
     if d.is_array() {
         let a = d.clone().into_array().unwrap_or_default();
-        return a.iter().map(|x| to_json_value(x, depth + 1)).collect::<Result<_, _>>().map(Value::Array);
+        return a.iter().map(|x| to_json_value(x, depth + 1, budget)).collect::<Result<_, _>>().map(Value::Array);
     }
     if d.is_map() {
         let m = d.clone().cast::<rhai::Map>();
         let mut out = serde_json::Map::new();
         for (k, v) in m.iter() {
-            out.insert(k.to_string(), to_json_value(v, depth + 1)?);
+            budget.bytes(k.len())?;
+            out.insert(k.to_string(), to_json_value(v, depth + 1, budget)?);
         }
         return Ok(Value::Object(out));
+    }
+    if d.is_string() {
+        let s = d.clone().into_immutable_string().unwrap_or_default();
+        budget.bytes(s.len())?;
+        return Ok(Value::String(s.to_string()));
     }
     rhai::serde::from_dynamic::<Value>(d)
 }
@@ -147,7 +157,7 @@ fn build_engine(state: &Shared, principal: String, deadline: u64) -> Engine {
     FuncRegistration::new("call_canister").with_volatility(true).set_into_module(
         &mut icp,
         move |ctx: NativeCallContext, canister: ImmutableString, method: ImmutableString, args: Dynamic| {
-            let args = to_json_value(&args, 0)?;
+            let args = to_json_value(&args, 0, &mut ValueBudget::default())?;
             request(&s, Request::Call(canister.into(), method.into(), args), ctx.call_position())
         },
     );
@@ -194,7 +204,7 @@ pub async fn run<B: HostBridge>(code: &str, bridge: &B) -> Result<Value, String>
         }
         let Some(req) = pending else {
             break match out {
-                Ok(v) => to_json_value(&v, 0).map_err(|e| format!("result is not JSON-serializable: {e}")),
+                Ok(v) => to_json_value(&v, 0, &mut ValueBudget::default()).map_err(|e| format!("result is not JSON-serializable: {e}")),
                 Err(e) => Err(e.to_string()),
             };
         };
@@ -261,6 +271,9 @@ mod tests {
         assert_eq!(block_on(run("icp::principal()", &b)).unwrap(), json!("aaaaa-aa"));
         assert_eq!(block_on(run("#{a: (), b: 1.5}", &b)).unwrap(), json!({ "a": null, "b": 1.5 }));
         assert_eq!(block_on(run("let b = blob(2, 7); b", &b)).unwrap(), json!([7, 7]));
+        // Strings are shared in Rhai: 300 references to one 1 MB string would copy out as 300 MB.
+        let big = block_on(run("let s = \"x\"; s.pad(1000000, 'x'); let a = []; for i in 0..300 { a.push(s); } a", &b));
+        assert!(big.is_err(), "refused by Rhai's own string-size accounting or by the value budget");
     }
 
     #[test]
