@@ -1,6 +1,7 @@
 // Checks for the video tooling. Run: node video/test-tools.mjs  (the Chrome part is skipped
 // when Chrome is missing; set CHROME to its path).
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { existsSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -15,6 +16,9 @@ assert.equal(readEnv("TOK_A", [join(dir, "a")]), "quoted value");
 assert.equal(readEnv("TOK_B", [join(dir, "a")]), "single");
 assert.equal(readEnv("TOK_C", [join(dir, "missing"), join(dir, "a"), join(dir, "b")]), "plain");
 assert.equal(readEnv("TOK_D", [join(dir, "a")]), undefined);
+writeFileSync(join(dir, "blank"), `TOK_E=\n`);
+writeFileSync(join(dir, "c"), `TOK_E=real\n`);
+assert.equal(readEnv("TOK_E", [join(dir, "blank"), join(dir, "c")]), "real", "a blank line falls through");
 process.env.TOK_A = "from-env";
 assert.equal(readEnv("TOK_A", [join(dir, "a")]), "from-env");
 rmSync(dir, { recursive: true });
@@ -36,5 +40,15 @@ if (!existsSync(chrome)) {
   decoy.close();
   assert.ok(!existsSync(profile), "close() removes the Chrome profile");
   assert.equal(hits, 0, "nothing connects to port 9333");
+  // SIGINT on a caller that never called close(): the profile is still removed.
+  const child = spawn(process.execPath, ["--input-type=module", "-e",
+    `const b = await (await import(${JSON.stringify(new URL("./cdp.mjs", import.meta.url).href)})).launch({ width: 200, height: 200 });
+     console.log(b.profile); setInterval(() => {}, 1000);`], { stdio: ["ignore", "pipe", "inherit"] });
+  const childProfile = await new Promise((r) => child.stdout.once("data", (d) => r(String(d).trim())));
+  assert.ok(existsSync(childProfile));
+  const code = new Promise((r) => child.once("exit", (c) => r(c)));
+  child.kill("SIGINT");
+  assert.equal(await code, 130);
+  assert.ok(!existsSync(childProfile), "SIGINT removes the Chrome profile");
   console.log("video tools: ok");
 }

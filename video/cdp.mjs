@@ -8,8 +8,8 @@ const CHROME = process.env.CHROME || "/Applications/Google Chrome.app/Contents/M
 
 // Chrome picks a free debugging port (0) and writes it to <profile>/DevToolsActivePort, so
 // nothing else listening on a fixed port can receive our commands (or the page's token).
-// The profile can hold page storage (the demo token): close() deletes it, and an exit
-// hook does the same if the caller dies first.
+// The profile can hold page storage (the demo token): close() deletes it, and exit and
+// SIGINT/SIGTERM hooks do the same if the caller dies first.
 export async function launch({ width = 1920, height = 1080 } = {}) {
   const profile = mkdtempSync(join(tmpdir(), "cdp-"));
   const proc = spawn(CHROME, [
@@ -19,7 +19,11 @@ export async function launch({ width = 1920, height = 1080 } = {}) {
   ], { stdio: "ignore" });
   const exited = new Promise((r) => proc.once("exit", r));
   const cleanup = () => { proc.kill("SIGKILL"); rmSync(profile, { recursive: true, force: true, maxRetries: 5 }); };
+  const onSignal = (sig) => { cleanup(); process.exit(sig === "SIGINT" ? 130 : 143); };
+  const unhook = () => { process.off("exit", cleanup); process.off("SIGINT", onSignal); process.off("SIGTERM", onSignal); };
   process.once("exit", cleanup);
+  process.once("SIGINT", onSignal);
+  process.once("SIGTERM", onSignal);
   let ws;
   try {
     let port, targets;
@@ -35,7 +39,7 @@ export async function launch({ width = 1920, height = 1080 } = {}) {
     ws = new WebSocket(page.webSocketDebuggerUrl);
     await new Promise((r, j) => { ws.onopen = r; ws.onerror = j; });
   } catch (e) {
-    cleanup(); process.off("exit", cleanup); throw e;
+    cleanup(); unhook(); throw e;
   }
   let id = 0;
   const pending = new Map(), listeners = [];
@@ -69,7 +73,7 @@ export async function launch({ width = 1920, height = 1080 } = {}) {
       try { ws.close(); } catch {}
       proc.kill();
       await Promise.race([exited, new Promise((r) => setTimeout(r, 3000))]);
-      cleanup(); process.off("exit", cleanup);
+      cleanup(); unhook();
     },
   };
   return api;

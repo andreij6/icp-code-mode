@@ -256,12 +256,12 @@ fn parse_tool_call(params: &Value) -> Result<ToolRequest, String> {
         SEARCH_TOOL_NAME => &["query", "canister_id"],
         _ => &[],
     };
-    if let Some(k) = args.as_object().into_iter().flatten().map(|(k, _)| k).find(|k| !known.contains(&k.as_str())) {
-        if !known.is_empty() {
-            let mut k = k.clone();
-            crate::bridge::truncate(&mut k, 64);
-            return Err(format!("unknown argument `{k}`"));
-        }
+    if !known.is_empty()
+        && let Some(k) = args.as_object().into_iter().flatten().map(|(k, _)| k).find(|k| !known.contains(&k.as_str()))
+    {
+        let mut k = k.clone();
+        crate::bridge::truncate(&mut k, 64);
+        return Err(format!("unknown argument `{k}`"));
     }
     let args = args.clone();
     match name {

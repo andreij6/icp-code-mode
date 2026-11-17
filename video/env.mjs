@@ -8,6 +8,7 @@ export function readEnv(name, files = []) {
     let text;
     try { text = readFileSync(f, "utf8"); } catch { continue; }
     const m = text.match(new RegExp(`^\\s*(?:export\\s+)?${name}\\s*=(.*)$`, "m"));
-    if (m) return m[1].trim().replace(/^(["'])(.*)\1$/, "$2");
+    const v = m?.[1].trim().replace(/^(["'])(.*)\1$/, "$2");
+    if (v) return v; // a blank template line falls through to the next file
   }
 }

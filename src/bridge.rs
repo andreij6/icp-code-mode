@@ -200,11 +200,13 @@ mod ic {
     const MAX_VIOLATIONS: usize = 16;
     const MAX_VIOLATION_BYTES: usize = 512;
 
+    /// (.did text, parsed service, fetch time in ns).
+    type CachedDid = (String, Rc<Service>, u64);
+
     thread_local! {
         // ponytail: heap cache keyed by canonical principal text, emptied on upgrade
         // (re-fetched on demand); bounded by the allowlist size.
-        // Value: (.did text, parsed service, fetch time in ns).
-        static DID_CACHE: RefCell<BTreeMap<String, (String, Rc<Service>, u64)>> = RefCell::default();
+        static DID_CACHE: RefCell<BTreeMap<String, CachedDid>> = RefCell::default();
         // Runs that wrote a `Started` entry and have not ended. Lets an auditor tell a run
         // still waiting on a reply from one that ended without a final entry.
         static PENDING_RUNS: RefCell<BTreeSet<u64>> = RefCell::default();

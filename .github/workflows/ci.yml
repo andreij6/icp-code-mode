@@ -1,6 +1,6 @@
 # Native tests and release Wasm builds for the all-in-one router and each single-language
-# worker, an ic0-only import check on every Wasm, an advisory scan, and a two-build
-# reproducibility check. The Rust toolchain comes from rust-toolchain.toml (rustup
+# worker, an ic0-only import check on every Wasm, an advisory scan, a two-build
+# reproducibility check, and the PocketIC harness (harness/) on the default Wasm. The Rust toolchain comes from rust-toolchain.toml (rustup
 # installs it on the first cargo call).
 name: ci
 
@@ -32,8 +32,6 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y wabt
       - name: Native tests
         run: cargo test --lib --locked ${{ matrix.features }}
-      - name: Clippy
-        run: cargo clippy --lib --tests --locked ${{ matrix.features }} -- -D warnings
       - name: Release Wasm
         run: cargo build --target wasm32-unknown-unknown --release --locked ${{ matrix.features }}
       - name: Wasm imports only ic0 (no wasm-bindgen)
@@ -48,6 +46,13 @@ jobs:
           second=$(sha256sum "$W" | cut -d' ' -f1)
           echo "first $first second $second"
           test "$first" = "$second"
+      - name: PocketIC harness (the release Wasm under a corpus of wasm32-only traps)
+        if: matrix.name == 'default'
+        run: cd harness && cargo test --locked
+      # Last, so a lint never hides the Wasm, import and reproducibility results above.
+      - name: Clippy
+        if: ${{ !cancelled() }}
+        run: cargo clippy --lib --tests --locked ${{ matrix.features }} -- -D warnings
 
   tooling:
     runs-on: ubuntu-latest
@@ -57,6 +62,8 @@ jobs:
         run: node scripts/test-audit-workflow.mjs
       - name: demo-setup.sh with a stub icp
         run: scripts/test-demo-setup.sh
+      - name: README MCP URLs resolve for Node/Python clients
+        run: node scripts/check-readme-urls.mjs
       - name: Demo page checks
         run: node scripts/test-demo-page.mjs
       - name: Video tooling (.env reader; the Chrome check runs only where CHROME is set)

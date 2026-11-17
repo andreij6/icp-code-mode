@@ -207,7 +207,7 @@ Return every candidate finding, and what you could not test and why.`,
     { label: `review:${lens.key}:r${round}`, phase: 'Review', schema: FINDINGS_SCHEMA })
 
 // A null result (the agent was skipped or died) is a failure, not an empty result: absorb
-// counts it so the round is not dry, and the item is re-queued.
+// counts it so the round is not dry; a failed lens or pattern is tried again next round.
 const verify = async (found, lens, round) => {
   if (!found) return null
   if (found.not_tested) notTested.push(`${lens.key}: ${found.not_tested}`)
@@ -236,7 +236,7 @@ const absorb = (results, r, what) => {
       if (addConfirmed(v, r)) fresh++
     }
   }
-  if (failed) log(`round ${r}: ${failed} ${what} agent(s) returned nothing; re-queued, and the round does not count as dry`)
+  if (failed) log(`round ${r}: ${failed} ${what} agent(s) returned nothing, so the round does not count as dry`)
   return { fresh, failed }
 }
 
@@ -245,7 +245,9 @@ let dry = 0
 let round = 0
 let stopped = 'when the critic found no gaps'
 const sweptPatterns = new Set()
-while (work.length && dry < 2 && round < MAX_ROUNDS) {
+// Patterns not yet swept (new, over the cap, or whose sweep failed) keep the loop going.
+const unswept = () => [...new Set(confirmed.map((c) => c.pattern))].filter((p) => !sweptPatterns.has(p))
+while ((work.length || unswept().length) && dry < 2 && round < MAX_ROUNDS) {
   round++
   const r = round
   const results = await pipeline(work, (lens) => review(lens, r), (found, lens) => verify(found, lens, r))
@@ -253,7 +255,7 @@ while (work.length && dry < 2 && round < MAX_ROUNDS) {
   let { fresh, failed } = absorb(results, r, 'review/verify')
 
   // Variant sweep: each newly confirmed pattern is searched for across the whole codebase.
-  const patterns = [...new Set(confirmed.map((c) => c.pattern))].filter((p) => !sweptPatterns.has(p))
+  const patterns = unswept()
   const toSweep = patterns.slice(0, MAX_SWEEPS)
   if (patterns.length > toSweep.length) log(`round ${r}: ${patterns.length - toSweep.length} patterns not swept this round (cap ${MAX_SWEEPS}); they carry over`)
   toSweep.forEach((p) => sweptPatterns.add(p))
@@ -295,8 +297,13 @@ empty list only if you would stake your reputation on the coverage.`,
     work = [...lenses, ...retry.filter((l) => !lenses.includes(l))]
   } else {
     work = [...retry, ...critic.gaps.map((g) => ({ key: g.key, title: g.title, rows: g.rows }))]
-    if (!work.length) log(`round ${r}: the critic found no further gaps`)
+    if (!work.length) log(`round ${r}: the critic found no further gaps${unswept().length ? `; ${unswept().length} pattern(s) still to sweep` : ''}`)
   }
+}
+const neverSwept = unswept()
+if (neverSwept.length) {
+  stopped += `; ${neverSwept.length} pattern(s) were never swept`
+  log(`${neverSwept.length} confirmed pattern(s) were never swept: ${neverSwept.join(' ; ')}`)
 }
 if (round >= MAX_ROUNDS && dry < 2) log(`stopped at the round cap (${MAX_ROUNDS}) before two dry rounds: coverage is NOT complete by the plan's stopping rule`)
 
@@ -347,6 +354,9 @@ ${JSON.stringify(refuted, null, 1)}
 Unverified candidates (their verifier did not finish; list them in their own section, and
 note any that a later round confirmed or refuted):
 ${JSON.stringify(unverified, null, 1)}
+Patterns never swept for variants (their sweep agent failed or hit the cap; list them as
+not swept in the coverage section):
+${neverSwept.join('\n') || '(none)'}
 Not tested, as reported by reviewers:
 ${notTested.join('\n') || '(none)'}`,
   { label: 'report', phase: 'Report', schema: REPORT_SCHEMA })
@@ -357,10 +367,11 @@ return {
   commit: inv.commit,
   depth,
   rounds: round,
-  complete_by_stopping_rule: dry >= 2,
+  complete_by_stopping_rule: dry >= 2 && !neverSwept.length,
   counts: confirmed.reduce((a, c) => ((a[c.severity] = (a[c.severity] || 0) + 1), a), {}),
   confirmed: confirmed.map((c) => ({ severity: c.severity, title: c.title, location: c.location, fix: c.fix })),
   refuted: refuted.length,
   unverified: unverified.map((f) => ({ severity: f.severity, title: f.title, location: f.location })),
+  never_swept: neverSwept,
   live: liveNotes,
 }

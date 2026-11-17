@@ -52,3 +52,33 @@ assert.ok(res.unverified.some((f) => f.title === 'c-unverified'), 'unverified ca
 assert.ok(reportPrompt.includes('c-unverified'), 'unverified candidates reach the report')
 assert.ok(reportPrompt.includes('live, unmatched title'), 'a retitled live refutation is kept')
 console.log('audit workflow dry run: ok')
+
+// A sweep agent that dies: its pattern is swept again next round, even when the critic finds
+// no gaps; one that always dies is reported as never swept.
+for (const sweepDies of ['once', 'always']) {
+  const labels = []
+  const logs2 = []
+  let prompt2 = ''
+  const agent2 = async (prompt, { label }) => {
+    labels.push(label)
+    if (label === 'inventory') return { run_dir: 'r', commit: 'c', baseline_ok: true, baseline_notes: '',
+      lenses: [{ key: 'A', title: 'A', applies: true, touched_since_last_run: true, rows: 'all' }] }
+    if (label === 'review:A:r1') return { ...empty, findings: [{ title: 'a1' }] }
+    if (label === 'verify:A:r1') return { verdicts: [{ ...verdict('a1'), pattern: 'PAT' }] }
+    if (label.startsWith('sweep:')) return sweepDies === 'always' || label === 'sweep:r1:0' ? null : empty
+    if (label.startsWith('critic:')) return { gaps: [], assessment: '' }
+    if (label === 'report') { prompt2 = prompt; return { report_file: 'x', summary: '' } }
+    return empty
+  }
+  const res2 = await run(agent2, pipeline, () => {}, (m) => logs2.push(m), { depth: 'full' })
+  assert.ok(labels.includes('sweep:r2:0'), `${sweepDies}: a failed sweep runs again next round`)
+  assert.ok(!logs2.some((l) => /re-queued/.test(l)), `${sweepDies}: no false "re-queued" log`)
+  if (sweepDies === 'once') {
+    assert.deepEqual(res2.never_swept, [])
+  } else {
+    assert.deepEqual(res2.never_swept, ['PAT'], 'a pattern whose sweep always fails is reported')
+    assert.equal(res2.complete_by_stopping_rule, false)
+    assert.ok(/never swept[^]*PAT/.test(prompt2) && /never swept/.test(prompt2.split('Run facts')[1]), 'the report is told')
+  }
+}
+console.log('audit workflow sweep-failure dry run: ok')

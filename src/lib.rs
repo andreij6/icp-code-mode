@@ -314,10 +314,10 @@ async fn run_script(caller_hash: &str, call: ToolCall) -> serde_json::Value {
     let bridge = IcBridge::new(caller.clone(), call.language.as_str(), script_sha256.clone());
     let mut out = LanguageRouter::execute(call.language, &call.code, &bridge).await;
     // A result too big to send is an error, and recorded as one.
-    if let Ok(v) = &out {
-        if let Err(e) = mcp::result_text(v.clone()) {
-            out = Err(e);
-        }
+    if let Ok(v) = &out
+        && let Err(e) = mcp::result_text(v.clone())
+    {
+        out = Err(e);
     }
     let instructions = bridge.instructions_used();
     let max = policy::limits().max_instructions;
