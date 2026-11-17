@@ -27,6 +27,10 @@ type Order = record {
 };
 type OrderError = variant {
   UnknownProduct : nat64;
+  // More than `MAX_LINES` lines in one order.
+  TooManyLines : nat32;
+  // The store already holds `MAX_ORDERS` orders.
+  StoreFull;
   OutOfStock : record { product_id : nat64; available : nat32 };
   UnknownCustomer;
   ZeroQuantity : nat64;

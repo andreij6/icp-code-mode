@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Allowlist the demo store in icp_code_mode: all 7 reads plus create_order.
-# cancel_order and restock stay blocked so the demo can show the guardrail.
+# cancel_order and restock stay blocked for scripts (icp_code_mode's allowlist) so the
+# demo can show the guardrail; the store itself accepts them from anyone (local demo only).
 # Usage: scripts/demo-setup.sh [environment]   (default: local)
 set -euo pipefail
 ENV="${1:-local}"

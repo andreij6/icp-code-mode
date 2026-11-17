@@ -11,9 +11,12 @@ canisters:
       steps:
         - type: script
           commands:
-            - "command -v ic-wasm >/dev/null 2>&1 || { echo >&2 'ic-wasm not found, see https://github.com/dfinity/ic-wasm'; exit 1; }"
-            # --target-dir pins where the wasm lands, whatever CARGO_TARGET_DIR says.
-            - cargo build --package icp_code_mode --target wasm32-unknown-unknown --release --locked --target-dir target
+            # A pinned ic-wasm, so the same source gives the same Wasm everywhere.
+            - 'v=$(ic-wasm --version 2>/dev/null); [ "$v" = "ic-wasm 0.11.1" ] || { echo >&2 "ic-wasm 0.11.1 is required (found: ${v:-none}); see https://github.com/dfinity/ic-wasm"; exit 1; }'
+            # --target-dir pins where the wasm lands, whatever CARGO_TARGET_DIR says. The
+            # --config rustflags are added to .cargo/config.toml's: they replace the builder's
+            # cargo home and checkout paths (panic locations, OUT_DIR) with fixed ones.
+            - 'cargo build --package icp_code_mode --target wasm32-unknown-unknown --release --locked --target-dir target --config "target.wasm32-unknown-unknown.rustflags=[\"--remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo\", \"--remap-path-prefix=$PWD=/src\"]"'
             - cp target/wasm32-unknown-unknown/release/icp_code_mode.wasm "$ICP_WASM_OUTPUT_PATH"
             - ic-wasm "$ICP_WASM_OUTPUT_PATH" -o "$ICP_WASM_OUTPUT_PATH" metadata candid:service -f icp_code_mode.did -v public
             - ic-wasm "$ICP_WASM_OUTPUT_PATH" -o "$ICP_WASM_OUTPUT_PATH" shrink
@@ -28,7 +31,7 @@ canisters:
       steps:
         - type: script
           commands:
-            - cargo build --package demo_store --target wasm32-unknown-unknown --release --locked --target-dir target
+            - 'cargo build --package demo_store --target wasm32-unknown-unknown --release --locked --target-dir target --config "target.wasm32-unknown-unknown.rustflags=[\"--remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo\", \"--remap-path-prefix=$PWD=/src\"]"'
             - cp target/wasm32-unknown-unknown/release/demo_store.wasm "$ICP_WASM_OUTPUT_PATH"
             - ic-wasm "$ICP_WASM_OUTPUT_PATH" -o "$ICP_WASM_OUTPUT_PATH" metadata candid:service -f demo_store/demo_store.did -v public
             - ic-wasm "$ICP_WASM_OUTPUT_PATH" -o "$ICP_WASM_OUTPUT_PATH" shrink

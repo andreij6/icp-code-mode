@@ -35,13 +35,14 @@ pub struct Limits {
     /// clamped). `null` (default): 300. A timed-out call may or may not have executed on
     /// the target; the error says so.
     pub call_timeout_seconds: Option<u32>,
-    /// `true`: every MCP request goes through an update call, so responses are certified
-    /// by consensus (about 1-2 s each) and the uncertified demo page is disabled.
+    /// `true`: every authenticated /mcp request goes through an update call, so responses
+    /// are certified by consensus (about 1-2 s each) and the uncertified demo page is disabled.
     /// `null`/`false` (default): initialize, tools/list and cached searches are answered
     /// by fast query calls, which a single malicious node could alter.
     pub certified_reads: Option<bool>,
-    /// Tool calls each bearer token may make per minute (on the update path). `null`
-    /// (default): 120. Over the limit, requests are refused before they run, so nothing is
+    /// Update calls each bearer token may make per minute (each runs at most one tool
+    /// call; with `certified_reads` every MCP request is one). `null` (default): 120.
+    /// Over the limit, requests are refused before they run, so nothing is
     /// spent and nothing is logged. This bounds how fast one token can spend cycles and
     /// grow the audit log.
     pub tool_calls_per_minute: Option<u32>,

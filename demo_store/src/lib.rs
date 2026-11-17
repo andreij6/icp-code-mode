@@ -3,6 +3,8 @@
 //! many single-method tool calls.
 //!
 //! State is heap-only and reseeded on every install/upgrade — it's demo data.
+//! There is no access control: anyone can call the writes. Deploy it on a local network
+//! only.
 
 use candid::{CandidType, Deserialize, Nat, Principal};
 use std::cell::RefCell;
@@ -85,7 +87,16 @@ pub enum OrderError {
     UnknownProduct(u64),
     OutOfStock { product_id: u64, available: u32 },
     ZeroQuantity(u64),
+    /// More than `MAX_LINES` lines in one order.
+    TooManyLines(u32),
+    /// The store already holds `MAX_ORDERS` orders.
+    StoreFull,
 }
+
+/// Bounds that keep `list_orders(null)` far below the 3 MiB reply limit
+/// (worst case about 1,000 x 300 bytes).
+const MAX_LINES: usize = 20;
+const MAX_ORDERS: usize = 1_000;
 
 struct Store {
     products: Vec<(Product, u64)>, // (product, price in cents as u64 for arithmetic)
@@ -281,6 +292,12 @@ fn create_order(customer: Principal, items: Vec<OrderItem>) -> Result<Order, Ord
         if items.is_empty() {
             return Err(OrderError::EmptyOrder);
         }
+        if items.len() > MAX_LINES {
+            return Err(OrderError::TooManyLines(MAX_LINES as u32));
+        }
+        if s.orders.len() >= MAX_ORDERS {
+            return Err(OrderError::StoreFull);
+        }
         if !s.customers.iter().any(|c| c.id == customer) {
             return Err(OrderError::UnknownCustomer);
         }
@@ -347,13 +364,13 @@ fn cancel_order(id: u64) -> Result<Order, String> {
 fn restock(product_id: u64, quantity: u32) -> Result<Inventory, String> {
     with_mut(|s| {
         let inv = s.inventory.iter_mut().find(|i| i.product_id == product_id).ok_or("no such product")?;
-        inv.on_hand = inv.on_hand.saturating_add(quantity);
+        inv.on_hand = inv.on_hand.checked_add(quantity).ok_or("stock would overflow")?;
         Ok(inv.clone())
     })
 }
 
-/// Lets callers (e.g. ICP Code Mode) read this interface; the local replica does not
-/// serve `canister_metadata` to other canisters.
+/// Lets callers (e.g. ICP Code Mode) read this interface where `canister_metadata` is not
+/// available to them.
 #[ic_cdk::query(hidden = true)]
 fn __get_candid_interface_tmp_hack() -> String {
     __export_service()
@@ -426,5 +443,20 @@ mod tests {
         assert!(restock(999, 5).is_err());
         let before = get_inventory(2).unwrap().on_hand;
         assert_eq!(restock(2, 5).unwrap().on_hand, before + 5);
+        // Finding 148: overflow is an error, not a silent saturation.
+        assert!(restock(2, u32::MAX).is_err());
+        assert_eq!(get_inventory(2).unwrap().on_hand, before + 5);
+    }
+
+    #[test]
+    fn orders_are_bounded() {
+        let cust = customer_principal(0);
+        let lines = vec![OrderItem { product_id: 1, quantity: 1 }; MAX_LINES + 1];
+        assert!(matches!(create_order(cust, lines), Err(OrderError::TooManyLines(_))));
+        with_mut(|s| {
+            let o = s.orders[0].clone();
+            s.orders.resize(MAX_ORDERS, o);
+        });
+        assert!(matches!(create_order(cust, vec![OrderItem { product_id: 1, quantity: 1 }]), Err(OrderError::StoreFull)));
     }
 }

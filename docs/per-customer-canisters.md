@@ -44,8 +44,9 @@ A private instance gives each customer:
 Rough figures from the local replica, at about $1.35 per trillion cycles:
 
 - Creating a canister: about 0.5 trillion cycles.
-- Idle: about 8 trillion cycles a year, roughly $10. This is mostly storage for the 12 MB
-  Wasm. A build without Python is about half that size.
+- Idle: about 8 trillion cycles a year, roughly $10. Idle cost follows the memory the
+  canister holds (heap and stable memory; about 1.25 GB was measured after use), not the
+  12 MB Wasm.
 - Per script run: about 15–20 million cycles, a few thousandths of a cent.
 
 ## What exists and what is missing

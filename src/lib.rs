@@ -17,7 +17,7 @@ use runtimes::LanguageRouter;
 
 #[derive(CandidType, Deserialize, Default)]
 pub struct InitArgs {
-    /// SHA-256 hex digests of bearer tokens: `echo -n "$TOKEN" | shasum -a 256`.
+    /// SHA-256 hex digests of bearer tokens: `printf %s "$TOKEN" | shasum -a 256 | cut -d' ' -f1`.
     pub token_sha256: Vec<String>,
     pub allowlist: Vec<(Principal, Vec<String>)>,
     pub limits: Option<Limits>,
@@ -60,8 +60,8 @@ const SKIP_CERT_DATA: [u8; 32] = [
     2, 114, 167, 214, 66, 145,
 ];
 
-// All state lives in stable structures, so no pre_upgrade serialization is needed;
-// post_upgrade accepts the same (optional) args to adjust policy during an upgrade.
+// All state lives in stable structures, so no pre_upgrade serialization is needed.
+// init applies InitArgs; post_upgrade ignores them (see below).
 #[ic_cdk::init]
 fn init(args: Option<InitArgs>) {
     apply(args);
@@ -131,15 +131,18 @@ fn http_request(req: HttpRequest) -> HttpResponse {
 
 #[ic_cdk::update]
 async fn http_request_update(req: HttpUpdateRequest) -> HttpResponse {
-    mcp::http_update(&req, run_tool).await
+    // Count every authenticated update, not only those that reach a tool: canister callers
+    // skip `inspect_message`, and with certified_reads every request is an update.
+    if let Ok(hash) = mcp::authenticate(&req.method, &req.url, &req.headers) {
+        if let Some(e) = rate_limited(&hash) {
+            return HttpResponse::too_many_requests(&e);
+        }
+        rate_count(&hash, this_minute());
+    }
+    mcp::http_update(&req, policy::limits().certified_reads == Some(true), run_tool).await
 }
 
 async fn run_tool(caller_hash: &str, req: ToolRequest) -> serde_json::Value {
-    let minute = this_minute();
-    if let Some(e) = rate_check(caller_hash, minute) {
-        return mcp::tool_result(Err(e), vec![]);
-    }
-    rate_count(caller_hash, minute);
     match req {
         ToolRequest::Execute(call) => run_script(caller_hash, call).await,
         ToolRequest::Search(args) => run_search(caller_hash, args).await,
@@ -392,6 +395,9 @@ fn controller() -> Result<(), String> {
     }
 }
 
+/// `methods = vec {"*"}` allows every method. `vec {}` allowlists the interface only:
+/// scripts can read it with `icp.candid` (those fetches are sent and logged) and search
+/// lists the canister with no methods, but every call is refused.
 #[ic_cdk::update(guard = "controller")]
 fn set_allowlist(canister: Principal, methods: Vec<String>) {
     // A controller re-allowlisting a canister usually means its interface changed or a
@@ -572,7 +578,8 @@ ic_cdk::export_candid!();
 /// ICP replicas have no OS RNG. getrandom 0.3 and 0.4 (pulled in by ahash and
 /// boa's `rand`) both resolve the "custom" backend (see .cargo/config.toml) to this
 /// symbol. Replicas must agree bit-for-bit, so it is a fixed deterministic stream:
-/// fine for hash seeding, never use it for secrets.
+/// fine for hash seeding and Monty's internal ids (e.g. boundary uuids), never use it
+/// for secrets.
 #[cfg(target_arch = "wasm32")]
 #[unsafe(no_mangle)]
 unsafe extern "Rust" fn __getrandom_v03_custom(dest: *mut u8, len: usize) -> Result<(), getrandom::Error> {
