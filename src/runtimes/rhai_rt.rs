@@ -21,6 +21,15 @@ pub const MAX_OPERATIONS: u64 = 1_000_000;
 pub const MAX_CALL_LEVELS: usize = 32;
 /// Host requests per script, which also bounds replays (each request costs one re-run).
 pub const MAX_REQUESTS: usize = 64;
+/// Expression nesting at top level and inside functions. A flat `a + b + ...` chain nests
+/// one level per operator. Stack use grows with both and with call levels: in a native
+/// release build the worst mix (every call level nested to the function limit) runs in
+/// 2 MiB, a quarter of the canister's 8 MiB stack.
+pub const MAX_EXPR_DEPTH: usize = 128;
+pub const MAX_FN_EXPR_DEPTH: usize = 64;
+/// Heap a run may grow by, as in Python. Rhai's size limits bound one value, not how many
+/// a script holds, and do not count map keys or values captured by closures.
+pub const MAX_MEMORY_BYTES: usize = 64 << 20;
 /// Deepest value accepted when converting to JSON.
 const MAX_VALUE_DEPTH: usize = crate::candid_bridge::MAX_DEPTH;
 const SUSPEND: &str = "__icp_suspend__";
@@ -40,6 +49,8 @@ struct RunState {
     diverged: Option<String>,
     logs: Vec<String>,
     log_bytes: usize,
+    /// Live heap when the current replay started.
+    mem_base: usize,
 }
 
 impl RunState {
@@ -249,8 +260,9 @@ fn build_engine(state: &Shared, principal: String, deadline: u64) -> Engine {
     engine
         .set_max_operations(MAX_OPERATIONS)
         .set_max_call_levels(MAX_CALL_LEVELS)
-        .set_max_expr_depths(64, 32)
-        // Sized to the app's value limits, so a reply the other runtimes accept fits too.
+        .set_max_expr_depths(MAX_EXPR_DEPTH, MAX_FN_EXPR_DEPTH)
+        // Sized to the app's value limits, which the bridge also holds replies to, and Rhai
+        // never counts more than they do: any reply the bridge passes fits.
         .set_max_string_size(crate::bridge::MAX_VALUE_BYTES)
         .set_max_array_size(crate::bridge::MAX_VALUE_NODES)
         .set_max_map_size(crate::bridge::MAX_VALUE_NODES)
@@ -263,7 +275,8 @@ fn build_engine(state: &Shared, principal: String, deadline: u64) -> Engine {
     // operation is counted. Scripts are short and run once: nothing to gain from it.
     engine.set_optimization_level(rhai::OptimizationLevel::None);
     // Curried function pointers are outside Rhai's size accounting, and deeply nested ones
-    // overflow the stack. Closures still capture variables (that does not use `curry`).
+    // overflow the stack. Closures still capture (Rhai keeps captures in the same list), so
+    // what they hold is bounded by the memory cap in `on_progress`, not the size limits.
     engine.disable_symbol("curry");
     // `sleep` calls std::thread::sleep, which traps on wasm32-unknown-unknown.
     engine.register_fn("sleep", |_: rhai::INT| -> Res<()> { Err("sleep is not available in the sandbox".into()) });
@@ -285,6 +298,10 @@ fn build_engine(state: &Shared, principal: String, deadline: u64) -> Engine {
         }
         if let Err(e) = budget_error(deadline) {
             s.diverged = Some(e);
+            return Some(Dynamic::from(SUSPEND));
+        }
+        if crate::counting_alloc::live().saturating_sub(s.mem_base) > MAX_MEMORY_BYTES {
+            s.diverged = Some(format!("script used more than {} MiB of memory", MAX_MEMORY_BYTES >> 20));
             return Some(Dynamic::from(SUSPEND));
         }
         None
@@ -320,9 +337,19 @@ fn build_engine(state: &Shared, principal: String, deadline: u64) -> Engine {
 }
 
 pub async fn run<B: HostBridge>(code: &str, bridge: &B) -> Result<Value, String> {
+    #[cfg(test)]
+    let _turn = crate::counting_alloc::test_serial::Turn::take();
+    #[cfg(test)]
+    let _count = crate::counting_alloc::test_serial::CountThisThread::on();
     let state: Shared = Arc::default();
     let engine = build_engine(&state, bridge.principal(), bridge.instruction_deadline());
-    let ast = engine.compile(code).map_err(|e| format!("syntax error: {e}"))?;
+    let ast = engine.compile(code).map_err(|e| match e.err_type() {
+        rhai::ParseErrorType::ExprTooDeep => format!(
+            "syntax error: {e} (expressions nest at most {MAX_EXPR_DEPTH} levels, {MAX_FN_EXPR_DEPTH} inside a function, \
+             and each operator in a chain like `a + b + c` is a level: split long expressions into `let` bindings)"
+        ),
+        _ => format!("syntax error: {e}"),
+    })?;
     // Compiling runs before any operation is counted; its cost is bounded by the script
     // size limit, and checked here so a slow compile is a policy error, not a surprise.
     crate::bridge::check_budget(bridge)?;
@@ -332,6 +359,8 @@ pub async fn run<B: HostBridge>(code: &str, bridge: &B) -> Result<Value, String>
             s.seq = 0;
             s.logs.clear();
             s.log_bytes = 0;
+            // Eval is synchronous: nothing else allocates on this thread until it returns.
+            s.mem_base = crate::counting_alloc::live();
         }
         // ponytail: each request replays the script from the top, so cost is O(requests²)
         // in the worst case; bounded by the policy call cap. Upgrade: snapshot/continuations.
@@ -506,5 +535,88 @@ mod tests {
         assert!(e.is_err());
         assert!(st.lock().unwrap().diverged.as_ref().unwrap().contains("non-deterministic"));
         assert!(request(&st, Request::Candid("c".into()), Position::NONE).is_err());
+    }
+
+    /// Answers every call with the same reply.
+    struct Fixed(Value);
+    impl HostBridge for Fixed {
+        async fn candid(&self, _: &str) -> Result<String, String> {
+            Err("no interface".into())
+        }
+        async fn call(&self, _: &str, _: &str, _: Value) -> Result<Value, String> {
+            Ok(self.0.clone())
+        }
+        fn principal(&self) -> String {
+            "aaaaa-aa".into()
+        }
+        fn log(&self, _: String) {}
+    }
+
+    #[test]
+    fn replies_within_the_value_limits_fit_rhai() {
+        use crate::bridge::{MAX_VALUE_BYTES, MAX_VALUE_NODES, check_value};
+        let order = json!({ "id": 1, "items": [{ "sku": "a", "qty": 1 }] });
+        let fits = [
+            json!(vec![order; 1_200]),
+            json!(vec![7; 20_000]),
+            // 199,997 values: 49,999 records of three fields.
+            json!(vec![json!({ "a": 1, "b": true, "c": "x" }); 49_999]),
+            json!(vec![true; MAX_VALUE_NODES - 1]),
+            json!("x".repeat(MAX_VALUE_BYTES)),
+        ];
+        for reply in fits {
+            check_value(&reply).unwrap();
+            let n = reply.as_array().map_or_else(|| reply.as_str().unwrap().len(), Vec::len);
+            let out = block_on(run(&format!(r#"icp::call_canister("{L}", "m").len()"#), &Fixed(reply)));
+            assert_eq!(out.unwrap(), json!(n));
+        }
+        // The bridge refuses larger replies for every runtime (the call has run by then).
+        let deep = (0..130).fold(json!(1), |v, _| json!([v]));
+        for over in [
+            json!(vec![1; 250_000]),
+            json!(vec![json!({ "a": 1, "b": true, "c": "x" }); 100_000]),
+            json!("x".repeat(MAX_VALUE_BYTES + 1)),
+            deep,
+        ] {
+            assert!(check_value(&over).is_err());
+        }
+    }
+
+    #[test]
+    fn memory_cap_counts_map_keys_and_captures() {
+        let b = MockBridge::default();
+        let mem = |code: &str| block_on(run(code, &b)).unwrap_err();
+        // Rhai's size limits skip map keys: 300 keys of 1 MB each.
+        let e = mem(r#"let k = "x"; k.pad(1000000, 'x'); let m = #{}; for i in 0..300 { m[k + i] = i; } m.len()"#);
+        assert!(e.contains("MiB of memory"), "{e}");
+        // And values captured by closures: 2,000 copies of a 9,000-element array.
+        let e = mem("let t = []; for i in 0..9000 { t.push(i); } let fs = []; for i in 0..2000 { let a = t; fs.push(|| a.len()); } fs.len()");
+        assert!(e.contains("MiB of memory"), "{e}");
+        // Values at Rhai's own size limits are well under the cap.
+        let ok = "let a = []; a.pad(200000, 0); let s = \"\"; s.pad(4000000, 'x'); a.len() + s.len()";
+        assert_eq!(block_on(run(ok, &b)).unwrap(), json!(4_200_000));
+    }
+
+    #[test]
+    fn long_expressions_parse_and_too_deep_ones_say_how_to_split() {
+        let b = MockBridge::default();
+        let chain = |n| vec!["s"; n].join(" + ");
+        assert_eq!(block_on(run(&format!("fn f(s) {{ {} }} f(1)", chain(40)), &b)).unwrap(), json!(40));
+        assert_eq!(block_on(run(&format!("let s = 1; {}", chain(100)), &b)).unwrap(), json!(100));
+        // Nesting up to the limit runs on a 2 MiB test thread; one more is a clean error.
+        for (open, close) in [("(", ")"), ("[", "]"), ("#{a: ", "}"), ("abs(", ")")] {
+            for in_fn in [false, true] {
+                let mut n = 1;
+                let err = loop {
+                    let e = format!("{}1{}", open.repeat(n), close.repeat(n));
+                    let code = if in_fn { format!("fn f() {{ {e} }} f()") } else { e };
+                    match block_on(run(&code, &b)) {
+                        Ok(_) => n += 1,
+                        Err(e) => break e,
+                    }
+                };
+                assert!(n > 10 && err.contains("split long expressions"), "{open} {in_fn} {n}: {err}");
+            }
+        }
     }
 }
