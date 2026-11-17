@@ -299,6 +299,21 @@ print("me", icp.principal())
         // JS errors leave as their text, also inside `allSettled` results.
         let v = run(JS, "const [r] = await Promise.allSettled([Promise.reject(new TypeError('boom'))]); return r").0;
         assert_eq!(v, Ok(json!({ "status": "rejected", "reason": "TypeError: boom" })));
+        // A caught host error leaves as its text in every runtime.
+        for (lang, code) in [
+            (JS, "try { await icp.call('zzz', 'm', null) } catch (e) { return e }"),
+            (PY, "try:\n    icp.call('zzz', 'm')\nexcept Exception as e:\n    r = e\nr"),
+            (RH, "let r = (); try { icp::call_canister(\"zzz\", \"m\"); } catch (e) { r = e; } r"),
+        ] {
+            let v = run(lang, code).0;
+            assert!(v.as_ref().is_ok_and(|v| v.as_str().is_some_and(|s| s.ends_with("policy: canister zzz is not allowlisted"))), "{lang:?}: {v:?}");
+        }
+        // Functions: JSON.stringify drops them in JS; Python and Rhai refuse them, alike.
+        assert_eq!(run(JS, "return [() => 1, { f() {} }]").0, Ok(json!([null, {}])));
+        for (lang, code) in [(PY, "[len]"), (RH, "[Fn(\"to_string\")]")] {
+            let e = run(lang, code).0.unwrap_err();
+            assert!(e.contains("value cannot leave the sandbox"), "{lang:?}: {e}");
+        }
         // Inside the script, JSON.stringify keeps JSON's own rules.
         assert_eq!(run(JS, "return JSON.stringify([NaN, -0, new Error('x'), new Uint8Array([1])])").0, Ok(json!("[null,0,{},{\"0\":1}]")));
     }
@@ -326,11 +341,13 @@ print("me", icp.principal())
     #[test]
     fn output_caps_are_measured_alike() {
         use crate::bridge::{CUT_MARK, MAX_LOG_BYTES, log_cost};
-        let cases: [(&str, [String; 3]); 4] = [
+        let cases: [(&str, [String; 3]); 5] = [
             ("empty", ["for (let i = 0; i < 100000; i++) console.log(); return 1".into(), "for _ in range(100000):\n    print()\n1".into(), "for i in 0..100000 { print(\"\"); } 1".into()]),
             ("control", ["console.log('\\x01'.repeat(60000)); return 1".into(), "print('\\x01' * 60000)\n1".into(), "let s = \"\"; s.pad(60000, '\\x01'); print(s); 1".into()]),
             ("long", ["console.log('x'.repeat(70000)); return 1".into(), "print('x' * 70000)\n1".into(), "let s = \"\"; s.pad(70000, 'x'); print(s); 1".into()]),
             ("lines", ["for (let i = 0; i < 10; i++) console.log('x'.repeat(7000)); return 1".into(), "for _ in range(10):\n    print('x' * 7000)\n1".into(), "let s = \"\"; s.pad(7000, 'x'); for i in 0..10 { print(s); } 1".into()]),
+            // 176: a last line with no newline is charged its newline, as every line is.
+            ("unterminated", ["console.log('x'.repeat(65519)); return 1".into(), "print('x' * 65519, end='')\n1".into(), "let s = \"\"; s.pad(65519, 'x'); print(s); 1".into()]),
         ];
         for (name, codes) in cases {
             for (lang, code) in [JS, PY, RH].into_iter().zip(codes) {
@@ -344,9 +361,27 @@ print("me", icp.principal())
                 if name != "empty" {
                     assert!(!last.starts_with(CUT_MARK), "{lang:?} {name}: the cut line keeps its prefix");
                 }
+                // On-chain, IcBridge's LogBuf keeps exactly what the runtime captured.
+                let buf = crate::bridge::LogBuf::default();
+                logs.iter().for_each(|l| buf.push(l.clone()));
+                assert_eq!(buf.take(), logs, "{lang:?} {name}");
                 let r = crate::mcp::tool_result(Ok(json!(1)), logs);
                 assert_eq!(r["content"][1]["text"].as_str().unwrap().matches(CUT_MARK).count(), 1, "{lang:?} {name}");
             }
+        }
+        // 175: script text ending with the marker cannot make later drops go unmarked.
+        let fake = 65506;
+        for (lang, code) in [
+            (JS, format!("console.log('x'.repeat({fake}) + '{CUT_MARK}'); console.log('secret'); for (let i = 0; i < 10; i++) console.log(i); return 1")),
+            (PY, format!("print('x' * {fake} + '{CUT_MARK}')\nprint('secret')\nfor i in range(10):\n    print(i)\n1")),
+            (RH, format!("let s = \"\"; s.pad({fake}, 'x'); s += \"{CUT_MARK}\"; print(s); print(\"secret\"); for i in 0..10 {{ print(i); }} 1")),
+        ] {
+            let (out, b) = run(lang, &code);
+            assert_eq!(out, Ok(json!(1)), "{lang:?}");
+            let logs = b.logs.take();
+            assert!(logs.iter().map(|l| log_cost(l)).sum::<usize>() <= MAX_LOG_BYTES, "{lang:?}");
+            assert!(logs.last().unwrap().ends_with(CUT_MARK) && logs.last().unwrap().len() > fake, "{lang:?}: {}", logs.len());
+            assert_eq!(logs.len(), 1, "{lang:?}");
         }
     }
 

@@ -814,6 +814,8 @@ mod tests {
         assert!(n.encode_args("f", &json!(9_007_199_254_740_993.0)).err().unwrap().contains("decimal string"));
         assert!(n.encode_args("g", &json!(1e18)).is_err());
         assert!(n.encode_args("f", &json!("18446744073709551616")).is_ok());
+        // 114: exact integers (Python / Rhai) are accepted beyond 2^53, as the description says.
+        assert!(n.encode_args("f", &json!(1u64 << 60)).is_ok() && n.encode_args("g", &json!(u64::MAX)).is_ok());
         assert!(n.encode_args("f", &json!("9".repeat(MAX_INT_DIGITS + 1))).err().unwrap().contains("digits"));
         let huge = IDLValue::Nat(candid::Nat(candid::Nat::from(1u8).0 << 200_000u32));
         assert!(idl_to_json(&huge, 0, &mut ValueBudget::default()).unwrap_err().contains("bits"));

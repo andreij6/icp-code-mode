@@ -58,7 +58,7 @@ struct RunState {
 
 impl RunState {
     fn log(&mut self, line: String) {
-        if let Some((line, used)) = log_line(self.log_bytes, line) {
+        if let Some((line, used)) = log_line(self.log_bytes, line, false) {
             self.log_bytes = used;
             self.logs.push(line);
         }
@@ -144,7 +144,9 @@ fn to_json_value(d: &Dynamic, depth: usize, budget: &mut ValueBudget) -> Result<
         budget.bytes(s.len())?;
         return Ok(Value::String(s.to_string()));
     }
+    // Functions and custom types, refused in the words Python uses.
     rhai::serde::from_dynamic::<Value>(d)
+        .map_err(|_| format!("a {} value cannot leave the sandbox; convert it to a map, array or string", d.type_name()).into())
 }
 
 type Res<T> = Result<T, Box<EvalAltResult>>;

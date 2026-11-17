@@ -83,15 +83,16 @@ const MAX_VALUE_DEPTH: usize = crate::candid_bridge::MAX_DEPTH;
 /// What is left of this run's VM budget. On-chain it is what is left of the policy's
 /// instruction budget (`set_limits`), so Python obeys the same limit as JavaScript and
 /// Rhai; the web-time shim makes one "nanosecond" one instruction. Off-chain it is what
-/// is left of `EXECUTION_BUDGET` of wall time since `started`, unless the bridge sets a
-/// deadline.
+/// is left of `EXECUTION_BUDGET` of wall time since `started`, or less if the bridge's
+/// deadline comes sooner.
 fn vm_budget<B: HostBridge>(bridge: &B, started: Option<std::time::Instant>) -> Duration {
-    // Natively too when a deadline is set (tests), so the budget path runs off-chain.
-    let deadline = bridge.instruction_deadline();
-    if cfg!(target_arch = "wasm32") || deadline != u64::MAX {
-        Duration::from_nanos(deadline.saturating_sub(instruction_counter()))
+    let left = Duration::from_nanos(bridge.instruction_deadline().saturating_sub(instruction_counter()));
+    if cfg!(target_arch = "wasm32") {
+        left
     } else {
-        EXECUTION_BUDGET.saturating_sub(started.map_or(Duration::ZERO, |s| s.elapsed()))
+        // Natively the counter is a stand-in (see `instruction_counter`) and the VM measures
+        // wall time: a test deadline can shorten the wall budget, never lengthen it.
+        left.min(EXECUTION_BUDGET.saturating_sub(started.map_or(Duration::ZERO, |s| s.elapsed())))
     }
 }
 
@@ -170,6 +171,16 @@ fn to_json(o: ObjectRef<'_>, depth: usize, budget: &mut ValueBudget) -> Result<V
                 out.insert(key, value);
             }
             Value::Object(out)
+        }
+        // As JS errors leave: "Type: message", each part cut short.
+        N::Exception { exc_type, arg } => {
+            let cut = |s: &str| if s.len() > 4096 { format!("{}…", &s[..s.floor_char_boundary(4096)]) } else { s.into() };
+            let s = match arg.as_deref() {
+                Some(m) if !m.is_empty() => format!("{exc_type}: {}", cut(m)),
+                _ => exc_type.to_string(),
+            };
+            budget.bytes(s.len())?;
+            Value::String(s)
         }
         N::Cycle(_) => return Err("value contains a reference cycle".into()),
         N::Repr(t) if t.is_empty() || t == "<deeply nested>" => {
@@ -329,8 +340,14 @@ pub async fn run<B: HostBridge>(code: &str, bridge: &B) -> Result<Value, String>
     let _count = test_serial::CountThisThread::on();
     let mut out = Printed::default();
     let result = drive(code, bridge, &mut out).await;
-    for line in out.text.lines() {
-        bridge.log(line.to_string());
+    // Split into lines and charged as the other runtimes charge theirs (an unterminated last
+    // line costs its newline too); only the line `Printed` cut may use the reserve.
+    let lines: Vec<&str> = out.text.lines().collect();
+    let mut used = 0;
+    for (i, line) in lines.iter().enumerate() {
+        let Some((line, u)) = crate::bridge::log_line(used, line.to_string(), out.cut && i + 1 == lines.len()) else { break };
+        used = u;
+        bridge.log(line);
     }
     result
 }
@@ -468,6 +485,15 @@ mod tests {
         let (r, b) = py(&code);
         assert_eq!(r.unwrap(), json!([300, 300]));
         assert_eq!(b.calls.borrow().len(), 3);
+    }
+
+    /// 110: natively a bridge's deadline (IcBridge's is base + max_instructions) never
+    /// stretches Python's wall-time budget past `EXECUTION_BUDGET`; a near one shortens it.
+    #[test]
+    fn native_vm_budget_is_capped_by_the_wall_budget() {
+        let far = MockBridge { deadline: u64::MAX - 1, ..MockBridge::default() };
+        assert!(vm_budget(&far, Some(std::time::Instant::now())) <= EXECUTION_BUDGET);
+        assert!(vm_budget(&MockBridge::with_budget(1_000), Some(std::time::Instant::now())) <= Duration::from_nanos(1_000));
     }
 
     /// 185: a gather batch holds at most `MAX_PENDING` requests, as in JS; nothing is sent
@@ -703,7 +729,10 @@ mod tests {
         assert!(r.is_err());
         assert!(b.calls.borrow().is_empty());
         assert!(py("range(3)").0.unwrap_err().contains("range(0, 3) cannot leave"));
-        assert!(py("[ValueError('x' * 1000000)] * 20").0.unwrap_err().contains("cannot leave"));
+        // 155: exceptions leave as their text, as JS errors do, the message cut short.
+        let v = py("[ValueError('x' * 1000000)] * 20").0.unwrap();
+        assert!(v.as_array().unwrap().iter().all(|e| e.as_str().is_some_and(|s| s.starts_with("ValueError: x") && s.ends_with('…') && s.len() < 4200)));
+        assert_eq!(py("[KeyError(), TypeError('')]").0.unwrap(), json!(["KeyError", "TypeError"]));
         // Bytes are charged one element per byte.
         assert!(py("b'a' * 4000000").0.unwrap_err().contains("elements"));
         // Keys that collide once turned into text, and keys that are not str or int.

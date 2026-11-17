@@ -201,13 +201,16 @@ pub const LOG_RESERVE: usize = CUT_MARK.len() + 2;
 /// Charge `line` to a log that has `used` of `MAX_LOG_BYTES`: the line to keep (cut with
 /// the marker if it does not fit) and the new total, or `None` once the log is full. Whole
 /// lines fill the log up to `LOG_RESERVE` short of the cap, so whatever is dropped is
-/// always marked; a line a runtime already cut passes through unchanged.
-pub fn log_line(used: usize, mut line: String) -> Option<(String, usize)> {
+/// always marked. `bounded`: the line is the runtime's own output, already held to this
+/// rule (the line it cut may use the reserve), so only the hard cap applies; never set it
+/// for script text, which could end with the marker itself.
+pub fn log_line(used: usize, mut line: String, bounded: bool) -> Option<(String, usize)> {
     if used >= MAX_LOG_BYTES {
         return None;
     }
+    let room = if bounded { MAX_LOG_BYTES } else { MAX_LOG_BYTES - LOG_RESERVE };
     match used + log_cost(&line) {
-        n if n <= MAX_LOG_BYTES - LOG_RESERVE || (n <= MAX_LOG_BYTES && line.ends_with(CUT_MARK)) => Some((line, n)),
+        n if n <= room => Some((line, n)),
         _ => {
             cut_escaped(&mut line, (MAX_LOG_BYTES - used).saturating_sub(2));
             Some((line, MAX_LOG_BYTES))
@@ -217,7 +220,8 @@ pub fn log_line(used: usize, mut line: String) -> Option<(String, usize)> {
 
 impl LogBuf {
     pub fn push(&self, line: String) {
-        if let Some((line, used)) = log_line(self.bytes.get(), line) {
+        // Lines arrive from a runtime that already capped them (`log_line`).
+        if let Some((line, used)) = log_line(self.bytes.get(), line, true) {
             self.bytes.set(used);
             self.lines.borrow_mut().push(line);
         }
@@ -1548,7 +1552,7 @@ mod ic {
             assert!(matches!(entry.status, AuditStatus::Started), "{:?}", entry.status);
             assert_eq!(entry.timestamp_ns, 3_000_000_000);
             assert!(pending_run_ids().contains(&id));
-            assert_eq!(b.principal(), canister_self().to_text(), "no platform read off-chain");
+            assert_eq!(b.principal(), Principal::anonymous().to_text(), "the native stand-in, no platform read off-chain");
             drop(b);
             assert!(!pending_run_ids().contains(&id));
             policy::set_candid_override(fx(), None).unwrap();
@@ -1704,23 +1708,32 @@ pub mod mock {
     }
 
     /// 175 / 176: a line that does not fit keeps its prefix (it is not replaced by a marker),
-    /// and lines are charged escaped, newline included.
+    /// lines are charged escaped, newline included, and whatever is dropped is marked, even
+    /// when script text ends with the marker itself.
     #[test]
-    fn log_buffer_keeps_the_prefix_and_charges_newlines() {
-        let buf = LogBuf::default();
-        buf.push("a".repeat(MAX_LOG_BYTES - 1000));
-        buf.push("b".repeat(5000));
-        buf.push("c".into());
-        let lines = buf.take();
+    fn log_lines_keep_the_prefix_charge_newlines_and_mark_drops() {
+        let log = |lines: Vec<String>| {
+            let mut used = 0;
+            lines.into_iter().filter_map(|l| log_line(used, l, false).inspect(|(_, u)| used = *u).map(|(l, _)| l)).collect::<Vec<_>>()
+        };
+        let lines = log(vec!["a".repeat(MAX_LOG_BYTES - 1000), "b".repeat(5000), "c".into()]);
         assert_eq!(lines.len(), 2);
         assert!(lines[1].starts_with('b') && lines[1].ends_with(CUT_MARK), "{}", &lines[1][..10]);
         assert!(lines.iter().map(|l| log_cost(l)).sum::<usize>() <= MAX_LOG_BYTES);
-        let buf = LogBuf::default();
-        (0..MAX_LOG_BYTES).for_each(|_| buf.push(String::new()));
-        let lines = buf.take();
+        let lines = log(vec![String::new(); MAX_LOG_BYTES]);
         assert_eq!(lines.len(), (MAX_LOG_BYTES - LOG_RESERVE) / 2 + 1, "an empty line costs its escaped newline");
         assert_eq!(lines.last().unwrap(), CUT_MARK, "what was dropped is marked");
         assert_eq!(log_cost("\u{1}"), 8);
+        // Script text ending with the marker gets no room from the reserve.
+        let fake = "x".repeat(MAX_LOG_BYTES - LOG_RESERVE - CUT_MARK.len()) + CUT_MARK;
+        let lines = log([fake, "secret".into()].into_iter().chain((0..10).map(|i| i.to_string())).collect());
+        assert!(lines.last().unwrap().ends_with(CUT_MARK), "{:?}", lines.last());
+        assert!(lines.len() <= 2 && lines.iter().map(|l| log_cost(l)).sum::<usize>() <= MAX_LOG_BYTES);
+        // The transport keeps what a runtime produced, its cut line included.
+        let buf = LogBuf::default();
+        let produced = log(vec!["a".repeat(MAX_LOG_BYTES - 1000), "b".repeat(5000)]);
+        produced.iter().for_each(|l| buf.push(l.clone()));
+        assert_eq!(buf.take(), produced);
     }
 
     /// 114 / 155 / 156: the value rules every runtime shares.

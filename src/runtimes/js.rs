@@ -526,7 +526,7 @@ fn console_fn(level: &'static str, state: &Shared) -> NativeFunction {
                 line.push_str(&display(a, st, ctx).unwrap_or_else(|| "<unprintable value>".into()));
             }
             let mut s = st.borrow_mut();
-            if let Some((line, used)) = log_line(s.log_bytes, line) {
+            if let Some((line, used)) = log_line(s.log_bytes, line, false) {
                 s.log_bytes = used;
                 s.logs.push(line);
             }
