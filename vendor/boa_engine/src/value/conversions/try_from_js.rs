@@ -132,7 +132,7 @@ where
                     .into());
             }
         };
-        let mut vec = Vec::with_capacity(length);
+        let mut vec = Vec::with_capacity(length.min(1 << 16)); // icp-code-mode patch: was length
         for i in 0..length {
             let value = object.get(i, context)?;
             vec.push(T::try_from_js(&value, context)?);

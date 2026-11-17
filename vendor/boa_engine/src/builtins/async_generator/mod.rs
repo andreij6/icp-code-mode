@@ -516,7 +516,10 @@ impl AsyncGenerator {
         generator.borrow_mut().data_mut().context = Some(generator_context);
 
         // 8. Assert: result is never an abrupt completion.
-        assert!(!result.is_throw_completion());
+        // icp-code-mode patch: the host interrupt ends the body with an uncatchable error.
+        if let CompletionRecord::Throw(err) = result {
+            return Err(err);
+        }
 
         // 9. Assert: When we return here, genContext has already been removed from the execution context stack and
         //    callerContext is the currently running execution context.

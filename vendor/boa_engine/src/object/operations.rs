@@ -437,7 +437,11 @@ impl JsObject {
         // NOTE(HalidOdat): For object's that are not callable we implement a special __call__ internal method
         //                  that throws on call.
 
-        context.host_check()?; // icp-code-mode patch
+        // icp-code-mode patch: built-in callees (promise resolvers, executors) are exempt, since
+        // Boa `expect`s them to succeed; a call into script code is checked.
+        if !self.is::<NativeFunctionObject>() {
+            context.host_check()?;
+        }
         context.vm.stack.push(this.clone()); // this
         context.vm.stack.push(self.clone()); // func
         let argument_count = args.len();
@@ -1419,7 +1423,7 @@ impl JsValue {
         let len = obj.length_of_array_like(context)?;
 
         // 4. Let list be a new empty List.
-        let mut list = Vec::with_capacity(len as usize);
+        let mut list = Vec::with_capacity(len.min(1 << 16) as usize); // icp-code-mode patch: was len
 
         // 5. Let index be 0.
         // 6. Repeat, while index < len,

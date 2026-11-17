@@ -107,10 +107,12 @@ const SNAPSHOT_JS: &str = r#"(() => {
       }
       const out = {}, ks = list || keys(x);
       for (let i = 0; i < ks.length; i++) {
-        const k = ks[i];
+        const k = ks[i], xv = x[k];
+        // Left out of the output (a listed key the object lacks): costs nothing.
+        if (xv === undefined && !replacer) continue;
         bytes += k.length;
         if (bytes > MAXB) throw new RangeError("value holds more than " + MAXB + " bytes of text");
-        const v = walk(x[k], d + 1, x, k);
+        const v = walk(xv, d + 1, x, k);
         if (v !== undefined) put(out, k, v);
       }
       return out;
@@ -633,8 +635,13 @@ fn error_string(err: JsError, st: &Shared, ctx: &mut Context) -> String {
 }
 
 fn error_text(err: JsError, st: &Shared, ctx: &mut Context) -> String {
-    stopped(st, ctx).err().unwrap_or_else(|| match (err.as_engine(), err.as_native(), err.as_opaque()) {
-        (Some(e), ..) => e.to_string(),
+    let text = stopped(st, ctx).err().unwrap_or_else(|| match (err.as_engine(), err.as_native(), err.as_opaque()) {
+        // A `PanicError` names the step Boa assumed infallible; its root cause says why
+        // (e.g. the native stack limit).
+        (Some(e), ..) => match std::iter::successors(Some(e as &dyn std::error::Error), |c| c.source()).skip(1).last() {
+            Some(root) => format!("{e} ({root})"),
+            None => e.to_string(),
+        },
         (_, Some(native), _) => {
             // Host functions and the snapshot helper report positions that mean nothing to
             // the script author: " (native)" / " (unknown at :L:C)".
@@ -653,7 +660,9 @@ fn error_text(err: JsError, st: &Shared, ctx: &mut Context) -> String {
             }
         }
         _ => "Uncaught error".into(),
-    })
+    });
+    // Formatting runs script code (toJSON, getters), which the interrupt may have stopped.
+    stopped(st, ctx).err().unwrap_or(text)
 }
 
 pub async fn run<B: HostBridge>(code: &str, bridge: &B) -> Result<Value, String> {
@@ -683,10 +692,12 @@ async fn run_metered<B: HostBridge>(code: &str, bridge: &B, meter: Rc<Meter>) ->
 
 /// Refuses source nested deeper than `MAX_NESTING` before Boa parses it, since the parser
 /// and compiler recurse natively once per level and a stack overflow traps. A level is an
-/// open `( [ { ${`, a right-associative operator (`=`, `=>`, `?`, `**`) since the last `,`
-/// or `;` in the enclosing brackets, a prefix operator in an unbroken run (`!!!x`,
-/// `typeof void x`), or 16 other operators (`a + b + ...` also nests, more cheaply).
-/// Strings, comments, regex literals and template text are skipped.
+/// open `( [ { ${`, a right-associative operator (`=`, `=>`, `?`, `**`) or a statement that
+/// nests without brackets (`if`, `for`, `while`, `with`, `do`, `extends`; two labels make one)
+/// since the statement or the last `,` began in the enclosing brackets, a prefix operator in
+/// an unbroken run (`!!!x`, `typeof void x`), or 16 other operators (`a + b + ...` also
+/// nests, more cheaply). An `else` continues its `if` statement. Strings, comments, regex
+/// literals and template text are skipped.
 // ponytail: a lexical scan, not Boa's grammar. `/` after `)` or `}` is taken as a regex
 // exactly when the grammar usually makes it one; source written to confuse that guess can
 // hide nesting from the scan (the README lists this).
@@ -705,6 +716,16 @@ fn check_nesting(code: &str) -> Result<(), String> {
     // word starting the next line resets the operator count, as `;` does.
     let (mut ended, mut fresh) = (false, false);
     let mut prev_word: &[u8] = b"";
+    let mut dot = false; // the last token was `.` or `?.`: a word here is a property name
+    // Whether the next token after `j`, past blanks and comments, is the word `else`.
+    let else_next = |mut j: usize| loop {
+        match (at(j), at(j + 1)) {
+            (b' ' | b'\t' | b'\r' | b'\n', _) => j += 1,
+            (b'/', b'/') => j = code[j..].find('\n').map_or(b.len(), |k| j + k),
+            (b'/', b'*') => j = code[j + 2..].find("*/").map_or(b.len(), |k| j + 2 + k + 2),
+            _ => break b.get(j..).is_some_and(|r| r.starts_with(b"else")) && !word(at(j + 4)),
+        }
+    };
     let deep = || Err(format!("script nests deeper than {MAX_NESTING} levels (brackets and chained operators)"));
     let mut i = 0;
     while i < b.len() {
@@ -783,14 +804,17 @@ fn check_nesting(code: &str) -> Result<(), String> {
                         prev_word = b"";
                         continue; // back in template text
                     }
-                    // `if (x) /re/` vs `(a) / b`; after a block `}` a statement starts.
+                    // `if (x) /re/` vs `(a) / b`; after a block `}` a statement starts. The
+                    // statement after `if (x)` continues on the next line.
                     regex_ok = kind == b'c' || c == b'}';
-                    (run, ended, fresh) = (0, true, false);
+                    (run, ended, fresh, dot) = (0, kind != b'c', c == b'}', false);
                     prev_word = b"";
                     continue;
                 }
             }
+            b';' if else_next(i) => {} // `if (a) x; else if (b) ...` still nests
             b',' | b';' => ops = 0,
+            b':' if !prev_word.is_empty() => ops += 8, // `a: b: c: x` nests (also object keys)
             b'?' if matches!(at(i), b'.' | b'?') => {
                 ops += 1; // `?.`, `??`
                 i += 1;
@@ -828,18 +852,27 @@ fn check_nesting(code: &str) -> Result<(), String> {
                     i += 1;
                 }
                 let w = &b[start..i];
-                if fresh && !matches!(w, b"in" | b"instanceof" | b"of") {
+                if fresh && !matches!(w, b"in" | b"instanceof" | b"of" | b"else") {
                     ops = 0;
                 }
-                if matches!(w, b"typeof" | b"void" | b"delete" | b"await" | b"new" | b"yield") {
+                // After `.` a word is a property name, never a keyword (`o.return / x`).
+                if !dot && matches!(w, b"typeof" | b"void" | b"delete" | b"await" | b"new" | b"yield") {
                     run += 1;
                 } else {
                     run = 0;
                 }
-                prev_word = w;
-                regex_ok = matches!(w, b"return" | b"typeof" | b"instanceof" | b"in" | b"of" | b"new" | b"delete" | b"void"
-                    | b"throw" | b"case" | b"do" | b"else" | b"yield" | b"await");
-                (ended, fresh) = (!regex_ok, false);
+                if !dot && matches!(w, b"if" | b"for" | b"while" | b"with" | b"do" | b"extends") {
+                    ops += 16;
+                }
+                prev_word = if dot { b"_" } else { w }; // `o.if(x) / y` is a call
+                let keyword = !dot
+                    && matches!(w, b"return" | b"typeof" | b"instanceof" | b"in" | b"of" | b"new" | b"delete" | b"void"
+                        | b"throw" | b"case" | b"do" | b"else" | b"yield" | b"await" | b"extends");
+                // `of`, `yield` and `await` can be identifiers too: taking `/` after them as
+                // division can only over-count.
+                regex_ok = keyword && !matches!(w, b"of" | b"yield" | b"await");
+                // A line break after `return` or `yield` ends the statement.
+                (ended, fresh, dot) = (!keyword || matches!(w, b"return" | b"yield"), false, false);
                 if over(outer, ops, run, open.len()) {
                     return deep();
                 }
@@ -852,6 +885,7 @@ fn check_nesting(code: &str) -> Result<(), String> {
         }
         prev_word = b"";
         (regex_ok, ended, fresh) = (!operand, operand, false);
+        dot = c == b'.' || (c == b'?' && at(start + 1) == b'.');
         if over(outer, ops, run, open.len()) {
             return deep();
         }
@@ -1156,6 +1190,41 @@ mod tests {
         assert_eq!(js("return 'ab'.repeat(1100000).length").unwrap(), json!(2200000));
         assert_eq!(js("return 'a'.repeat(1 << 24).length").unwrap(), json!(1 << 24));
         assert_eq!(js("let n = 0; for (let i = 0; i < 600000; i++) n++; for (let i = 0; i < 600000; i++) n++; return n").unwrap(), json!(1200000));
+        // The deadline can land inside steps Boa treats as infallible (`expect`): still a clean stop.
+        let spread = "const src = {}; for (let i = 0; i < 2000; i++) src['k' + i] = i; for (;;) { const c = {...src} }";
+        for n in (300..700).step_by(20) {
+            let e = js_with_deadline_after(n, spread).unwrap_err();
+            assert!(e.contains("instruction budget"), "{n}: {e}");
+        }
+        let e = js_with_deadline_after(1000, "throw { toJSON() { for (;;) {} } }").unwrap_err();
+        assert!(e.contains("instruction budget"), "{e}");
+        let e = js_with_deadline_after(1000, "async function* g() { for (;;) {} } for await (const v of g()) {}").unwrap_err();
+        assert!(e.contains("instruction budget"), "{e}");
+        // Finding 70: argument lists from a script-chosen length are not pre-sized.
+        for code in ["Reflect.apply(function () {}, null, {length: 2 ** 45})", "(function () {}).apply(null, {length: 2 ** 45})",
+                     "Reflect.construct(function () {}, {length: 2 ** 45})",
+                     "Reflect.ownKeys(new Proxy({}, {ownKeys: () => new Proxy({}, {get: (_, k) => k === 'length' ? 2 ** 45 : 'k'})}))"] {
+            let r = js_with_deadline_after(200, &format!("try {{ {code} }} catch (e) {{ return String(e) }} return 1"));
+            assert!(r.as_ref().is_err_and(|e| e.contains("instruction budget")), "{code}: {r:?}");
+        }
+    }
+
+    /// Interrupt polls `code` makes.
+    fn polls(code: &str) -> u64 {
+        TEST_BUDGET_CHECKS.with(|c| c.set(u64::MAX));
+        js(code).unwrap();
+        u64::MAX - TEST_BUDGET_CHECKS.with(Cell::get)
+    }
+
+    // Finding 59: the default sort comparator runs no checked step, yet the merge polls.
+    #[test]
+    fn default_sort_polls_the_interrupt() {
+        let prep = polls("const a = new Array(1 << 16).fill(1); return 1");
+        let copy = polls("const a = new Array(1 << 16).fill(1); a.slice(); return 1") - prep;
+        let sort = polls("const a = new Array(1 << 16).fill(1); a.sort(); return 1") - prep;
+        // Reading and writing back the elements polls about as often as a copy (3x); the
+        // 16 merge passes add one poll per 4096 element moves.
+        assert!(sort > 6 * copy, "{sort} vs {copy}");
     }
 
     // Findings 70, 71, R24: memory is capped per run, inside native loops and across awaits,
@@ -1182,9 +1251,13 @@ mod tests {
                 block_on(run(&code, &b))
             };
             assert!(held(60).unwrap_err().contains("MiB of heap"));
+            // Stopped while the thrown value is formatted: the policy error, not "unserializable".
+            let e = js("throw { toJSON() { globalThis.k = []; for (let i = 0; i < 200; i++) k.push('x'.repeat(1 << 20) + i); return 1 } }").unwrap_err();
+            assert!(e.contains("MiB of heap"), "{e}");
             assert_eq!(held(3).unwrap(), json!(9));
             // ArrayBuffers larger than a run may hold are a RangeError up front.
-            assert_eq!(js("try { new Uint8Array(2 ** 31) } catch (e) { return e.name }").unwrap(), json!("RangeError"));
+            // (Boa's own limit is 1.5 GiB, so this size tests the hook.)
+            assert_eq!(js("try { new Uint8Array(2 ** 27) } catch (e) { return e.name }").unwrap(), json!("RangeError"));
         });
     }
 
@@ -1205,6 +1278,20 @@ mod tests {
     // Finding 99: only the last live run collects the shared heap.
     #[test]
     fn only_the_last_run_collects() {
+        #[derive(Trace)]
+        struct Garbage(#[unsafe_ignore_trace] Rc<Cell<bool>>);
+        impl Finalize for Garbage {
+            fn finalize(&self) {
+                self.0.set(true);
+            }
+        }
+        let swept = Rc::new(Cell::new(false));
+        drop(Gc::new(Garbage(swept.clone())));
+        ACTIVE_RUNS.with(|a| a.set(1)); // another run is live
+        assert_eq!(js("return 1").unwrap(), json!(1));
+        assert!(!swept.get(), "a run collected while another was live");
+        assert!(leave());
+        assert!(swept.get());
         ACTIVE_RUNS.with(|a| a.set(2));
         assert!(!leave());
         assert!(leave());
@@ -1223,6 +1310,9 @@ mod tests {
         assert_eq!(js("let d = 1; for (let i = 0; i < 200; i++) d = [d]; return JSON.stringify({a: 1, b: d}, ['a'])").unwrap(), json!("{\"a\":1}"));
         assert_eq!(js("return JSON.stringify({b: 2, a: 1, 1: 3}, ['a', 'b', 1, new String('a'), true])").unwrap(), json!("{\"a\":1,\"b\":2,\"1\":3}"));
         assert_eq!(js("return JSON.stringify({o: {a: 1, z: 2}, a: [{a: 3, z: 4}]}, ['o', 'a'])").unwrap(), json!("{\"o\":{\"a\":1},\"a\":[{\"a\":3}]}"));
+        // Listed keys an object lacks cost nothing.
+        assert_eq!(js("return JSON.stringify(Array(1000).fill({}), ['k'.repeat(10000)]).length").unwrap(), json!(3001));
+        assert_eq!(js("return JSON.stringify(Array(1000).fill({}), Array.from({length: 1000}, (_, i) => 'k' + i)).length").unwrap(), json!(3001));
     }
 
     // Finding 81: a request queued while converting the result was not sent: an error.
@@ -1340,6 +1430,23 @@ mod tests {
         assert!(check_nesting(SNAPSHOT_JS).is_ok());
         assert!(check_nesting(&"x = a.b + c * d - e\n".repeat(500)).is_ok());
         assert!(check_nesting(&format!("x{}", "\n= y".repeat(500))).is_err());
+        // Statements nest without brackets.
+        for code in [format!("{}x", "if (1) ".repeat(2000)), format!("if (0) {{}}{}", " else if (0) {}".repeat(2000)),
+                     format!("if (0) x;{}", "\nelse if (0) x; /* */".repeat(2000)), format!("{}x;", "do ".repeat(20000)),
+                     format!("{}x", "a: ".repeat(3000)), format!("{}x", "while (0)\n".repeat(2000)),
+                     format!("return typeof class extends {}Object{}", "class extends ".repeat(1000), " {}".repeat(1000)),
+                     // A keyword as a property name or identifier is not one: `/` after it divides.
+                     format!("const o = {{return: 1}}; return o.return / {}1{} / 1", "(".repeat(5000), ")".repeat(5000)),
+                     format!("let of = 1; return of / {}1{} / 1", "(".repeat(5000), ")".repeat(5000)),
+                     format!("const o = {{if: () => 1}}; return o.if(1) / {}1{} / 1", "(".repeat(5000), ")".repeat(5000))] {
+            assert!(check_nesting(&code).unwrap_err().contains("nests deeper"), "{}", &code[..30]);
+        }
+        // Sequential statements do not.
+        for code in ["if (a) return\n", "if (a) {}\n", "if (a) {} ", "if (a) b();", "while (a) b++\n", "for (const x of y) {}",
+                     "class A extends B {} ", "switch (a) { case 1: b: c; }\n", "x = {a: 1, b: {c: 2}};", "do x(); while (a)\n"] {
+            assert!(check_nesting(&code.repeat(500)).is_ok(), "{code}");
+        }
+        assert!(check_nesting(&format!("if (0) {{}}{}", " else if (0) {}".repeat(100))).is_ok());
         // Deep data: native recursion stops at the stack floor with a RangeError.
         for code in [
             "let o = {}; for (let i = 0; i < 100000; i++) o = Object.create(o); return o.x",
@@ -1349,6 +1456,18 @@ mod tests {
         ] {
             let e = js(code).unwrap_err();
             assert!(e.contains("native stack"), "{code}: {e}");
+        }
+        // The floor reached inside steps Boa treats as infallible (`expect`) is an error too:
+        // sweep the depth so the getter runs at every distance above it.
+        for body in ["return {...src}", "return new Error('m')", "const {a, ...r} = src; return r", "return import('x')",
+                     "return Promise.resolve(1)", "return [...[1, 2]]", "return [1, 2].map(x => x)", "return (async () => {})()"] {
+            let code = format!("const src = {{a: 1, b: 2}}; let o = {{ get x() {{ {body} }} }}, fails = 0; \
+                                for (let d = 0; fails < 300; d++) {{ o = Object.create(o); try {{ o.x }} catch (e) {{ fails++ }} }} return fails");
+            // Either caught, or (where Boa turns it into an uncatchable `PanicError`) a clean error.
+            match js(&code) {
+                Ok(v) => assert_eq!(v, json!(300), "{body}"),
+                Err(e) => assert!(e.contains("native stack limit exceeded"), "{body}: {e}"),
+            }
         }
         let e = js("let p = {}; for (let i = 0; i < 2000; i++) p = new Proxy(p, {}); return Object.isExtensible(p)").unwrap_err();
         assert!(e.contains("Proxy target chain"), "{e}");

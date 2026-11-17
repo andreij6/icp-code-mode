@@ -2677,6 +2677,9 @@ impl Array {
                 let (mid, hi) = ((lo + width).min(n), (lo + 2 * width).min(n));
                 let (mut a, mut b) = (lo, mid);
                 for slot in &mut buf[lo..hi] {
+                    // icp-code-mode patch: the default comparator never reaches a checked
+                    // property access or call, so poll the interrupt here.
+                    context.host_check()?;
                     let right = a == mid
                         || (b < hi && sort_compare(&items[b], &items[a], context)? == Ordering::Less);
                     *slot = if right { b += 1; items[b - 1].clone() } else { a += 1; items[a - 1].clone() };

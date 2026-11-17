@@ -658,7 +658,8 @@ pub(crate) fn ordinary_define_own_property(
     context: &mut InternalMethodPropertyContext<'_>,
 ) -> JsResult<bool> {
     // 1. Let current be ? O.[[GetOwnProperty]](P).
-    let current = obj.__get_own_property__(key, context)?;
+    // icp-code-mode patch: skip `host_check`; Boa `expect`s defines on fresh objects to succeed.
+    let current = (obj.vtable().__get_own_property__)(obj, key, context)?;
 
     // 2. Let extensible be ? IsExtensible(O).
     let extensible = obj.__is_extensible__(context)?;

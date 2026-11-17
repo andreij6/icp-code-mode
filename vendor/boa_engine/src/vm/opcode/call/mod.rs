@@ -574,8 +574,7 @@ impl ImportCall {
         let cap = PromiseCapability::new(
             &context.intrinsics().constructors().promise().constructor(),
             context,
-        )
-        .expect("operation cannot fail for the %Promise% intrinsic");
+        )?; // icp-code-mode patch: was `expect`, but its Get(prototype) passes `host_check`
         let promise = cap.promise().clone();
 
         // 6. Let specifierString be Completion(ToString(specifier)).
