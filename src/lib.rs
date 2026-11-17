@@ -31,6 +31,8 @@ pub struct PolicyView {
     pub tokens: Vec<(String, String)>,
     /// Scripts running right now (at most `MAX_CONCURRENT_RUNS`).
     pub active_runs: u32,
+    /// Runs (by `run_id`) that have sent messages and not ended: still waiting on a reply.
+    pub pending_run_ids: Vec<u64>,
 }
 
 fn apply(args: Option<InitArgs>) {
@@ -335,6 +337,7 @@ fn get_policy() -> PolicyView {
         allowlist: policy::list_allowed(),
         tokens: policy::list_tokens(),
         active_runs: ACTIVE_RUNS.with(|a| a.get()),
+        pending_run_ids: bridge::pending_run_ids(),
     }
 }
 
@@ -450,7 +453,7 @@ mod tests {
         use super::{MAX_CONCURRENT_RUNS, RunSlot};
         let mut held: Vec<RunSlot> = (0..MAX_CONCURRENT_RUNS).map(|_| RunSlot::take().expect("free slot")).collect();
         assert!(RunSlot::take().is_none(), "no slot beyond the cap");
-        held.pop(); // a finished (or trapped and cleaned-up) run gives its slot back
+        held.pop(); // a run that ended (normally, or by a cleaned-up trap) gives its slot back
         let again = RunSlot::take();
         assert!(again.is_some() && RunSlot::take().is_none());
     }

@@ -122,7 +122,7 @@ impl LogBuf {
     }
 }
 
-pub use ic::{IcBridge, MAX_DID_BYTES, cached_service, evict_interface};
+pub use ic::{IcBridge, MAX_DID_BYTES, cached_service, evict_interface, pending_run_ids};
 
 /// Instructions executed so far in this call context (0 off-chain).
 pub fn instruction_counter() -> u64 {
@@ -175,6 +175,9 @@ mod ic {
         // (re-fetched on demand); bounded by the allowlist size.
         // Value: (.did text, parsed service, fetch time in ns).
         static DID_CACHE: RefCell<BTreeMap<String, (String, Rc<Service>, u64)>> = RefCell::default();
+        // Runs that wrote a `Started` entry and have not ended. Lets an auditor tell a run
+        // still waiting on a reply from one that ended without a final entry.
+        static PENDING_RUNS: RefCell<BTreeSet<u64>> = RefCell::default();
         // Recent fetch failures: (error, time in ns).
         static DID_FAILED: RefCell<BTreeMap<String, (String, u64)>> = RefCell::default();
         // Parsed admin overrides: (.did text it was parsed from, service).
@@ -203,6 +206,23 @@ mod ic {
                 s
             }),
         })
+    }
+
+    /// Run ids (see `AuditEntry::run_id`) with outbound messages sent and no end yet. Kept
+    /// in memory: a run leaves the list when it finishes or when its trap is cleaned up,
+    /// and the list is empty after an upgrade.
+    pub fn pending_run_ids() -> Vec<u64> {
+        PENDING_RUNS.with(|r| r.borrow().iter().copied().collect())
+    }
+
+    /// The run is over, however it ended: normally, or by ic-cdk dropping the future while
+    /// cleaning up after a trap.
+    impl Drop for IcBridge {
+        fn drop(&mut self) {
+            if let Some(id) = self.started.get() {
+                PENDING_RUNS.with(|r| r.borrow_mut().remove(&id));
+            }
+        }
     }
 
     /// Forget everything cached about a canister (called when it leaves the allowlist).
@@ -311,8 +331,8 @@ mod ic {
 
         /// Write-ahead audit record for one outbound message: `Started` for the run's first,
         /// `Call` for each later one. State commits when the message is sent, so even if the
-        /// script later traps (rolling back the final entry), the log still shows every
-        /// message that went out, with its target and method.
+        /// script never finishes (a trap rolls back the final entry), the log still shows
+        /// every message that went out, with its target and method.
         fn record_message(&self, p: &Principal, label: String) {
             let (caller, language, sha) = self.audit_key.clone();
             let run = self.started.get();
@@ -333,6 +353,7 @@ mod ic {
             });
             if run.is_none() {
                 self.started.set(Some(id));
+                PENDING_RUNS.with(|r| r.borrow_mut().insert(id));
             }
             self.messages.borrow_mut().push(label);
         }

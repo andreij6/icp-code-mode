@@ -8,7 +8,7 @@ type AuditEntry = record {
   methods : opt vec text;
   // Links all entries of one run: the id of the run's `Started` entry, or the entry's
   // own id if the run never sent a message. Script hashes alone can't tell apart two
-  // runs of the same script (one trapped, one not), and runs interleave across awaits.
+  // runs of the same script (one finished, one not), and runs interleave across awaits.
   // `None` only on entries written before this field existed.
   run_id : opt nat64;
   calls : nat32;
@@ -24,11 +24,13 @@ type AuditEntry = record {
 type AuditStatus = variant {
   Ok;
   // Written before a script's first outbound message. A run whose entries are only
-  // `Started`/`Call` (no final entry with its `run_id`) trapped after reaching the network.
+  // `Started`/`Call` has no final entry (yet): it is still waiting on a reply, or it
+  // ended without one because the canister trapped after the message went out. Treat
+  // it as pending or unknown; `get_policy().pending_run_ids` lists the runs in flight.
   Started;
   Error;
   // Written before each later outbound message of the run. Like `Started`, it is
-  // committed when the message is sent, so it survives a later trap.
+  // committed when the message is sent, so it stays even if the run never finishes.
   Call;
   PolicyViolation;
 };
@@ -73,6 +75,8 @@ type Limits = record {
   certified_reads : opt bool;
 };
 type PolicyView = record {
+  // Runs (by `run_id`) that have sent messages and not ended: still waiting on a reply.
+  pending_run_ids : vec nat64;
   // (token hash prefix, label)
   tokens : vec record { text; text };
   allowlist : vec record { principal; vec text };

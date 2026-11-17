@@ -56,10 +56,12 @@ pub struct AllowedMethods(pub Vec<String>);
 #[derive(CandidType, Deserialize, Clone, Debug, PartialEq)]
 pub enum AuditStatus {
     /// Written before a script's first outbound message. A run whose entries are only
-    /// `Started`/`Call` (no final entry with its `run_id`) trapped after reaching the network.
+    /// `Started`/`Call` has no final entry (yet): it is still waiting on a reply, or it
+    /// ended without one because the canister trapped after the message went out. Treat
+    /// it as pending or unknown; `get_policy().pending_run_ids` lists the runs in flight.
     Started,
     /// Written before each later outbound message of the run. Like `Started`, it is
-    /// committed when the message is sent, so it survives a later trap.
+    /// committed when the message is sent, so it stays even if the run never finishes.
     Call,
     Ok,
     Error,
@@ -82,7 +84,7 @@ pub struct AuditEntry {
     pub error: Option<String>,
     /// Links all entries of one run: the id of the run's `Started` entry, or the entry's
     /// own id if the run never sent a message. Script hashes alone can't tell apart two
-    /// runs of the same script (one trapped, one not), and runs interleave across awaits.
+    /// runs of the same script (one finished, one not), and runs interleave across awaits.
     /// `None` only on entries written before this field existed.
     pub run_id: Option<u64>,
     /// Outbound messages as `canister.method` (`canister.<candid interface>` for an
@@ -346,13 +348,13 @@ mod tests {
     /// second succeeds. The run id says which attempt finished; the script hash can't.
     #[test]
     fn run_id_links_started_and_final_entries() {
-        let first = append_audit(entry("same", AuditStatus::Started, None)); // trapped later
+        let first = append_audit(entry("same", AuditStatus::Started, None)); // never finishes
         let second = append_audit(entry("same", AuditStatus::Started, None));
         let done = append_audit(entry("same", AuditStatus::Ok, Some(second)));
         let page = audit_page(0, 3);
         assert_eq!(page.iter().map(|e| (e.id, e.run_id)).collect::<Vec<_>>(),
             vec![(done, Some(second)), (second, Some(second)), (first, Some(first))]);
-        // The trapped run is the Started entry with no other entry in its run.
+        // The unfinished run (pending, or ended by a trap) is the one with no final entry.
         let finished: Vec<_> = page.iter().filter(|e| e.status != AuditStatus::Started).map(|e| e.run_id).collect();
         assert!(!finished.contains(&Some(first)) && finished.contains(&Some(second)));
         // A run that never reached the network is its own run.

@@ -384,8 +384,18 @@ names the target and method (`methods`), and IC state commits when the message i
 if the script traps afterwards, which rolls back its final entry, the log still shows every
 call that went out. The final `Ok` / `Error` / `PolicyViolation` entry lists all of them.
 
-All entries of one run carry the same `run_id` (the `Started` entry's id). A run whose
-entries are only `Started`/`Call` trapped after reaching the network. The script hash can't
+All entries of one run carry the same `run_id` (the `Started` entry's id).
+
+A run whose entries are only `Started`/`Call` has no final entry yet. That is not proof of a
+trap. It means one of two things:
+
+- **Pending:** the run is still waiting on a reply. `get_policy` lists these runs in
+  `pending_run_ids`, next to `active_runs`.
+- **Ended without a final entry:** the canister trapped after the messages went out, which
+  rolled back the final entry.
+
+The pending list is kept in memory and is empty after an upgrade, so for older runs treat a
+missing final entry as "pending or unknown". The script hash can't
 link entries: the same code can run several times, and runs interleave across awaits. A run
 that never reaches the network writes a single entry whose `run_id` is its own id.
 
