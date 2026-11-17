@@ -43,13 +43,39 @@ impl Language {
 
 impl std::str::FromStr for Language {
     type Err = String;
+    /// Only languages compiled into this build parse, so a request for another one is
+    /// refused when it is validated, before any run slot or audit entry.
     fn from_str(s: &str) -> Result<Self, String> {
-        match s.to_ascii_lowercase().as_str() {
-            "javascript" | "js" => Ok(Language::JavaScript),
-            "python" | "py" => Ok(Language::Python),
-            "rhai" => Ok(Language::Rhai),
-            other => Err(format!("unsupported language `{other}` (expected javascript, python or rhai)")),
+        let names = Language::ENABLED.iter().map(|l| l.as_str()).collect::<Vec<_>>().join(", ");
+        let l = match s.to_ascii_lowercase().as_str() {
+            "javascript" | "js" => Language::JavaScript,
+            "python" | "py" => Language::Python,
+            "rhai" => Language::Rhai,
+            other => return Err(format!("unsupported language `{other}` (expected one of: {names})")),
+        };
+        if !Language::ENABLED.contains(&l) {
+            return Err(format!("language `{}` is not compiled into this canister (available: {names})", l.as_str()));
         }
+        Ok(l)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Language;
+
+    /// 95: a known but uncompiled language is refused when parsed; every enabled one parses.
+    #[test]
+    fn only_compiled_languages_parse() {
+        for name in ["javascript", "python", "rhai"] {
+            let r = name.parse::<Language>();
+            let enabled = Language::ENABLED.iter().any(|l| l.as_str() == name);
+            assert_eq!(r.is_ok(), enabled, "{name}: {r:?}");
+            if !enabled {
+                assert!(r.unwrap_err().contains("not compiled"));
+            }
+        }
+        assert!("cobol".parse::<Language>().unwrap_err().contains(Language::ENABLED[0].as_str()));
     }
 }
 
