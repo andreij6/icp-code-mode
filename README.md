@@ -19,6 +19,43 @@ The script:
 
 On-chain policy (allowlist, call cap, instruction budget) is enforced, and every run is audited.
 
+## Benefits
+
+- **Fewer round-trips:** Batch multiple inter-canister calls (`Promise.all` / `asyncio.gather`) inside a single `tools/call` instead of sequential LLM tool turns.
+- **Smaller context window:** Filter, join, and aggregate raw Candid responses inside the Wasm sandbox so only the final JSON summary reaches the model.
+- **Zero per-canister tool wiring:** `search_icp_canisters` and `icp.candid` discover `.did` interfaces dynamically—no custom MCP server or schema needed per canister.
+- **Deny-by-default safety & auditability:** Controllers restrict access per `(Principal, method)`, cap calls/instructions, and inspect an append-only on-chain `StableLog`.
+- **No local MCP runtime:** Any HTTP-capable MCP client (Claude, Gemini, etc.) connects directly to the canister URL with a Bearer token.
+
+## Comparison with Cloudflare Code Mode
+
+Cloudflare's Code Mode introduced the pattern of letting an LLM write code against a typed SDK inside a sandbox rather than calling many fine-grained MCP tools. **ICP Code Mode** brings that same search-and-execute pattern natively onto the Internet Computer, with several advantages for ICP workflows:
+
+- **On-chain, consensus-certified execution:** Scripts run inside the canister's deterministic Wasm sandbox (`http_request_update`) and make native inter-canister calls, rather than running in an off-chain isolate talking to external RPCs.
+- **Native Candid bridge:** Built-in `.did` parsing and type-directed JSON ⇄ Candid conversion—no off-chain IDL tooling or generated client bindings required.
+- **Multi-language runtime:** Supports **JavaScript** (Boa), **Python** (Monty), and **Rhai** in one canister (or per-language feature builds).
+- **On-chain policy & immutable audit log:** Allowlists, SHA-256 token hashes, instruction budgets, and `StableLog` audit entries live in canister stable memory and survive upgrades.
+- **Zero external infra:** The canister *is* the MCP server via the ICP HTTP gateway—no separate Worker, proxy, or API server to host.
+
+## Quickstart (How to use)
+
+1. **Deploy locally** ([build & deploy details](#deploy-locally-with-icp-cli)):
+   ```bash
+   icp network start -d && icp deploy
+   ```
+2. **Create and register a Bearer token** ([token details](#create-a-bearer-token-only-its-sha-256-goes-on-chain)):
+   ```bash
+   export MCP_TOKEN=$(openssl rand -hex 32)
+   icp canister call icp_code_mode add_api_token_hash "(\"$(printf %s "$MCP_TOKEN" | shasum -a 256 | cut -d' ' -f1)\", \"my-laptop\")"
+   ```
+3. **Allowlist target canisters/methods** ([policy & admin endpoints](#allowlist-what-scripts-may-call-deny-by-default)):
+   ```bash
+   icp canister call icp_code_mode set_allowlist '(principal "ryjl3-tyaaa-aaaaa-aaaba-cai", vec {"icrc1_balance_of"; "icrc1_symbol"; "icrc1_decimals"; "icrc1_metadata"; "icrc1_total_supply"})'
+   ```
+4. **Connect your MCP client** ([client config](#mcp-client-config)) or **test with `curl`** ([curl examples](#curl-examples-local)) against `http://icp_code_mode.local.localhost:8010/mcp` (or `https://<canister-id>.icp0.io/mcp` on mainnet).
+
+For SDK signatures, value encoding, and execution limits, see [The `icp` SDK](#the-icp-sdk) and [Guardrails](#guardrails).
+
 ```
 MCP client ──POST /mcp──▶ HTTP gateway ──▶ http_request (query)
                                              ├─ initialize / tools/list / ping → answered here
@@ -242,7 +279,7 @@ How values are encoded:
 | Allowlist | `Principal → ["method" \| "*"]`, deny by default. Checked before any message is sent, including the interface fetch |
 | Calls per script | 25 (`set_limits`). Counts `icp.call` and every interface fetch that misses the cache. Reserved before the await, so concurrent batches count |
 | Instruction budget | 20B per script, measured from the script's own start. Checked before each host request, between JS rounds, and on every Rhai operation; Python has its own 10B VM budget |
-| Requests | One `tools/call` per HTTP request (others in a batch get `-32600`). JS: at most 64 concurrent requests per round and 64 rounds. Rhai: at most 64 requests |
+| Requests | One `execute_icp_script` per HTTP request (further ones in a batch get `-32600`; searches are exempt). JS: at most 64 concurrent requests per round and 64 rounds. Rhai: at most 64 requests |
 | JS (Boa) | 1M loop iterations, recursion 256. `Math.random`, `eval`/`Function`, `Atomics`, `SharedArrayBuffer` and `WeakRef` removed. Fixed clock = block time, UTC. Values crossing into the host, and `JSON.stringify`, are limited to 128 levels and 200k elements |
 | Python (Monty) | Recursion 200, 64 MiB memory, 10B-instruction execution budget, 256 suspensions. Fixed `datetime`, zero sleep, seeded `random`, no OS access |
 | Rhai | 1M operations per run, 32 call levels, size limits on strings/arrays/maps. `eval` and modules disabled |

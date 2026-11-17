@@ -119,20 +119,47 @@ async fn run_search(caller_hash: &str, args: SearchArgs) -> serde_json::Value {
     let script_sha256 = policy::sha256_hex(key.as_bytes());
     let bridge = IcBridge::new(caller.clone(), "search", script_sha256.clone());
     let mut entries = vec![];
+    let mut fetch_errors = vec![];
+    let mut halted: Option<String> = None;
     for (canister, allowed) in search::scope(&args, policy::list_allowed()) {
-        let service = match bridge::cached_service(&canister) {
-            Some(s) => Ok(Some(s)),
-            None => {
+        let service = match (bridge::cached_service(&canister), &halted) {
+            (Some(s), _) => Ok(Some(s)),
+            // After a policy refusal (call cap, budget) every further fetch would be refused
+            // too; don't try, and don't log one violation per remaining canister.
+            (None, Some(why)) => Err(format!("not fetched: {why}; search with canister_id")),
+            (None, None) => {
                 use bridge::HostBridge;
-                bridge.candid(&canister.to_text()).await.map(|_| bridge::cached_service(&canister))
+                let r = bridge.candid(&canister.to_text()).await.map(|_| bridge::cached_service(&canister));
+                if let Err(e) = &r {
+                    if e.starts_with("policy:") {
+                        halted = Some(e.clone());
+                    } else {
+                        fetch_errors.push(e.clone());
+                    }
+                }
+                r
             }
         };
         entries.push(Entry { canister, allowed, service });
     }
     let result = search::render(&args, &entries);
-    // Fetching sent messages (and wrote a `Started` entry): close it like a script run.
-    if bridge.calls() > 0 {
-        let violations = bridge.violations.take();
+    let mut violations = bridge.violations.take();
+    if let n @ 1.. = bridge.violations_dropped.get() {
+        violations.push(format!("…and {n} more"));
+    }
+    // Audit whenever a fetch was attempted: sent messages (a `Started` entry is open) or
+    // was refused by policy (refusals must be logged even though nothing was sent).
+    if bridge.calls() > 0 || !violations.is_empty() {
+        let status = match (violations.is_empty(), fetch_errors.is_empty()) {
+            (false, _) => AuditStatus::PolicyViolation,
+            (true, false) => AuditStatus::Error,
+            (true, true) => AuditStatus::Ok,
+        };
+        let error = (!fetch_errors.is_empty()).then(|| {
+            let mut e = fetch_errors.join("; ");
+            bridge::truncate(&mut e, MAX_AUDIT_ERROR_BYTES);
+            e
+        });
         policy::append_audit(AuditEntry {
             id: 0,
             timestamp_ns: ic_cdk::api::time(),
@@ -142,9 +169,9 @@ async fn run_search(caller_hash: &str, args: SearchArgs) -> serde_json::Value {
             canisters: bridge.touched.take().into_iter().collect(),
             calls: bridge.calls(),
             instructions: bridge.instructions_used(),
-            status: if violations.is_empty() { AuditStatus::Ok } else { AuditStatus::PolicyViolation },
+            status,
             violations,
-            error: None,
+            error,
         });
     }
     mcp::tool_result(Ok(result), vec![])

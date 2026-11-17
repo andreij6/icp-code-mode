@@ -343,13 +343,13 @@ pub async fn http_update(req: &HttpUpdateRequest, exec: impl AsyncFn(&str, ToolR
             Msg::Done(r) => replies.extend(r),
             Msg::ToolCall(id, Err(e)) => replies.push(rpc_error(id, -32602, e)),
             // One script per request: each gets its own message budget, and the reply
-            // size stays bounded.
-            Msg::ToolCall(id, Ok(_)) if ran_script => {
-                replies.push(rpc_error(id, -32600, "only one tools/call per HTTP request"))
+            // size stays bounded. Searches are cheap and size-capped, so they are exempt.
+            Msg::ToolCall(id, Ok(ToolRequest::Execute(_))) if ran_script => {
+                replies.push(rpc_error(id, -32600, "only one execute_icp_script call per HTTP request"))
             }
-            Msg::ToolCall(id, Ok(call)) => {
-                ran_script = true;
-                replies.push(rpc_ok(id, exec(&caller, call).await));
+            Msg::ToolCall(id, Ok(req)) => {
+                ran_script |= matches!(req, ToolRequest::Execute(_));
+                replies.push(rpc_ok(id, exec(&caller, req).await));
             }
         }
     }
@@ -566,8 +566,12 @@ mod tests {
         setup();
         let call = |id: u32| json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call",
             "params": { "name": TOOL_NAME, "arguments": { "language": "rhai", "code": "40 + 2" } } });
-        let b = body(&update(json!([call(1), call(2)])));
-        assert_eq!(b[0]["result"]["content"][0]["text"], "42");
-        assert_eq!(b[1]["error"]["code"], -32600);
+        let search = |id: u32| json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": { "name": SEARCH_TOOL_NAME, "arguments": {} } });
+        let b = body(&update(json!([search(0), call(1), search(2), call(3)])));
+        assert!(b[0]["result"].is_object(), "search before the script still runs");
+        assert_eq!(b[1]["result"]["content"][0]["text"], "42");
+        assert!(b[2]["result"].is_object(), "search after the script still runs");
+        assert_eq!(b[3]["error"]["code"], -32600);
     }
 }

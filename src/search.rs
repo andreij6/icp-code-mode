@@ -111,6 +111,7 @@ pub fn render(args: &SearchArgs, entries: &[Entry]) -> Value {
             .collect();
 
         let mut shown = vec![];
+        let mut cut = 0usize; // matching methods dropped by the global cap
         let mut vars = BTreeSet::new();
         for (name, f) in methods {
             let sig = signature(f);
@@ -119,22 +120,28 @@ pub fn render(args: &SearchArgs, entries: &[Entry]) -> Value {
                 continue;
             }
             if budget == 0 {
-                omitted += 1;
+                cut += 1;
                 continue;
             }
             budget -= 1;
             f.args.iter().chain(&f.rets).for_each(|t| collect_vars(&svc.env, t, &mut vars));
             shown.push(json!({ "name": name, "signature": sig }));
         }
+        omitted += cut;
         // With a keyword filter, skip canisters that have no matching method.
-        if shown.is_empty() && !terms.is_empty() {
+        if shown.is_empty() && cut == 0 && !terms.is_empty() {
             continue;
         }
         let types: serde_json::Map<String, Value> = vars
             .into_iter()
             .filter_map(|v| svc.env.find_type(&v).ok().map(|t| (v, Value::String(type_text(t)))))
             .collect();
-        canisters.push(json!({ "canister_id": id, "allowed_methods": e.allowed, "methods": shown, "types": types }));
+        let mut c = json!({ "canister_id": id, "allowed_methods": e.allowed, "methods": shown, "types": types });
+        if cut > 0 {
+            // Otherwise an empty `methods` would read as "nothing allowed here".
+            c["omitted_methods"] = json!(cut);
+        }
+        canisters.push(c);
     }
 
     let mut out = json!({ "canisters": canisters });
@@ -235,5 +242,13 @@ mod tests {
         let out = render(&SearchArgs::default(), &many);
         let shown: usize = out["canisters"].as_array().unwrap().iter().map(|c| c["methods"].as_array().unwrap().len()).sum();
         assert_eq!((shown, out["omitted_methods"].as_u64()), (MAX_METHODS, Some(20)));
+        // Canisters past the cap say so instead of showing an unexplained empty list.
+        let cs = out["canisters"].as_array().unwrap();
+        assert!(cs.iter().all(|c| !c["methods"].as_array().unwrap().is_empty() || c["omitted_methods"].as_u64() == Some(3)));
+        let per: u64 = cs.iter().filter_map(|c| c["omitted_methods"].as_u64()).sum();
+        assert_eq!(per, 20);
+        // Same with a keyword filter: truncated canisters are kept, non-matching ones dropped.
+        let out = render(&SearchArgs { query: Some("icrc1".into()), canister_id: None }, &many);
+        assert_eq!(out["canisters"].as_array().unwrap().len(), 20);
     }
 }
