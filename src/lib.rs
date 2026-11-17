@@ -17,7 +17,7 @@ use runtimes::LanguageRouter;
 
 #[derive(CandidType, Deserialize, Default)]
 pub struct InitArgs {
-    /// SHA-256 hex digests of bearer tokens: `echo -n "$TOKEN" | shasum -a 256`.
+    /// SHA-256 hex digests of bearer tokens: `printf %s "$TOKEN" | shasum -a 256 | cut -d' ' -f1`.
     pub token_sha256: Vec<String>,
     pub allowlist: Vec<(Principal, Vec<String>)>,
     pub limits: Option<Limits>,
@@ -218,15 +218,22 @@ fn decode_update_req(bytes: &[u8]) -> Result<HttpUpdateRequest, candid::Error> {
 
 #[ic_cdk::update]
 async fn http_request_update(req: HttpUpdateRequest) -> HttpResponse {
-    mcp::http_update(&req, run_tool).await
+    // Count every authenticated update, not only those that reach a tool: canister callers
+    // skip `inspect_message`, and with certified_reads every request is an update.
+    if let Ok(hash) = mcp::authenticate(&req.method, &req.url, &req.headers) {
+        if let Some(e) = rate_limited(&hash) {
+            return HttpResponse::too_many_requests(&e);
+        }
+        rate_count(&hash, this_minute());
+    }
+    mcp::http_update(&req, policy::limits().certified_reads == Some(true), run_tool).await
 }
 
 async fn run_tool(caller_hash: &str, req: ToolRequest) -> serde_json::Value {
-    let minute = this_minute();
-    if let Some(e) = rate_check(caller_hash, minute).or_else(|| cycles_check(ic_cdk::api::canister_liquid_cycle_balance())) {
+    // Rate counting is done per HTTP request in `http_request_update`.
+    if let Some(e) = cycles_check(ic_cdk::api::canister_liquid_cycle_balance()) {
         return mcp::tool_result(Err(e), vec![]);
     }
-    rate_count(caller_hash, minute);
     match req {
         ToolRequest::Execute(call) => run_script(caller_hash, call).await,
         ToolRequest::Search(args) => run_search(caller_hash, args).await,
@@ -366,7 +373,7 @@ fn rate_limited(token_hash: &str) -> Option<String> {
 fn rate_check(token_hash: &str, minute: u64) -> Option<String> {
     let limit = policy::limits().tool_calls_per_minute.unwrap_or(policy::DEFAULT_TOOL_CALLS_PER_MINUTE);
     let used = RATE.with(|r| r.borrow().get(token_hash).filter(|(m, _)| *m == minute).map_or(0, |(_, n)| *n));
-    (used >= limit).then(|| format!("rate limited: at most {limit} tool calls per minute per token; retry in a minute"))
+    (used >= limit).then(|| format!("rate limited: at most {limit} update calls per minute per token; retry in a minute"))
 }
 
 /// Liquid cycles (above the freezing threshold) below which no run is started. A run
@@ -490,9 +497,10 @@ async fn run_script(caller_hash: &str, call: ToolCall) -> serde_json::Value {
     let mut out = LanguageRouter::execute(call.language, &call.code, &bridge).await;
     // A result too big to send is an error, and recorded as one.
     if let Ok(v) = &out
-        && let Err(e) = mcp::result_text(v.clone()) {
-            out = Err(e);
-        }
+        && let Err(e) = mcp::result_text(v.clone())
+    {
+        out = Err(e);
+    }
     let instructions = bridge.instructions_used();
     let (out, deny) = close_over_budget(out, instructions, bridge.limits().max_instructions, &bridge.messages());
     let out = out.map_err(|e| if deny { bridge.deny(e) } else { e });
@@ -566,6 +574,9 @@ fn controller() -> Result<(), String> {
 /// Refused (the call traps) for the management canister, this canister, or past the caps
 /// on methods per canister, method name length and allowlist size. `"*"` allows every
 /// method except delegating ones such as `icrc2_approve`, which must be listed by name.
+/// `vec {}` allowlists the interface only: scripts can read it with `icp.candid` (those
+/// fetches are sent and logged) and search lists the canister with no methods, but every
+/// call is refused.
 #[ic_cdk::update(guard = "controller")]
 fn set_allowlist(canister: Principal, methods: Vec<String>) {
     // A controller re-allowlisting a canister usually means its interface changed or a
@@ -1071,7 +1082,7 @@ mod tests {
             assert!(rate_check("a", 5).is_none());
             rate_count("a", 5);
         }
-        assert!(rate_check("a", 5).unwrap().contains("rate limited"));
+        assert!(rate_check("a", 5).unwrap().contains("rate limited: at most 2 update calls"));
         assert!(rate_check("b", 5).is_none(), "per token");
         assert!(rate_check("a", 6).is_none(), "per minute");
         rate_count("a", 6);

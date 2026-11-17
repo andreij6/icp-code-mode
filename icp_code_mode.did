@@ -71,7 +71,7 @@ type HttpUpdateRequest = record {
   headers : vec record { text; text };
 };
 type InitArgs = record {
-  // SHA-256 hex digests of bearer tokens: `echo -n "$TOKEN" | shasum -a 256`.
+  // SHA-256 hex digests of bearer tokens: `printf %s "$TOKEN" | shasum -a 256 | cut -d' ' -f1`.
   token_sha256 : vec text;
   allowlist : vec record { principal; vec text };
   limits : opt Limits;
@@ -81,8 +81,9 @@ type Limits = record {
   // clamped). `null` (default): 300. A timed-out call may or may not have executed on
   // the target; the error says so.
   call_timeout_seconds : opt nat32;
-  // Tool calls each bearer token may make per minute (on the update path). `null`
-  // (default): 120. Over the limit, requests are refused before they run, so nothing is
+  // Update calls each bearer token may make per minute (each runs at most one tool
+  // call; with `certified_reads` every MCP request is one). `null` (default): 120.
+  // Over the limit, requests are refused before they run, so nothing is
   // spent and nothing is logged. This bounds how fast one token can spend cycles and
   // grow the audit log.
   tool_calls_per_minute : opt nat32;
@@ -90,8 +91,8 @@ type Limits = record {
   // Checked against `call_context_instruction_counter()` before every call and after the run.
   // At most 30B (larger values are stored as 30B).
   max_instructions : nat64;
-  // `true`: every MCP request goes through an update call, so responses are certified
-  // by consensus (about 1-2 s each) and the uncertified demo page is disabled.
+  // `true`: every authenticated /mcp request goes through an update call, so responses
+  // are certified by consensus (about 1-2 s each) and the uncertified demo page is disabled.
   // `null`/`false` (default): initialize, tools/list and cached searches are answered
   // by fast query calls, which a single malicious node could alter.
   certified_reads : opt bool;
@@ -151,6 +152,9 @@ service : (opt InitArgs) -> {
   // Refused (the call traps) for the management canister, this canister, or past the caps
   // on methods per canister, method name length and allowlist size. `"*"` allows every
   // method except delegating ones such as `icrc2_approve`, which must be listed by name.
+  // `vec {}` allowlists the interface only: scripts can read it with `icp.candid` (those
+  // fetches are sent and logged) and search lists the canister with no methods, but every
+  // call is refused.
   set_allowlist : (principal, vec text) -> ();
   // Register (or clear, with `null`) a `.did` for a target. While set it takes precedence:
   // the target's own interface is not fetched or refreshed. `remove_allowlist` does not
