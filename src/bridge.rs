@@ -118,13 +118,15 @@ mod ic {
     use crate::policy::{self, AuditEntry, AuditStatus};
     use candid::types::FuncMode;
     use candid::{CandidType, Deserialize, Principal};
-    use ic_cdk::call::Call;
+    use ic_cdk::call::{Call, CallErrorExt};
     use std::cell::{Cell, RefCell};
     use std::collections::{BTreeMap, BTreeSet};
     use std::rc::Rc;
 
     /// Longest method name a script may pass (keeps policy messages small).
     const MAX_METHOD_LEN: usize = 256;
+    /// How long a fetched interface is trusted before it is fetched again.
+    const DID_CACHE_TTL_NS: u64 = 3600 * 1_000_000_000;
     /// Violations kept per script; the rest are only counted.
     const MAX_VIOLATIONS: usize = 16;
     const MAX_VIOLATION_BYTES: usize = 512;
@@ -132,7 +134,8 @@ mod ic {
     thread_local! {
         // ponytail: heap cache keyed by canonical principal text, emptied on upgrade
         // (re-fetched on demand); bounded by the allowlist size.
-        static DID_CACHE: RefCell<BTreeMap<String, (String, Rc<Service>)>> = RefCell::default();
+        // Value: (.did text, parsed service, fetch time in ns).
+        static DID_CACHE: RefCell<BTreeMap<String, (String, Rc<Service>, u64)>> = RefCell::default();
     }
 
     /// The interface for `p` without any outbound message: an admin override, or the
@@ -142,7 +145,16 @@ mod ic {
         if let Some(did) = policy::candid_override(&key) {
             return Service::parse(&did).ok().map(Rc::new);
         }
-        DID_CACHE.with(|c| c.borrow().get(&key).map(|(_, s)| s.clone()))
+        cache_get(&key).map(|(_, s)| s)
+    }
+
+    /// A cached interface, unless it is older than `DID_CACHE_TTL_NS` (then it is
+    /// re-fetched, so a target's interface change is picked up without an upgrade here).
+    fn cache_get(key: &str) -> Option<(String, Rc<Service>)> {
+        let now = ic_cdk::api::time();
+        DID_CACHE.with(|c| {
+            c.borrow().get(key).filter(|(_, _, at)| now.saturating_sub(*at) <= DID_CACHE_TTL_NS).map(|(d, s, _)| (d.clone(), s.clone()))
+        })
     }
 
     /// Production bridge: one instance per `tools/call`, so counters start at zero.
@@ -154,6 +166,9 @@ mod ic {
         audit_key: (String, String, String),
         /// Id of this run's `Started` audit entry, once one is written.
         started: Cell<Option<u64>>,
+        /// Every outbound message so far, as `canister.method`, in order.
+        messages: RefCell<Vec<String>>,
+        call_timeout: Option<u32>,
         pub touched: RefCell<BTreeSet<String>>,
         pub violations: RefCell<Vec<String>>,
         pub violations_dropped: Cell<u32>,
@@ -168,6 +183,8 @@ mod ic {
                 max_instructions: policy::limits().max_instructions,
                 audit_key: (caller, language.to_string(), script_sha256),
                 started: Cell::new(None),
+                messages: RefCell::default(),
+                call_timeout: policy::limits().call_timeout_seconds,
                 touched: RefCell::default(),
                 violations: RefCell::default(),
                 violations_dropped: Cell::new(0),
@@ -177,6 +194,11 @@ mod ic {
 
         pub fn calls(&self) -> u32 {
             self.calls.get()
+        }
+
+        /// Outbound messages so far (see `AuditEntry::methods`).
+        pub fn messages(&self) -> Vec<String> {
+            self.messages.borrow().clone()
         }
 
         /// The run this script's final audit entry belongs to (see `AuditEntry::run_id`).
@@ -213,18 +235,17 @@ mod ic {
             .map_err(|e| self.deny(e))?;
             self.calls.set(n + 1);
             self.touched.borrow_mut().insert(p.to_text());
-            self.mark_started(p);
+            self.record_message(p, format!("{}.{}", p.to_text(), method.unwrap_or("<candid interface>")));
             Ok(())
         }
 
-        /// Before the first outbound message, append a `Started` audit entry. State commits
-        /// at that await, so even if the script later traps (rolling back the final entry),
-        /// the log still records that this script reached the network.
-        fn mark_started(&self, p: &Principal) {
-            if self.started.get().is_some() {
-                return;
-            }
+        /// Write-ahead audit record for one outbound message: `Started` for the run's first,
+        /// `Call` for each later one. State commits when the message is sent, so even if the
+        /// script later traps (rolling back the final entry), the log still shows every
+        /// message that went out, with its target and method.
+        fn record_message(&self, p: &Principal, label: String) {
             let (caller, language, sha) = self.audit_key.clone();
+            let run = self.started.get();
             let id = policy::append_audit(AuditEntry {
                 id: 0,
                 timestamp_ns: ic_cdk::api::time(),
@@ -232,14 +253,18 @@ mod ic {
                 language,
                 script_sha256: sha,
                 canisters: vec![p.to_text()],
-                calls: 0,
+                calls: self.calls.get(),
                 instructions: self.instructions_used(),
-                status: AuditStatus::Started,
+                status: if run.is_none() { AuditStatus::Started } else { AuditStatus::Call },
                 violations: vec![],
                 error: None,
-                run_id: None, // a Started entry opens its own run
+                run_id: run, // None: a Started entry opens its own run
+                methods: Some(vec![label.clone()]),
             });
-            self.started.set(Some(id));
+            if run.is_none() {
+                self.started.set(Some(id));
+            }
+            self.messages.borrow_mut().push(label);
         }
 
         async fn service(&self, p: &Principal) -> Result<Rc<Service>, String> {
@@ -247,12 +272,11 @@ mod ic {
             if let Some(did) = policy::candid_override(&key) {
                 return Ok(Rc::new(Service::parse(&did)?));
             }
-            let cached = || DID_CACHE.with(|c| c.borrow().get(&key).map(|(_, s)| s.clone()));
-            if let Some(s) = cached() {
+            if let Some((_, s)) = cache_get(&key) {
                 return Ok(s);
             }
             self.candid(&key).await?; // populates DID_CACHE
-            cached().ok_or_else(|| "candid cache miss".into())
+            cache_get(&key).map(|(_, s)| s).ok_or_else(|| "candid cache miss".into())
         }
     }
 
@@ -298,7 +322,7 @@ mod ic {
             if let Some(did) = policy::candid_override(&key) {
                 return Ok(did);
             }
-            if let Some((did, _)) = DID_CACHE.with(|c| c.borrow().get(&key).cloned()) {
+            if let Some((did, _)) = cache_get(&key) {
                 return Ok(did);
             }
             // Fetching an interface sends messages: allowlisted canisters only, and it
@@ -308,7 +332,7 @@ mod ic {
                 format!("could not fetch candid for {key} ({e}); a controller can register it with set_candid_override")
             })?;
             let svc = Rc::new(Service::parse(&did)?);
-            DID_CACHE.with(|c| c.borrow_mut().insert(key, (did.clone(), svc)));
+            DID_CACHE.with(|c| c.borrow_mut().insert(key, (did.clone(), svc, ic_cdk::api::time())));
             Ok(did)
         }
 
@@ -323,10 +347,17 @@ mod ic {
             if enc.func.modes.contains(&FuncMode::CompositeQuery) {
                 return Err(format!("`{method}` is a composite_query; it cannot be called from an update"));
             }
-            let reply = Call::unbounded_wait(p, method)
-                .with_raw_args(&enc.bytes)
-                .await
-                .map_err(|e| format!("call {p}.{method} failed: {e}"))?;
+            // Default: wait for a guaranteed reply. With a timeout configured the call is
+            // best-effort: it cannot block this canister from stopping, but a timed-out
+            // call may still have executed on the target.
+            let call = match self.call_timeout {
+                Some(secs) => Call::bounded_wait(p, method).change_timeout(secs),
+                None => Call::unbounded_wait(p, method),
+            };
+            let reply = call.with_raw_args(&enc.bytes).await.map_err(|e| {
+                let unknown = self.call_timeout.is_some() && !e.is_clean_reject();
+                format!("call {p}.{method} failed: {e}{}", if unknown { " (outcome unknown: the call may have executed)" } else { "" })
+            })?;
             svc.decode_reply(&enc.func, &reply.into_bytes())
         }
 
@@ -383,6 +414,37 @@ pub mod mock {
         }
         fn log(&self, line: String) {
             self.logs.push(line);
+        }
+    }
+
+    /// Like MockBridge, but every call suspends once, as an inter-canister await does,
+    /// so two runs driven by `join` really interleave.
+    pub struct YieldBridge(pub MockBridge);
+    struct YieldOnce(bool);
+    impl std::future::Future for YieldOnce {
+        type Output = ();
+        fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+            if self.0 {
+                return std::task::Poll::Ready(());
+            }
+            self.0 = true;
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    }
+    impl HostBridge for YieldBridge {
+        async fn candid(&self, id: &str) -> Result<String, String> {
+            self.0.candid(id).await
+        }
+        async fn call(&self, id: &str, m: &str, a: Value) -> Result<Value, String> {
+            YieldOnce(false).await;
+            self.0.call(id, m, a).await
+        }
+        fn principal(&self) -> String {
+            self.0.principal()
+        }
+        fn log(&self, l: String) {
+            self.0.log(l)
         }
     }
 }

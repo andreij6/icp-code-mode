@@ -21,6 +21,9 @@ pub const MAX_RESULT_BYTES: usize = 1_000_000;
 /// The IC rejects replies over 2 MiB (and traps the canister, rolling back the audit
 /// entry); anything bigger than this is replaced by a small error.
 pub const MAX_REPLY_BYTES: usize = 1_900_000;
+/// Messages per JSON-RPC batch. Without a cap, thousands of tiny invalid messages
+/// inflate the reply past the limit, and the resulting trap rolls back the audit entry.
+pub const MAX_BATCH: usize = 50;
 
 #[derive(CandidType, Deserialize, Clone, Debug)]
 pub struct HttpRequest {
@@ -137,7 +140,9 @@ fn initialize_result() -> Value {
 }
 
 fn rpc_error(id: Value, code: i64, message: impl Into<String>) -> Value {
-    json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message.into() } })
+    let mut message = message.into(); // may echo client input (method, tool, language names)
+    crate::bridge::truncate(&mut message, 300);
+    json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
 fn rpc_ok(id: Value, result: Value) -> Value {
@@ -284,6 +289,10 @@ pub fn authenticate(method: &str, url: &str, headers: &[(String, String)]) -> Re
 /// Parse the body into individual messages; `bool` = it was a batch.
 fn parse_body(body: &[u8]) -> Result<(Vec<Value>, bool), HttpResponse> {
     match serde_json::from_slice::<Value>(body) {
+        Ok(Value::Array(a)) if a.len() > MAX_BATCH => Err(HttpResponse::json(
+            400,
+            &rpc_error(Value::Null, -32600, format!("batch of {} messages exceeds the limit of {MAX_BATCH}", a.len())),
+        )),
         Ok(Value::Array(a)) if !a.is_empty() => Ok((a, true)),
         Ok(Value::Array(_)) => Err(HttpResponse::json(400, &rpc_error(Value::Null, -32600, "empty batch"))),
         Ok(v) => Ok((vec![v], false)),
@@ -292,11 +301,17 @@ fn parse_body(body: &[u8]) -> Result<(Vec<Value>, bool), HttpResponse> {
 }
 
 fn finish(replies: Vec<Value>, batch: bool) -> HttpResponse {
-    match (replies.len(), batch) {
+    let r = match (replies.len(), batch) {
         (0, _) => HttpResponse::new(202, vec![], None), // only notifications
         (_, true) => HttpResponse::json(200, &Value::Array(replies)),
         _ => HttpResponse::json(200, &replies[0]),
+    };
+    // Last line of defence: the reply must always fit, whatever it echoes (e.g. huge ids),
+    // because a trap here would discard the audit entry of a script that already ran.
+    if r.body.len() > MAX_REPLY_BYTES {
+        return HttpResponse::json(200, &rpc_error(Value::Null, -32603, format!("reply exceeded {MAX_REPLY_BYTES} bytes")));
     }
+    r
 }
 
 /// Demo UI (no secrets inside; it asks for the token and calls `POST /mcp`).
@@ -314,12 +329,23 @@ fn demo_page(method: &str, url: &str) -> Option<HttpResponse> {
 /// Query path: answer read-only methods. `search(args)` answers a search from cached
 /// state, or returns `None` when an interface must be fetched first. Anything that
 /// needs an update (scripts, such searches) upgrades the whole request.
-pub fn http_query(req: &HttpRequest, search: impl Fn(&SearchArgs) -> Option<Value>) -> HttpResponse {
+///
+/// Query responses are not certified, so a single malicious node could alter them.
+/// With `certified` (policy `certified_reads`), every authenticated request is upgraded
+/// to an update call instead, and the demo page (uncertified HTML that asks for the
+/// token) is switched off.
+pub fn http_query(req: &HttpRequest, certified: bool, search: impl Fn(&SearchArgs) -> Option<Value>) -> HttpResponse {
     if let Some(page) = demo_page(&req.method, &req.url) {
+        if certified {
+            return HttpResponse::json(404, &json!({ "error": "the demo page is disabled while certified_reads is on" }));
+        }
         return page;
     }
     if let Err(r) = authenticate(&req.method, &req.url, &req.headers) {
         return r;
+    }
+    if certified {
+        return HttpResponse::upgrade();
     }
     let (msgs, batch) = match parse_body(&req.body) {
         Ok(x) => x,
@@ -406,6 +432,7 @@ mod tests {
                 body: ByteBuf::from(serde_json::to_vec(&body).unwrap()),
                 certificate_version: Some(2),
             },
+            false,
             mock_search,
         )
     }
@@ -446,10 +473,10 @@ mod tests {
             body: ByteBuf::from(b"{}".to_vec()),
             certificate_version: None,
         };
-        assert_eq!(http_query(&mk("POST", "/mcp", "wrong"), mock_search).status_code, 401);
-        assert_eq!(http_query(&mk("POST", "/other", TOKEN), mock_search).status_code, 404);
-        assert_eq!(http_query(&mk("GET", "/mcp", TOKEN), mock_search).status_code, 405);
-        let r = http_query(&mk("POST", "/mcp?x=1", TOKEN), mock_search);
+        assert_eq!(http_query(&mk("POST", "/mcp", "wrong"), false, mock_search).status_code, 401);
+        assert_eq!(http_query(&mk("POST", "/other", TOKEN), false, mock_search).status_code, 404);
+        assert_eq!(http_query(&mk("GET", "/mcp", TOKEN), false, mock_search).status_code, 405);
+        let r = http_query(&mk("POST", "/mcp?x=1", TOKEN), false, mock_search);
         assert_eq!(body(&r)["error"]["code"], -32600);
     }
 
@@ -476,7 +503,7 @@ mod tests {
 
         let b = body(&query(json!({ "jsonrpc": "2.0", "id": 2, "method": "nope" })));
         assert_eq!(b["error"]["code"], -32601);
-        let r = http_query(&HttpRequest { body: ByteBuf::from(b"{oops".to_vec()), ..mk_req() }, mock_search);
+        let r = http_query(&HttpRequest { body: ByteBuf::from(b"{oops".to_vec()), ..mk_req() }, false, mock_search);
         assert_eq!(body(&r)["error"]["code"], -32700);
     }
 
@@ -560,13 +587,51 @@ mod tests {
 
     #[test]
     fn demo_page_is_served_without_auth() {
-        let get = |url: &str| http_query(&HttpRequest { method: "GET".into(), url: url.into(), headers: vec![], ..mk_req() }, mock_search);
+        let get = |url: &str| http_query(&HttpRequest { method: "GET".into(), url: url.into(), headers: vec![], ..mk_req() }, false, mock_search);
         let r = get("/");
         assert_eq!(r.status_code, 200);
         assert!(r.headers.contains(&("content-type".into(), "text/html; charset=utf-8".into())));
         assert!(std::str::from_utf8(&r.body).unwrap().contains("search_icp_canisters"));
         assert_eq!(get("/demo?x").status_code, 200);
         assert_eq!(get("/mcp").status_code, 405); // MCP endpoint itself is unchanged
+    }
+
+    /// Reported audit-suppression vector: pad a batch so the reply exceeds the limit and the
+    /// canister traps while replying, which rolls back the script's audit entry.
+    #[test]
+    fn replies_always_fit() {
+        setup();
+        // 30,000 tiny invalid messages: refused outright, in both paths.
+        let padded = Value::Array(vec![json!({}); 30_000]);
+        let (q, u) = (query(padded.clone()), update(padded));
+        for r in [&q, &u] {
+            assert_eq!(r.status_code, 400);
+            assert!(body(r)["error"]["message"].as_str().unwrap().contains("exceeds the limit of 50"));
+        }
+        // Inside the cap, replies that echo client input still cannot exceed the limit.
+        let big_id = "i".repeat(MAX_REPLY_BYTES);
+        let r = update(json!({ "jsonrpc": "2.0", "id": big_id, "method": "ping" }));
+        assert!(r.body.len() < 1000);
+        assert_eq!(body(&r)["error"]["code"], -32603);
+        let r = update(json!({ "jsonrpc": "2.0", "id": 1, "method": "m".repeat(500_000) }));
+        assert!(r.body.len() < 1000, "error messages do not echo unbounded input");
+    }
+
+    #[test]
+    fn certified_mode_upgrades_everything_and_disables_the_demo_page() {
+        setup();
+        let post = |token: &str| HttpRequest {
+            body: ByteBuf::from(br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#.to_vec()),
+            headers: headers(token),
+            ..mk_req()
+        };
+        assert_eq!(http_query(&post(TOKEN), true, mock_search).upgrade, Some(true));
+        assert_eq!(http_query(&post(TOKEN), false, mock_search).upgrade, None);
+        // Bad tokens are still refused in the query, so they never reach an update call.
+        assert_eq!(http_query(&post("wrong"), true, mock_search).status_code, 401);
+        let page = HttpRequest { method: "GET".into(), url: "/".into(), headers: vec![], ..mk_req() };
+        assert_eq!(http_query(&page, true, mock_search).status_code, 404);
+        assert_eq!(http_query(&page, false, mock_search).status_code, 200);
     }
 
     #[test]

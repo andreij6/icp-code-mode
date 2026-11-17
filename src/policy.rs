@@ -26,11 +26,26 @@ pub struct Limits {
     pub max_calls_per_script: u32,
     /// Checked against `call_context_instruction_counter()` before every call and after the run.
     pub max_instructions: u64,
+    /// `null` (default): calls wait for the reply however long it takes (guaranteed
+    /// response), so a target that never answers keeps this canister from stopping and
+    /// upgrading. A number: calls time out after that many seconds (the IC caps it at
+    /// 300); a timed-out call may or may not have executed on the target.
+    pub call_timeout_seconds: Option<u32>,
+    /// `true`: every MCP request goes through an update call, so responses are certified
+    /// by consensus (about 1-2 s each) and the uncertified demo page is disabled.
+    /// `null`/`false` (default): initialize, tools/list and cached searches are answered
+    /// by fast query calls, which a single malicious node could alter.
+    pub certified_reads: Option<bool>,
 }
 
 impl Default for Limits {
     fn default() -> Self {
-        Self { max_calls_per_script: DEFAULT_MAX_CALLS, max_instructions: DEFAULT_MAX_INSTRUCTIONS }
+        Self {
+            max_calls_per_script: DEFAULT_MAX_CALLS,
+            max_instructions: DEFAULT_MAX_INSTRUCTIONS,
+            call_timeout_seconds: None,
+            certified_reads: None,
+        }
     }
 }
 
@@ -40,9 +55,12 @@ pub struct AllowedMethods(pub Vec<String>);
 
 #[derive(CandidType, Deserialize, Clone, Debug, PartialEq)]
 pub enum AuditStatus {
-    /// Written before a script's first outbound message. A `Started` entry with no other
-    /// entry carrying its `run_id` means the run trapped after reaching the network.
+    /// Written before a script's first outbound message. A run whose entries are only
+    /// `Started`/`Call` (no final entry with its `run_id`) trapped after reaching the network.
     Started,
+    /// Written before each later outbound message of the run. Like `Started`, it is
+    /// committed when the message is sent, so it survives a later trap.
+    Call,
     Ok,
     Error,
     PolicyViolation,
@@ -67,6 +85,10 @@ pub struct AuditEntry {
     /// runs of the same script (one trapped, one not), and runs interleave across awaits.
     /// `None` only on entries written before this field existed.
     pub run_id: Option<u64>,
+    /// Outbound messages as `canister.method` (`canister.<candid interface>` for an
+    /// interface fetch), in order. On a `Started`/`Call` entry: the one message about to
+    /// be sent. On a final entry: all of them. `None` on entries from before this field.
+    pub methods: Option<Vec<String>>,
 }
 
 macro_rules! candid_storable {
@@ -260,7 +282,7 @@ mod tests {
 
     #[test]
     fn execution_caps() {
-        let lim = Limits { max_calls_per_script: 2, max_instructions: 100 };
+        let lim = Limits { max_calls_per_script: 2, max_instructions: 100, ..Limits::default() };
         let any = AllowedMethods(vec!["*".into()]);
         assert!(authorize(Some(&any), LEDGER, "m", 1, 0, &lim).is_ok());
         assert!(authorize(Some(&any), LEDGER, "m", 2, 0, &lim).unwrap_err().contains("call limit"));
@@ -275,7 +297,7 @@ mod tests {
         assert!(check_call(&ledger, "icrc1_balance_of", 0, 0).is_ok());
         assert!(check_call(&ledger, "icrc1_transfer", 0, 0).is_err());
         assert!(check_call(&Principal::management_canister(), "raw_rand", 0, 0).is_err());
-        set_limits(Limits { max_calls_per_script: 0, max_instructions: 1 });
+        set_limits(Limits { max_calls_per_script: 0, max_instructions: 1, ..Limits::default() });
         assert!(check_call(&ledger, "icrc1_balance_of", 0, 0).unwrap_err().contains("call limit"));
         assert!(remove_allowed(ledger));
         assert_eq!(list_allowed(), vec![]);
@@ -299,7 +321,7 @@ mod tests {
         let e = |lang: &str| AuditEntry {
             id: 0, timestamp_ns: 1, caller: "c".into(), language: lang.into(), script_sha256: "s".into(),
             canisters: vec![], calls: 0, instructions: 0, status: AuditStatus::Ok, violations: vec![], error: None,
-            run_id: None,
+            run_id: None, methods: None,
         };
         for l in ["a", "b", "c"] {
             append_audit(e(l));
@@ -315,7 +337,7 @@ mod tests {
     fn entry(sha: &str, status: AuditStatus, run_id: Option<u64>) -> AuditEntry {
         AuditEntry {
             id: 0, timestamp_ns: 1, caller: "c".into(), language: "javascript".into(), script_sha256: sha.into(),
-            canisters: vec![], calls: 0, instructions: 0, status, violations: vec![], error: None, run_id,
+            canisters: vec![], calls: 0, instructions: 0, status, violations: vec![], error: None, run_id, methods: None,
         }
     }
 
@@ -352,5 +374,15 @@ mod tests {
         };
         let decoded = <AuditEntry as Storable>::from_bytes(Cow::Owned(Encode!(&old).unwrap()));
         assert_eq!((decoded.id, decoded.run_id, decoded.language.as_str()), (7, None, "rhai"));
+        assert_eq!(decoded.methods, None);
+
+        // Same for the stored limits record, which gained two optional settings.
+        #[derive(CandidType)]
+        struct OldLimits {
+            max_calls_per_script: u32,
+            max_instructions: u64,
+        }
+        let l = <Limits as Storable>::from_bytes(Cow::Owned(Encode!(&OldLimits { max_calls_per_script: 7, max_instructions: 9 }).unwrap()));
+        assert_eq!(l, Limits { max_calls_per_script: 7, max_instructions: 9, call_timeout_seconds: None, certified_reads: None });
     }
 }

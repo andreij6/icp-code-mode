@@ -204,7 +204,7 @@ async fn drive<B: HostBridge>(code: &str, bridge: &B, out: &mut String) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge::mock::MockBridge;
+    use crate::bridge::mock::{MockBridge, YieldBridge};
     use futures::executor::block_on;
     use serde_json::json;
 
@@ -245,36 +245,6 @@ mod tests {
         assert!(py("icp.call('a', 'b', args=1)").0.unwrap_err().contains("positional"));
         assert_eq!(py("from icp import principal\nprincipal()").0.unwrap(), json!("aaaaa-aa"));
         assert_eq!(py("b'\\x01\\x02'").0.unwrap(), json!([1, 2]));
-    }
-
-    /// Like MockBridge, but every call suspends once, as an inter-canister await does.
-    struct YieldBridge(MockBridge);
-    struct YieldOnce(bool);
-    impl std::future::Future for YieldOnce {
-        type Output = ();
-        fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
-            if self.0 {
-                return std::task::Poll::Ready(());
-            }
-            self.0 = true;
-            cx.waker().wake_by_ref();
-            std::task::Poll::Pending
-        }
-    }
-    impl HostBridge for YieldBridge {
-        async fn candid(&self, id: &str) -> Result<String, String> {
-            self.0.candid(id).await
-        }
-        async fn call(&self, id: &str, m: &str, a: Value) -> Result<Value, String> {
-            YieldOnce(false).await;
-            self.0.call(id, m, a).await
-        }
-        fn principal(&self) -> String {
-            self.0.principal()
-        }
-        fn log(&self, l: String) {
-            self.0.log(l)
-        }
     }
 
     #[test]

@@ -2,6 +2,10 @@ type AuditEntry = record {
   id : nat64;
   status : AuditStatus;
   timestamp_ns : nat64;
+  // Outbound messages as `canister.method` (`canister.<candid interface>` for an
+  // interface fetch), in order. On a `Started`/`Call` entry: the one message about to
+  // be sent. On a final entry: all of them. `None` on entries from before this field.
+  methods : opt vec text;
   // Links all entries of one run: the id of the run's `Started` entry, or the entry's
   // own id if the run never sent a message. Script hashes alone can't tell apart two
   // runs of the same script (one trapped, one not), and runs interleave across awaits.
@@ -19,10 +23,13 @@ type AuditEntry = record {
 };
 type AuditStatus = variant {
   Ok;
-  // Written before a script's first outbound message. A `Started` entry with no other
-  // entry carrying its `run_id` means the run trapped after reaching the network.
+  // Written before a script's first outbound message. A run whose entries are only
+  // `Started`/`Call` (no final entry with its `run_id`) trapped after reaching the network.
   Started;
   Error;
+  // Written before each later outbound message of the run. Like `Started`, it is
+  // committed when the message is sent, so it survives a later trap.
+  Call;
   PolicyViolation;
 };
 type HttpRequest = record {
@@ -51,9 +58,19 @@ type InitArgs = record {
   limits : opt Limits;
 };
 type Limits = record {
+  // `null` (default): calls wait for the reply however long it takes (guaranteed
+  // response), so a target that never answers keeps this canister from stopping and
+  // upgrading. A number: calls time out after that many seconds (the IC caps it at
+  // 300); a timed-out call may or may not have executed on the target.
+  call_timeout_seconds : opt nat32;
   max_calls_per_script : nat32;
   // Checked against `call_context_instruction_counter()` before every call and after the run.
   max_instructions : nat64;
+  // `true`: every MCP request goes through an update call, so responses are certified
+  // by consensus (about 1-2 s each) and the uncertified demo page is disabled.
+  // `null`/`false` (default): initialize, tools/list and cached searches are answered
+  // by fast query calls, which a single malicious node could alter.
+  certified_reads : opt bool;
 };
 type PolicyView = record {
   // (token hash prefix, label)

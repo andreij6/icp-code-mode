@@ -157,7 +157,8 @@ icp canister call icp_code_mode set_allowlist '(principal "ryjl3-tyaaa-aaaaa-aaa
 ```
 
 Use `vec {"*"}` to allow every method of a canister. The other admin endpoints are controller-only:
-- `set_limits(record { max_calls_per_script; max_instructions })`
+- `set_limits(record { max_calls_per_script; max_instructions; call_timeout_seconds; certified_reads })`
+  (the last two are optional; see "Options" below)
 - `remove_allowlist`
 - `revoke_api_token_hash`
 - `set_candid_override(principal, opt text)`
@@ -364,26 +365,44 @@ How values are encoded:
 | Allowlist | `Principal → ["method" \| "*"]`, deny by default. Checked before any message is sent, including the interface fetch |
 | Calls per script | 25 (`set_limits`). Counts `icp.call` and every interface fetch that misses the cache. Reserved before the await, so concurrent batches count |
 | Instruction budget | 20B per script, measured from the script's own start. Checked before each host request, between JS rounds, and on every Rhai operation; Python has its own 10B VM budget |
-| Requests | One `execute_icp_script` per HTTP request (further ones in a batch get `-32600`; searches are exempt). JS: at most 64 concurrent requests per round and 64 rounds. Rhai: at most 64 requests |
+| Requests | At most 50 messages per JSON-RPC batch. One `execute_icp_script` per HTTP request (further ones in a batch get `-32600`; searches are exempt). JS: at most 64 concurrent requests per round and 64 rounds. Rhai: at most 64 requests |
 | JS (Boa) | 1M loop iterations, recursion 256. `Math.random`, `eval`/`Function`, `Atomics`, `SharedArrayBuffer` and `WeakRef` removed. Fixed clock = block time, UTC. Values crossing into the host, and `JSON.stringify`, are limited to 128 levels and 200k elements |
 | Python (Monty) | Recursion 200, 64 MiB memory, 10B-instruction execution budget, 256 suspensions. Fixed `datetime`, zero sleep, seeded `random`, no OS access |
 | Rhai | 1M operations per run, 32 call levels, size limits on strings/arrays/maps. `eval` and modules disabled |
-| Output | Script source ≤ 100 KiB. Captured logs ≤ 64 KiB, enforced while running. Result ≤ 1 MB of *escaped* JSON. A reply that would still exceed 1.9 MB is replaced by an error |
-| Audit | Append-only `StableLog`: time, token-hash prefix, language, script SHA-256, canisters, calls, instructions, status, violations (≤ 16, each ≤ 512 B), error (≤ 4 KiB) |
+| Output | Script source ≤ 100 KiB. Captured logs ≤ 64 KiB, enforced while running. Result ≤ 1 MB of *escaped* JSON. Any reply that would exceed 1.9 MB, whatever it contains, is replaced by a small error, so replying can never trap |
+| Audit | Append-only `StableLog`: time, token-hash prefix, language, script SHA-256, canisters, methods, calls, instructions, status, violations (≤ 16, each ≤ 512 B), error (≤ 4 KiB). One entry is written before every outbound message, plus a final entry per run |
+| Unpaid-call filter | `inspect_message` rejects update calls that carry no registered token (or, for admin methods, don't come from a controller) before the canister is charged for them |
 | Stack | 8 MiB wasm stack (`.cargo/config.toml`), up from Rust's 1 MiB default |
 
 Policy, tokens and the audit log live in `ic-stable-structures`, so they survive upgrades
 without `pre_upgrade` code. `post_upgrade` accepts the same optional `InitArgs` as `init`.
 
-**Audit entries come in pairs.** A script that reaches the network writes a `Started` entry
-before its first outbound message. IC state commits at that await, so the entry survives even
-if the script traps later. The final `Ok` / `Error` / `PolicyViolation` entry follows, and both
-carry the same `run_id` (the `Started` entry's id). A `Started` entry with no other entry for
-its `run_id` means the run trapped after its calls went out.
+**The audit log is written ahead of every outbound message.** Before a script's first
+message the canister appends a `Started` entry, and before each later one a `Call` entry. Each
+names the target and method (`methods`), and IC state commits when the message is sent. So
+if the script traps afterwards, which rolls back its final entry, the log still shows every
+call that went out. The final `Ok` / `Error` / `PolicyViolation` entry lists all of them.
 
-The script hash can't link the two: the same code can run several times, and runs interleave
-across awaits. A run that never reaches the network writes a single entry whose `run_id` is
-its own id.
+All entries of one run carry the same `run_id` (the `Started` entry's id). A run whose
+entries are only `Started`/`Call` trapped after reaching the network. The script hash can't
+link entries: the same code can run several times, and runs interleave across awaits. A run
+that never reaches the network writes a single entry whose `run_id` is its own id.
+
+**Options** (both off by default, set with `set_limits`):
+
+- `call_timeout_seconds`: by default calls wait for a guaranteed reply, so an allowlisted
+  canister that never answers can keep this canister from stopping and upgrading. With a
+  timeout (the IC caps it at 300 s) that can't happen, but a timed-out call may still have
+  executed on the target; the error says so.
+- `certified_reads`: by default `initialize`, `tools/list` and cached searches are answered by
+  query calls. Those are fast and free but not certified, so a single malicious node could
+  alter them (the allowlist is still enforced on-chain when a script runs). With
+  `certified_reads = opt true` every request goes through an update call (about 0.2 s locally,
+  1-2 s on mainnet) and the demo page, which is uncertified HTML that asks for the token, is
+  switched off. Read the audit log with an update call for the same reason.
+
+Fetched interfaces are cached for one hour, then fetched again, so a target's interface
+change is picked up without upgrading this canister.
 
 Canister ids are canonicalised (`RYJL3-…` and `ryjl3-…` are the same principal) before the
 allowlist check, the interface cache and the override lookup.
@@ -392,16 +411,23 @@ allowlist check, the interface cache and the override lookup.
 
 - **One built-in call can still hit the IC's 40B-instruction trap.** Boa cannot be
   interrupted inside a single native operation, such as `new Array(2e8).fill(0)`. Every other
-  path stops with a clean error. If this happens before any outbound message, nothing changed
-  and the client gets a 503. If it happens after one, the `Started` audit entry remains.
+  path stops with a clean error. If this happens before any outbound message, nothing changed,
+  nothing is logged, and the client gets a 503 with no result. If it happens after one, the
+  `Started`/`Call` entries for every message already sent remain.
+- **Bearer tokens are visible to the subnet's node operators and the HTTP gateway**, because
+  request contents are replicated to the nodes that run the canister. That is how HTTP
+  requests work on ICP. Treat tokens as revocable credentials: one per client, rotated, and
+  revoked with `revoke_api_token_hash` when in doubt.
+- **All tokens act as one on-chain identity:** calls go out as this canister's principal.
+  Tokens are told apart only in the audit log.
 - **Rhai replays from the top** for each host request. That costs O(requests²) operations,
   bounded by the 64-request cap and the instruction budget.
 - **`opt opt T`:** `?null` and `null` both decode to JSON `null`, and you can't send `?null`.
-- **The interface cache lives on the heap**, so it is re-fetched after an upgrade.
+- **The interface cache lives on the heap**, so it is also re-fetched after an upgrade.
   `canister_metadata` is tried first, but the local pocket-ic replica does not implement it
   yet, so the code falls back to `__get_candid_interface_tmp_hack`.
-- **Adding the `Started` audit status was a Candid-breaking change** for `get_audit_logs`
-  clients compiled against the older `.did`. Upgrading needed `icp deploy --yes`.
+- **Adding the `Started` and `Call` audit statuses were Candid-breaking changes** for
+  `get_audit_logs` clients compiled against an older `.did`. Upgrading needed `icp deploy --yes`.
 
 ## Where this differs from the original spec, and why
 

@@ -72,7 +72,8 @@ fn post_upgrade(args: Option<InitArgs>) {
 #[ic_cdk::query]
 fn http_request(req: HttpRequest) -> HttpResponse {
     use base64::Engine;
-    let mut r = mcp::http_query(&req, search_cached);
+    let certified = policy::limits().certified_reads == Some(true);
+    let mut r = mcp::http_query(&req, certified, search_cached);
     // Only available in non-replicated queries.
     if let (None, Some(cert)) = (r.upgrade, ic_cdk::api::data_certificate()) {
         let cert = base64::engine::general_purpose::STANDARD.encode(cert);
@@ -173,6 +174,7 @@ async fn run_search(caller_hash: &str, args: SearchArgs) -> serde_json::Value {
             violations,
             error,
             run_id: bridge.run_id(),
+            methods: Some(bridge.messages()),
         });
     }
     mcp::tool_result(Ok(result), vec![])
@@ -219,8 +221,29 @@ async fn run_script(caller_hash: &str, call: ToolCall) -> serde_json::Value {
         violations,
         error,
         run_id: bridge.run_id(),
+        methods: Some(bridge.messages()),
     });
     mcp::tool_result(out, bridge.logs.take())
+}
+
+/// Runs on one replica before an ingress update call is accepted, at no charge. Without
+/// it, anyone could call `http_request_update` directly (bypassing the gateway's query)
+/// and make the canister pay for receiving and running each call, valid token or not.
+/// Only calls with a registered bearer token, or from a controller, are let in.
+///
+/// This is a cost filter, not the security boundary: a dishonest replica can skip it and
+/// calls from other canisters never pass through it (they pay for themselves), so every
+/// method still does its own check.
+#[ic_cdk::inspect_message]
+fn inspect_message() {
+    let allowed = match ic_cdk::api::msg_method_name().as_str() {
+        "http_request_update" => candid::decode_one::<HttpUpdateRequest>(&ic_cdk::api::msg_arg_data())
+            .is_ok_and(|r| mcp::authenticate(&r.method, &r.url, &r.headers).is_ok()),
+        _ => ic_cdk::api::is_controller(&ic_cdk::api::msg_caller()),
+    };
+    if allowed {
+        ic_cdk::api::accept_message();
+    }
 }
 
 // ---------- admin (controllers only) ----------

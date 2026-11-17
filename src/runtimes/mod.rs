@@ -161,6 +161,39 @@ print("me", icp.principal())
         }
     }
 
+    /// Requests interleave across awaits on-chain. Runs of every engine, suspended
+    /// mid-call while others start, finish and collect garbage, must not disturb each other.
+    #[test]
+    fn interleaved_runs_are_isolated() {
+        use crate::bridge::mock::YieldBridge;
+        let js = |tag: &str| format!(
+            r#"globalThis.leak = "{tag}"; const junk = []; for (let i = 0; i < 20000; i++) junk.push({{i, s: "x" + i}});
+               const a = await icp.call("{LEDGER}", "icrc1_balance_of", {{owner: "{tag}"}});
+               const more = []; for (let i = 0; i < 20000; i++) more.push([i]);
+               const b = await icp.call("{LEDGER}", "icrc1_balance_of", {{owner: "{tag}"}});
+               return [globalThis.leak, a.owner, b.owner, junk.length + more.length];"#);
+        let py = |tag: &str| format!("x = ['{tag}'] * 1000\na = icp.call('{LEDGER}', 'icrc1_balance_of', {{'owner': '{tag}'}})\n[x[0], a['owner'], len(x)]");
+        let rh = |tag: &str| format!(r#"let a = icp::call_canister("{LEDGER}", "icrc1_balance_of", #{{owner: "{tag}"}}); let b = icp::call_canister("{LEDGER}", "icrc1_balance_of", #{{owner: "{tag}"}}); [a.owner, b.owner]"#);
+        let bridges: Vec<YieldBridge> = (0..7).map(|_| YieldBridge(MockBridge::default())).collect();
+        let (j1, j2, j3, p1, p2, r1, r2) = (js("one"), js("two"), js("three"), py("p1"), py("p2"), rh("r1"), rh("r2"));
+        let out = block_on(futures::future::join_all(vec![
+            Box::pin(LanguageRouter::execute(Language::JavaScript, &j1, &bridges[0])) as std::pin::Pin<Box<dyn std::future::Future<Output = _>>>,
+            Box::pin(LanguageRouter::execute(Language::Python, &p1, &bridges[1])),
+            Box::pin(LanguageRouter::execute(Language::JavaScript, &j2, &bridges[2])),
+            Box::pin(LanguageRouter::execute(Language::Rhai, &r1, &bridges[3])),
+            Box::pin(LanguageRouter::execute(Language::JavaScript, &j3, &bridges[4])),
+            Box::pin(LanguageRouter::execute(Language::Python, &p2, &bridges[5])),
+            Box::pin(LanguageRouter::execute(Language::Rhai, &r2, &bridges[6])),
+        ]));
+        assert_eq!(out[0], Ok(json!(["one", "one", "one", 40000])));
+        assert_eq!(out[2], Ok(json!(["two", "two", "two", 40000])));
+        assert_eq!(out[4], Ok(json!(["three", "three", "three", 40000])));
+        assert_eq!(out[1], Ok(json!(["p1", "p1", 1000])));
+        assert_eq!(out[5], Ok(json!(["p2", "p2", 1000])));
+        assert_eq!(out[3], Ok(json!(["r1", "r1"])));
+        assert_eq!(out[6], Ok(json!(["r2", "r2"])));
+    }
+
     #[test]
     fn unknown_language_and_oversized_code() {
         assert!("cobol".parse::<Language>().is_err());
