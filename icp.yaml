@@ -18,6 +18,18 @@ canisters:
     # `opt InitArgs`; tokens and allowlist can also be managed after deploy (see README).
     init_args: "(null)"
 
+  # Demo target: a small store with 10 methods and seeded data (see demo_store/).
+  # After deploy, run scripts/demo-setup.sh to allowlist it in icp_code_mode.
+  - name: demo_store
+    build:
+      steps:
+        - type: script
+          commands:
+            - cargo build --package demo_store --target wasm32-unknown-unknown --release --locked
+            - cp target/wasm32-unknown-unknown/release/demo_store.wasm "$ICP_WASM_OUTPUT_PATH"
+            - ic-wasm "$ICP_WASM_OUTPUT_PATH" -o "$ICP_WASM_OUTPUT_PATH" metadata candid:service -f demo_store/demo_store.did -v public
+            - ic-wasm "$ICP_WASM_OUTPUT_PATH" -o "$ICP_WASM_OUTPUT_PATH" shrink
+
 # Local network on 8010 so it can run beside other projects' networks (default 8000).
 networks:
   - name: local

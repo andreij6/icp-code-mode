@@ -1,0 +1,13 @@
+[package]
+name = "demo_store"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ic-cdk = "0.20.3"
+candid = "0.10.40"
+serde = { version = "1", features = ["derive"] }

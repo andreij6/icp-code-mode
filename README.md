@@ -77,7 +77,9 @@ MCP client ──POST /mcp──▶ HTTP gateway ──▶ http_request (query)
 | `src/mcp.rs` | JSON-RPC 2.0 router (`initialize`, `notifications/initialized`, `ping`, `tools/list`, `tools/call`, batches), bearer auth |
 | `src/bridge.rs` | `HostBridge` trait (shared by all runtimes) and `IcBridge` (policy → Candid fetch → call → decode) |
 | `src/candid_bridge.rs` | `.did` parsing (`candid_parser`) and type-directed `serde_json::Value` ⇄ `IDLValue` conversion |
-| `src/demo.html` | Demo UI served at `GET /` |
+| `src/demo.html` | Demo UI served at `GET /`, including the Classic MCP vs Code Mode comparison |
+| `demo_store/` | Demo target canister: 10 store methods with seed data |
+| `scripts/demo-setup.sh` | Allowlists `demo_store` in `icp_code_mode` |
 | `src/search.rs` | `search_icp_canisters`: allowlist × interface → filtered signatures and referenced type definitions |
 | `src/policy.rs` | Stable-memory guardrails: allowlist, limits, SHA-256 token hashes, append-only audit log |
 | `src/runtimes/` | `LanguageRouter` + `js.rs` (Boa), `python.rs` (Monty), `rhai_rt.rs` (Rhai) |
@@ -154,6 +156,44 @@ Use `vec {"*"}` to allow every method of a canister. The other admin endpoints a
 - `revoke_api_token_hash`
 - `set_candid_override(principal, opt text)`
 - `get_policy`, `get_audit_logs(offset, limit)`, `get_audit_log_len`
+
+## Demo store and side-by-side comparison
+
+`demo_store/` is a second canister: a small shop with 10 methods (7 reads, 3 writes) and
+deterministic seed data (12 products, 8 customers, 60 orders). It exposes its interface
+through `__get_candid_interface_tmp_hack`. Deploying it and allowlisting its reads plus
+`create_order` takes two commands; `cancel_order` and `restock` stay blocked, so the
+guardrail is visible:
+
+```bash
+icp deploy
+```
+
+```bash
+scripts/demo-setup.sh
+```
+
+The demo page's **Classic MCP vs Code Mode** section runs each task both ways against the
+store and checks that both sides return the same answer:
+- **Classic MCP:** one tool per store method. Each call is a real tool call, and its full result
+  goes through the model.
+- **Code Mode:** one search, then one script.
+
+It reports LLM round trips, tool calls, and tool-definition / tool-result / generated / total
+input tokens (estimated as characters ÷ 4 over a modelled agent loop), plus measured canister
+time. "How the numbers are counted" on the page spells out what is measured and what is
+modelled.
+
+Measured on the local network:
+
+| Task | Classic MCP | Code Mode | Total input tokens |
+|---|---|---|---|
+| Top 3 customers by spend | 4 tool calls, ≈3.2k tok of results | 2 tool calls, ≈0.5k tok | 2.6× fewer |
+| What needs restocking? | 13 tool calls | 2 tool calls | 1.2× fewer |
+| Tea sales report | 2 tool calls, ≈3.1k tok of results | 2 tool calls, ≈0.5k tok | 1.4× fewer |
+
+Code Mode's cost here is mostly its fixed overhead: two tool definitions plus one search.
+Classic MCP grows with every row and call, so the gap widens with real data volumes.
 
 ## Demo page
 

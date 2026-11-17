@@ -41,6 +41,26 @@
   .out-label { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin-top: 12px; }
   details summary { cursor: pointer; color: var(--muted); font-size: 13px; margin-top: 12px; }
   .hint { font-size: 13px; color: var(--muted); margin-top: 6px; }
+  .cmp-prompt { background: var(--code); border-radius: 6px; padding: 10px 12px; margin: 10px 0 14px; font-size: 14px; }
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 720px) { .cols { grid-template-columns: 1fr; } }
+  .col { border: 1px solid var(--line); border-radius: 8px; padding: 12px; min-width: 0; }
+  .col h3 { font-size: 14px; margin: 0 0 2px; }
+  .col .sub { font-size: 12px; color: var(--muted); margin-bottom: 10px; }
+  .turns { list-style: none; padding: 0; margin: 0; font-size: 13px; }
+  .turns li { padding: 6px 0; border-top: 1px dashed var(--line); }
+  .turns li:first-child { border-top: 0; }
+  .turns code { font-size: 12px; }
+  .turns .meta { color: var(--muted); font-size: 12px; }
+  .bad { color: var(--err); } .good { color: var(--ok); }
+  table.metrics { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 4px; }
+  table.metrics th, table.metrics td { text-align: right; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+  table.metrics th:first-child, table.metrics td:first-child { text-align: left; color: var(--muted); font-weight: normal; }
+  table.metrics td.win { color: var(--ok); font-weight: 600; }
+  .bar-row { display: grid; grid-template-columns: 110px 1fr 90px; gap: 8px; align-items: center; font-size: 13px; margin: 6px 0; }
+  .bar { height: 14px; border-radius: 4px; background: var(--accent); min-width: 2px; }
+  .bar.classic { background: var(--muted); }
+  .headline { font-size: 18px; font-weight: 600; margin: 4px 0 8px; }
 </style>
 </head>
 <body>
@@ -62,18 +82,61 @@
   </section>
 
   <section>
-    <h2>2. Search: what may scripts call?</h2>
+    <h2>2. Classic MCP vs Code Mode, side by side</h2>
+    <p class="hint" style="margin-top:0">Same task, same store canister, real calls on both sides. Classic MCP exposes one tool per
+      method, and every result goes through the model. Code Mode searches once, then runs one script in the canister and sends back only the answer.</p>
+    <div class="chips" id="scenarios"></div>
+    <div class="cmp-prompt" id="cmp-prompt">Pick a task above.</div>
+    <div class="row" style="margin-bottom:12px">
+      <button id="btn-compare" class="primary">Run both</button>
+      <span id="cmp-status" class="status"></span>
+    </div>
+    <div id="cmp-out" hidden>
+      <div class="headline" id="cmp-headline"></div>
+      <div id="cmp-bars"></div>
+      <div class="hint">Most of Code Mode's cost is fixed: its two tool definitions, re-read every turn, plus one search.
+        Classic MCP grows with every row and call it passes through the model, so the gap widens with real data volumes.
+        This demo store has only 60 orders.</div>
+      <table class="metrics" id="cmp-table"></table>
+      <div class="cols" style="margin-top:14px">
+        <div class="col">
+          <h3>Classic MCP</h3><div class="sub" id="classic-sub"></div>
+          <ol class="turns" id="classic-turns"></ol>
+        </div>
+        <div class="col">
+          <h3>Code Mode</h3><div class="sub">2 tools: search_icp_canisters and execute_icp_script</div>
+          <ol class="turns" id="code-turns"></ol>
+        </div>
+      </div>
+      <div class="out-label">Answer (identical on both sides: <span id="cmp-same"></span>)</div>
+      <pre id="cmp-answer"></pre>
+      <details><summary>How the numbers are counted</summary><div class="hint">
+        <p><b>Real:</b> every call on both sides runs against the canister, so the call counts, the results (in characters) and the
+        canister time are measured. On the Classic side, each tool call is run as its own one-call script, so its result is exactly
+        what a per-method tool would return.</p>
+        <p><b>Modelled:</b> an agent loop where each LLM turn re-reads its whole context: the tool definitions, the task, and every
+        earlier tool call and result. Classic tool definitions are built from the store's real Candid interface: 10 tools, each with
+        its signature and referenced types (a lower bound; JSON Schemas are usually larger). Code Mode's definitions are this server's
+        real <code>tools/list</code>. On the Classic side, the page does the model's work between turns (ranking, filtering) only to
+        decide which calls come next.</p>
+        <p><b>Estimated:</b> tokens ≈ characters ÷ 4. Model latency is not included; every extra LLM round trip adds it.</p>
+      </div></details>
+    </div>
+  </section>
+
+  <section>
+    <h2>3. Search: what may scripts call?</h2>
     <div class="row">
       <div class="grow">
         <label for="q">Keywords (optional)</label>
-        <input id="q" placeholder="e.g. balance">
+        <input id="q" placeholder="e.g. order, balance">
       </div>
       <button id="btn-search" class="primary">Search</button>
     </div>
   </section>
 
   <section>
-    <h2>3. Execute a script</h2>
+    <h2>4. Execute a script</h2>
     <div class="chips" id="examples"></div>
     <div class="row" style="margin-bottom:10px">
       <div style="flex:0 0 180px">
@@ -220,6 +283,247 @@ EXAMPLES.forEach((ex, i) => {
   $("examples").appendChild(b);
   if (i === 0) b.onclick();
 });
+</script>
+<script>
+// ---------- Classic MCP vs Code Mode ----------
+const SCENARIOS = [
+  {
+    title: "Top 3 customers",
+    prompt: "Who are our top 3 customers by spend on delivered orders? Give name, tier and spend in USD.",
+    classic: async (turn) => {
+      const [orders] = await turn([["list_orders", [null]]]);
+      const top = rankCustomers(orders);
+      const people = await turn(top.map(([p]) => ["get_customer", p]));
+      return top.map(([, cents], i) => ({ name: people[i].name, tier: Object.keys(people[i].tier)[0], spend_usd: cents / 100 }));
+    },
+    code: (S) => `const S = "${S}";
+const orders = await icp.call(S, "list_orders", null);
+const spend = {};
+for (const o of orders) if ("Delivered" in o.status) spend[o.customer] = (spend[o.customer] || 0) + o.total_cents;
+const top = Object.entries(spend).sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1)).slice(0, 3);
+const people = await Promise.all(top.map(([p]) => icp.call(S, "get_customer", p)));
+return top.map(([, cents], i) => ({ name: people[i].name, tier: Object.keys(people[i].tier)[0], spend_usd: cents / 100 }));`,
+  },
+  {
+    title: "What needs restocking?",
+    prompt: "Which products have fewer units available (on hand minus reserved) than their reorder level? List them, lowest first.",
+    classic: async (turn) => {
+      const [products] = await turn([["list_products", [null]]]);
+      const inv = await turn(products.map((p) => ["get_inventory", p.id]));
+      return lowStock(products, inv);
+    },
+    code: (S) => `const S = "${S}";
+const products = await icp.call(S, "list_products", [null]);
+const inv = await Promise.all(products.map((p) => icp.call(S, "get_inventory", p.id)));
+return products.map((p, i) => ({ product: p.name, available: inv[i].on_hand - inv[i].reserved, reserved: inv[i].reserved, reorder_level: inv[i].reorder_level }))
+  .filter((r) => r.available < r.reorder_level)
+  .sort((a, b) => a.available - b.available || (a.product < b.product ? -1 : 1));`,
+  },
+  {
+    title: "Tea sales report",
+    prompt: "For each tea product: units sold and revenue in USD across shipped and delivered orders, highest revenue first.",
+    classic: async (turn) => {
+      const [teas, orders] = await turn([["list_products", ["tea"]], ["list_orders", [null]]]);
+      return teaReport(teas, orders);
+    },
+    code: (S) => `const S = "${S}";
+const [teas, orders] = await Promise.all([icp.call(S, "list_products", ["tea"]), icp.call(S, "list_orders", null)]);
+const units = {};
+for (const o of orders) if ("Delivered" in o.status || "Shipped" in o.status)
+  for (const it of o.items) units[it.product_id] = (units[it.product_id] || 0) + it.quantity;
+return teas.map((p) => ({ product: p.name, units: units[p.id] || 0, revenue_usd: (units[p.id] || 0) * p.price_cents / 100 }))
+  .sort((a, b) => b.revenue_usd - a.revenue_usd || (a.product < b.product ? -1 : 1));`,
+  },
+];
+
+// The model's reasoning on the Classic side, done in the page only to decide the next calls.
+function rankCustomers(orders) {
+  const spend = {};
+  for (const o of orders) if ("Delivered" in o.status) spend[o.customer] = (spend[o.customer] || 0) + o.total_cents;
+  return Object.entries(spend).sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1)).slice(0, 3);
+}
+function lowStock(products, inv) {
+  return products.map((p, i) => ({ product: p.name, available: inv[i].on_hand - inv[i].reserved, reserved: inv[i].reserved, reorder_level: inv[i].reorder_level }))
+    .filter((r) => r.available < r.reorder_level)
+    .sort((a, b) => a.available - b.available || (a.product < b.product ? -1 : 1));
+}
+function teaReport(teas, orders) {
+  const units = {};
+  for (const o of orders) if ("Delivered" in o.status || "Shipped" in o.status)
+    for (const it of o.items) units[it.product_id] = (units[it.product_id] || 0) + it.quantity;
+  return teas.map((p) => ({ product: p.name, units: units[p.id] || 0, revenue_usd: (units[p.id] || 0) * p.price_cents / 100 }))
+    .sort((a, b) => b.revenue_usd - a.revenue_usd || (a.product < b.product ? -1 : 1));
+}
+
+const tok = (chars) => Math.round(chars / 4);
+const fmt = (n) => n.toLocaleString("en-US");
+let scenario = 0;
+const cache = {};
+
+async function post(method, params) {
+  const token = $("token").value.trim();
+  const body = { jsonrpc: "2.0", id: nextId++, method, ...(params ? { params } : {}) };
+  const t0 = performance.now();
+  const res = await fetch("/mcp", { method: "POST", body: JSON.stringify(body), headers: {
+    "Content-Type": "application/json", "Accept": "application/json, text/event-stream", "Authorization": "Bearer " + token } });
+  const text = await res.text();
+  const ms = performance.now() - t0;
+  if (res.status === 401) throw new Error("401: missing or wrong token (step 1)");
+  let json; try { json = JSON.parse(text); } catch { throw new Error("HTTP " + res.status + ": " + text.slice(0, 200)); }
+  if (json.error) throw new Error("JSON-RPC " + json.error.code + ": " + json.error.message);
+  return { json, ms };
+}
+
+async function tool(name, args) {
+  const { json, ms } = await post("tools/call", { name, arguments: args });
+  const r = json.result;
+  const text = r.content.map((c) => c.text).join("\n");
+  if (r.isError) throw new Error(name + ": " + text);
+  return { text, ms };
+}
+
+// One store method as one Classic-MCP tool call.
+async function classicCall(S, method, args) {
+  const code = `return await icp.call(${JSON.stringify(S)}, ${JSON.stringify(method)}, ${JSON.stringify(args)})`;
+  const { text, ms } = await tool("execute_icp_script", { language: "javascript", code });
+  return { method, args, value: JSON.parse(text), resultChars: text.length, callChars: JSON.stringify({ name: method, arguments: { args } }).length, ms };
+}
+
+async function findStore() {
+  if (cache.store) return cache.store;
+  const { text } = await tool("search_icp_canisters", { query: "list_products" });
+  const c = JSON.parse(text).canisters.find((c) => c.methods && c.methods.some((m) => m.name === "list_products"));
+  if (!c) throw new Error("demo_store is not allowlisted. Run scripts/demo-setup.sh");
+  return (cache.store = c.canister_id);
+}
+
+// Classic MCP tool definitions: one per store method, with its signature and the types it references.
+async function classicDefsChars(S) {
+  if (cache.defs) return cache.defs;
+  const { text } = await tool("execute_icp_script", { language: "javascript", code: `return await icp.candid(${JSON.stringify(S)})` });
+  const types = {};
+  for (const m of text.matchAll(/^type (\w+) = ([\s\S]*?);\n(?=type |service)/gm)) types[m[1]] = m[2];
+  const svc = text.slice(text.indexOf("service"));
+  const tools = [];
+  for (const m of svc.matchAll(/^\s*(\w+) : (\(.*\)) -> (\(.*\))( query)?;/gm)) {
+    const used = new Set(), todo = [m[2] + m[3]];
+    while (todo.length) for (const w of todo.pop().match(/\b[A-Z]\w*\b/g) || []) if (types[w] && !used.has(w)) { used.add(w); todo.push(types[w]); }
+    tools.push({ name: m[1], description: `Calls ${m[1]} on the store canister. Candid: ${m[2]} -> ${m[3]}${m[4] || ""}`,
+      inputSchema: { type: "object", properties: { args: { description: "Candid arguments " + m[2] } },
+                     $defs: Object.fromEntries([...used].map((t) => [t, "type " + t + " = " + types[t]])) } });
+  }
+  cache.defs = { chars: JSON.stringify(tools).length, count: tools.length };
+  return cache.defs;
+}
+
+async function codeDefsChars() {
+  if (cache.codeDefs) return cache.codeDefs;
+  const { json } = await post("tools/list");
+  return (cache.codeDefs = JSON.stringify(json.result.tools).length);
+}
+
+// Agent loop: each LLM turn reads the whole context so far; its tool calls and their results are appended.
+function simulate(defs, prompt, steps, answer) {
+  let ctx = defs + prompt, input = 0, output = 0;
+  for (const s of steps) { input += ctx; output += s.out; ctx += s.out + s.in; }
+  input += ctx; output += answer;
+  return { input, output, turns: steps.length + 1, data: steps.reduce((a, s) => a + s.in, 0) };
+}
+
+function li(html) { const e = document.createElement("li"); e.innerHTML = html; return e; }
+const esc = (t) => String(t).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]);
+
+async function runComparison() {
+  const sc = SCENARIOS[scenario];
+  const btns = document.querySelectorAll("button");
+  btns.forEach((b) => (b.disabled = true));
+  $("cmp-status").className = "status"; $("cmp-status").textContent = "Running both sides…";
+  try {
+    const S = await findStore();
+    const [defs, codeDefs] = await Promise.all([classicDefsChars(S), codeDefsChars()]);
+
+    // Classic: turns of parallel single-method tool calls.
+    const classicTurns = [];
+    const turn = async (calls) => {
+      const rs = await Promise.all(calls.map(([m, a]) => classicCall(S, m, a)));
+      classicTurns.push(rs);
+      return rs.map((r) => r.value);
+    };
+    const classicAnswer = await sc.classic(turn);
+
+    // Code Mode: search, then one script.
+    const search = await tool("search_icp_canisters", { canister_id: S });
+    const script = sc.code(S);
+    const exec = await tool("execute_icp_script", { language: "javascript", code: script });
+    const codeAnswer = JSON.parse(exec.text);
+
+    const answerText = JSON.stringify(codeAnswer);
+    // Compare values, not key order (the canister returns object keys sorted).
+    const canon = (v) => Array.isArray(v) ? v.map(canon) : v && typeof v === "object"
+      ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, canon(v[k])])) : v;
+    const same = JSON.stringify(canon(classicAnswer)) === JSON.stringify(canon(codeAnswer));
+    const prompt = sc.prompt.length;
+    const classicSteps = classicTurns.map((rs) => ({ out: rs.reduce((a, r) => a + r.callChars, 0), in: rs.reduce((a, r) => a + r.resultChars, 0) }));
+    const codeSteps = [
+      { out: JSON.stringify({ name: "search_icp_canisters", arguments: { canister_id: S } }).length, in: search.text.length },
+      { out: JSON.stringify({ name: "execute_icp_script", arguments: { language: "javascript", code: script } }).length, in: exec.text.length },
+    ];
+    const C = simulate(defs.chars, prompt, classicSteps, answerText.length);
+    const M = simulate(codeDefs, prompt, codeSteps, answerText.length);
+    const classicCalls = classicTurns.reduce((a, rs) => a + rs.length, 0);
+    const classicMs = classicTurns.reduce((a, rs) => a + Math.max(...rs.map((r) => r.ms)), 0);
+    const codeMs = search.ms + exec.ms;
+
+    $("classic-sub").textContent = `${defs.count} tools, one per store method`;
+    const ct = $("classic-turns"); ct.innerHTML = "";
+    classicTurns.forEach((rs, i) => ct.appendChild(li(`<b>LLM turn ${i + 1}</b>: ${rs.length} tool call${rs.length > 1 ? "s" : ""}<br>` +
+      rs.map((r) => `<code>${esc(r.method)}(${esc(JSON.stringify(r.args)).slice(0, 40)})</code> <span class="meta">→ ${fmt(r.resultChars)} chars into context</span>`).join("<br>"))));
+    ct.appendChild(li(`<b>LLM turn ${classicTurns.length + 1}</b>: reads all of it, writes the answer`));
+
+    const mt = $("code-turns"); mt.innerHTML = "";
+    mt.appendChild(li(`<b>LLM turn 1</b>: <code>search_icp_canisters</code> <span class="meta">→ ${fmt(search.text.length)} chars (signatures + types)</span>`));
+    mt.appendChild(li(`<b>LLM turn 2</b>: <code>execute_icp_script</code>, a ${fmt(script.length)}-char script making ${classicCalls} calls inside the canister <span class="meta">→ ${fmt(exec.text.length)} chars back</span>`));
+    mt.appendChild(li(`<b>LLM turn 3</b>: writes the answer`));
+
+    const rows = [
+      ["LLM round trips", C.turns, M.turns, (n) => n],
+      ["Tool calls the model makes", classicCalls, 2, (n) => n],
+      ["Tool definitions in context", tok(defs.chars), tok(codeDefs), (n) => "≈" + fmt(n) + " tok"],
+      ["Tool results through the model", tok(C.data), tok(M.data), (n) => "≈" + fmt(n) + " tok"],
+      ["Tokens generated by the model", tok(C.output), tok(M.output), (n) => "≈" + fmt(n) + " tok"],
+      ["Total input tokens across the loop", tok(C.input), tok(M.input), (n) => "≈" + fmt(n) + " tok"],
+      ["Canister time (measured)", Math.round(classicMs), Math.round(codeMs), (n) => fmt(n) + " ms"],
+    ];
+    $("cmp-table").innerHTML = "<tr><th></th><th>Classic MCP</th><th>Code Mode</th></tr>" + rows.map(([k, a, b, f]) =>
+      `<tr><td>${k}</td><td class="${a < b ? "win" : ""}">${f(a)}</td><td class="${b < a ? "win" : ""}">${f(b)}</td></tr>`).join("");
+
+    const max = Math.max(C.input, M.input);
+    $("cmp-bars").innerHTML = [["Classic MCP", C.input, "classic"], ["Code Mode", M.input, ""]].map(([k, v, cls]) =>
+      `<div class="bar-row"><span>${k}</span><div class="bar ${cls}" style="width:${(100 * v / max).toFixed(1)}%"></div><span>≈${fmt(tok(v))} tok</span></div>`).join("");
+    const ratio = C.input / M.input;
+    $("cmp-headline").innerHTML = ratio >= 1
+      ? `Code Mode used <span class="good">${ratio.toFixed(1)}× fewer</span> input tokens: ${fmt(tok(C.input - M.input))} saved`
+      : `Classic MCP used ${(1 / ratio).toFixed(1)}× fewer input tokens on this task`;
+    $("cmp-same").innerHTML = same ? '<span class="good">yes ✓</span>' : '<span class="bad">no, they differ</span>';
+    $("cmp-answer").textContent = JSON.stringify(codeAnswer, null, 2);
+    $("cmp-out").hidden = false;
+    $("cmp-status").className = "status ok"; $("cmp-status").textContent = "Done";
+  } catch (e) {
+    $("cmp-status").className = "status err"; $("cmp-status").textContent = e.message;
+  } finally {
+    btns.forEach((b) => (b.disabled = false));
+  }
+}
+
+SCENARIOS.forEach((sc, i) => {
+  const b = document.createElement("button");
+  b.textContent = sc.title;
+  b.onclick = () => { scenario = i; $("cmp-prompt").textContent = "Task: " + sc.prompt;
+    document.querySelectorAll("#scenarios button").forEach((x, j) => x.classList.toggle("primary", j === i)); };
+  $("scenarios").appendChild(b);
+  if (i === 0) b.onclick();
+});
+$("btn-compare").onclick = runComparison;
 </script>
 </body>
 </html>

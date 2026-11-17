@@ -1,0 +1,68 @@
+type CategorySales = record {
+  units : nat64;
+  category : text;
+  revenue_cents : nat;
+};
+type Customer = record {
+  id : principal;
+  name : text;
+  tier : Tier;
+  email : text;
+  joined_at : nat64;
+};
+type Inventory = record {
+  product_id : nat64;
+  // Units held by pending orders.
+  "reserved" : nat32;
+  reorder_level : nat32;
+  on_hand : nat32;
+};
+type Order = record {
+  id : nat64;
+  status : OrderStatus;
+  customer : principal;
+  created_at : nat64;
+  items : vec OrderItem;
+  total_cents : nat;
+};
+type OrderError = variant {
+  UnknownProduct : nat64;
+  OutOfStock : record { product_id : nat64; available : nat32 };
+  UnknownCustomer;
+  EmptyOrder;
+};
+type OrderItem = record { product_id : nat64; quantity : nat32 };
+type OrderStatus = variant { Delivered; Cancelled; Shipped; Pending };
+type Product = record {
+  id : nat64;
+  name : text;
+  price_cents : nat;
+  category : text;
+};
+type Result = variant { Ok : Order; Err : text };
+type Result_1 = variant { Ok : Order; Err : OrderError };
+type Result_2 = variant { Ok : Inventory; Err : text };
+type SalesSummary = record {
+  by_category : vec CategorySales;
+  orders : nat64;
+  revenue_cents : nat;
+};
+type Tier = variant { Gold; Bronze; Silver };
+service : {
+  // Cancel a pending order and release its reserved stock.
+  cancel_order : (nat64) -> (Result);
+  // Place a pending order; reserves stock.
+  create_order : (principal, vec OrderItem) -> (Result_1);
+  get_customer : (principal) -> (opt Customer) query;
+  get_inventory : (nat64) -> (opt Inventory) query;
+  get_product : (nat64) -> (opt Product) query;
+  // All orders, optionally for one customer, oldest first.
+  list_orders : (opt principal) -> (vec Order) query;
+  // All products, optionally only one category ("coffee", "tea", "kitchen").
+  list_products : (opt text) -> (vec Product) query;
+  restock : (nat64, nat32) -> (Result_2);
+  // Revenue over all non-cancelled orders, total and per category.
+  sales_summary : () -> (SalesSummary) query;
+  // Case-insensitive substring match on name or category.
+  search_products : (text) -> (vec Product) query;
+}
