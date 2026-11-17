@@ -103,13 +103,12 @@ pub fn render(args: &SearchArgs, entries: &[Entry]) -> Value {
                 continue;
             }
         };
-        let any = e.allowed.iter().any(|m| m == "*");
         let methods: Vec<(&String, &Function)> = svc
             .env
             .as_service(&svc.actor)
             .unwrap_or_default()
             .iter()
-            .filter(|(name, _)| any || e.allowed.contains(name))
+            .filter(|(name, _)| crate::policy::method_allowed(&e.allowed, name))
             .filter_map(|(name, t)| svc.env.as_func(t).ok().map(|f| (name, f)))
             .collect();
 

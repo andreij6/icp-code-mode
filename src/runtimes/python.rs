@@ -495,6 +495,15 @@ mod tests {
         assert!(e.contains("never awaited") || e.contains("never"), "{e}");
     }
 
+    /// #106: host calls split the work into turns, each under the turn cap; the run's
+    /// budget (Monty's feed clock, not reset on resume) still stops their sum.
+    #[test]
+    fn budget_spans_turns_split_by_host_calls() {
+        let code = "for _ in range(250):\n    x = 0\n    for i in range(100000):\n        x += 1\n    icp.principal()";
+        let e = py(code).0.unwrap_err();
+        assert!(e.contains("feed time limit"), "{e}");
+    }
+
     #[test]
     fn python_run_resets_test_thread_allocation_flag() {
         crate::counting_alloc::COUNT_THIS_THREAD.with(|c| c.set(false));

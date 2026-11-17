@@ -5,15 +5,25 @@ type AuditEntry = record {
   // Outbound messages as `canister.method`, in order. Interface fetches appear as
   // `aaaaa-aa.canister_metadata(<target>)` and `<target>.__get_candid_interface_tmp_hack`. On a `Started`/`Call` entry: the one message about to
   // be sent. On a final entry: all of them. `None` on entries from before this field.
+  // Pages cut long lists (see `audit_page`); the `Started`/`Call` entries have each one.
   methods : opt vec text;
   // Links all entries of one run: the id of the run's `Started` entry, or the entry's
   // own id if the run never sent a message. Script hashes alone can't tell apart two
   // runs of the same script (one finished, one not), and runs interleave across awaits.
   // `None` only on entries written before this field existed.
   run_id : opt nat64;
+  // On a `Started`/`Call` entry for a script's call: its Candid-encoded argument, as hex
+  // (decode with `didc decode`), or past 1 KiB as `sha256:<hex> prefix:<first 512 bytes
+  // as hex>`. `None` on interface fetches, final entries and entries from before this field.
+  args : opt vec text;
   calls : nat32;
+  // Policy refusals. They may quote script- or target-authored text, which is escaped
+  // and quoted (as are labels in `methods`).
   violations : vec text;
+  // Instructions the run used so far. On a `Trapped` entry, a lower bound (it leaves out
+  // the trapped execution).
   instructions : nat64;
+  // May hold script- or target-authored text (a script's own error, a target's reject).
   error : opt text;
   language : text;
   canisters : vec text;
@@ -34,7 +44,9 @@ type AuditStatus = variant {
   // never finishes.
   Call;
   // The canister trapped while handling a reply, after messages had gone out. Written
-  // during cleanup, in place of the final entry that the trap rolled back.
+  // during cleanup, in place of the final entry that the trap rolled back. Its
+  // `instructions` leaves out the trapped execution (rolled back with the trap), so it
+  // is a lower bound.
   Trapped;
   PolicyViolation;
 };
@@ -88,6 +100,8 @@ type PolicyView = record {
   pending_run_ids : vec nat64;
   // (token hash prefix, label)
   tokens : vec record { text; text };
+  // Audit entries that could not be written (stable memory full) since the last upgrade.
+  lost_audit_entries : nat64;
   // Interfaces set with `set_candid_override` (canister, bytes, SHA-256). Each one is
   // used instead of fetching that canister's own interface.
   candid_overrides : vec record { text; nat64; text };
@@ -102,11 +116,20 @@ service : (opt InitArgs) -> {
   get_audit_log_len : () -> (nat64) query;
   // Newest first; `limit` is capped at 100.
   get_audit_logs : (nat64, nat64) -> (vec AuditEntry) query;
+  // Newest first, below id `before` (`null`: from the newest); `limit` is capped at 100.
+  // Pass the last id of a page to get the next one: unlike offsets, ids do not shift as
+  // entries are appended.
+  get_audit_logs_before : (opt nat64, nat64) -> (vec AuditEntry) query;
   get_policy : () -> (PolicyView) query;
   http_request : (HttpRequest) -> (HttpResponse) query;
   http_request_update : (HttpUpdateRequest) -> (HttpResponse);
   remove_allowlist : (principal) -> (bool);
+  // Takes the full hash or the 16-character id `get_policy` shows (any unique prefix of at
+  // least 16 hex characters). `false`: no token, or the prefix matches more than one.
   revoke_api_token_hash : (text) -> (bool);
+  // Refused (the call traps) for the management canister, this canister, or past the caps
+  // on methods per canister, method name length and allowlist size. `"*"` allows every
+  // method except delegating ones such as `icrc2_approve`, which must be listed by name.
   set_allowlist : (principal, vec text) -> ();
   // Register (or clear, with `null`) a `.did` for a target. While set it takes precedence:
   // the target's own interface is not fetched or refreshed. `remove_allowlist` does not

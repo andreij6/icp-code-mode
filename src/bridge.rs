@@ -273,21 +273,24 @@ mod ic {
             if self.finished.get() || !ic_cdk::futures::is_recovering_from_trap() {
                 return;
             }
-            let (caller, language, sha) = self.audit_key.clone();
-            policy::append_audit(AuditEntry {
+            // Must not trap: that would also undo the slot and pending-id release above.
+            let (caller, language, script_sha256) = std::mem::take(&mut self.audit_key);
+            let calls = self.calls();
+            policy::try_append_audit(AuditEntry {
                 id: 0,
                 timestamp_ns: ic_cdk::api::time(),
                 caller,
                 language,
-                script_sha256: sha,
-                canisters: self.touched.borrow().iter().cloned().collect(),
-                calls: self.calls(),
+                script_sha256,
+                canisters: self.touched.take().into_iter().collect(),
+                calls,
                 instructions: self.instructions_used(),
                 status: AuditStatus::Trapped,
-                violations: self.violations.borrow().clone(),
-                error: Some("the canister trapped while handling a reply (instruction or memory limit, or a bug); the script's result was discarded".into()),
+                violations: self.violations.take(),
+                error: Some("the canister trapped while handling a reply (instruction or memory limit, or a bug); the script's result was discarded; `instructions` excludes the trapped execution".into()),
                 run_id: Some(id),
-                methods: Some(self.messages()),
+                methods: Some(self.messages.take()),
+                args: None,
             });
         }
     }
@@ -417,15 +420,15 @@ mod ic {
         ///
         /// `about` is the canister the message concerns (the target, or for a metadata
         /// request the canister whose interface is read); `label` names the message.
-        async fn sent<T>(&self, about: &Principal, label: String, call: impl std::future::Future<Output = T>) -> T {
-            on_first_pending(call, || self.record_message(about, label)).await
+        async fn sent<T>(&self, about: &Principal, label: String, args: Option<&[u8]>, call: impl std::future::Future<Output = T>) -> T {
+            on_first_pending(call, || self.record_message(about, label, args)).await
         }
 
         /// Audit record for one outbound message: `Started` for the run's first, `Call` for
         /// each later one. It is appended in the same message execution that hands the
         /// message to the system, so the two are committed together when that execution
         /// ends, or discarded together if it traps first. Later traps cannot remove it.
-        fn record_message(&self, p: &Principal, label: String) {
+        fn record_message(&self, p: &Principal, label: String, args: Option<&[u8]>) {
             let (caller, language, sha) = self.audit_key.clone();
             let run = self.started.get();
             self.touched.borrow_mut().insert(p.to_text());
@@ -444,6 +447,7 @@ mod ic {
                 error: None,
                 run_id: run, // None: a Started entry opens its own run
                 methods: Some(vec![label]),
+                args: args.map(|a| vec![policy::arg_digest(a)]),
             });
             if run.is_none() {
                 self.started.set(Some(id));
@@ -464,7 +468,7 @@ mod ic {
             let meta = Call::bounded_wait(mgmt, "canister_metadata")
                 .with_arg(MetadataArgs { canister_id: p, name: "candid:service".into() })
                 .into_future();
-            if let Ok(r) = self.sent(&p, format!("{mgmt}.canister_metadata({p})"), meta).await
+            if let Ok(r) = self.sent(&p, format!("{mgmt}.canister_metadata({p})"), None, meta).await
                 && let Ok(m) = candid::decode_one_with_config::<MetadataResult>(&r.into_bytes(), &fetch_decoder()) {
                     return String::from_utf8(m.value).map_err(|_| ("candid:service is not UTF-8".to_string(), true));
                 }
@@ -472,7 +476,7 @@ mod ic {
             let sent_before = self.calls();
             let hack = Call::bounded_wait(p, "__get_candid_interface_tmp_hack").into_future();
             let reply = self
-                .sent(&p, format!("{p}.__get_candid_interface_tmp_hack"), hack)
+                .sent(&p, format!("{p}.__get_candid_interface_tmp_hack"), None, hack)
                 .await
                 .map_err(|e| (e.to_string(), self.calls() > sent_before))?;
             candid::decode_one_with_config::<String>(&reply.into_bytes(), &fetch_decoder()).map_err(|e| (e.to_string(), true))
@@ -514,7 +518,7 @@ mod ic {
     fn parse_principal(id: &str) -> Result<Principal, String> {
         let mut shown = id.to_string();
         truncate(&mut shown, 80);
-        Principal::from_text(id).map_err(|e| format!("invalid canister id `{shown}`: {e}"))
+        Principal::from_text(id).map_err(|e| format!("invalid canister id {}: {e}", policy::shown(&shown)))
     }
 
     impl HostBridge for IcBridge {
@@ -522,7 +526,8 @@ mod ic {
             // Canonical text: `RYJL3-…` and `ryjl3-…` are the same principal.
             let p = parse_principal(canister_id)?;
             let key = p.to_text();
-            if let Some(did) = policy::candid_override(&key) {
+            // Allowlisted canisters only, whether the text comes from an override or a fetch.
+            if let Some(did) = policy::served_override(&p).map_err(|e| self.deny(e))? {
                 return Ok(did);
             }
             if let Some((did, _)) = cache_get(&key) {
@@ -550,7 +555,10 @@ mod ic {
                     Ok(did)
                 }
                 Err((e, remember)) => {
-                    let msg = format!("could not fetch candid for {key} ({e}); a controller can register it with set_candid_override");
+                    // `e` may be a target's reject message: quoted and escaped.
+                    let mut e = e;
+                    truncate(&mut e, 300);
+                    let msg = format!("could not fetch candid for {key} ({}); a controller can register it with set_candid_override", policy::shown(&e));
                     if remember {
                         DID_FAILED.with(|c| c.borrow_mut().insert(key, (msg.clone(), now)));
                     }
@@ -581,10 +589,13 @@ mod ic {
             // have executed on the target; the error says so.
             let secs = self.call_timeout.unwrap_or(policy::DEFAULT_CALL_TIMEOUT_SECONDS);
             let call = Call::bounded_wait(p, method).change_timeout(secs);
-            let label = format!("{p}.{}", method.escape_debug());
-            let reply = self.sent(&p, label, call.with_raw_args(&enc.bytes).into_future()).await.map_err(|e| {
+            let label = format!("{p}.{}", policy::shown(method));
+            let reply = self.sent(&p, label, Some(&enc.bytes), call.with_raw_args(&enc.bytes).into_future()).await.map_err(|e| {
                 let unknown = !e.is_clean_reject();
-                format!("call {p}.{} failed: {e}{}", method.escape_debug(), if unknown { " (outcome unknown: the call may have executed)" } else { "" })
+                // The reject message is the target's text: quoted and escaped.
+                let mut e = e.to_string();
+                truncate(&mut e, 300);
+                format!("call {p}.{} failed: {}{}", policy::shown(method), policy::shown(&e), if unknown { " (outcome unknown: the call may have executed)" } else { "" })
             })?;
             svc.decode_reply(&enc.func, &reply.into_bytes()).map_err(|e| {
                 // Most likely the target was upgraded and our copy of its interface is stale.
