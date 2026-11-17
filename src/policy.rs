@@ -103,7 +103,8 @@ pub struct AuditEntry {
     /// Policy refusals. They may quote script- or target-authored text, which is escaped
     /// and quoted (as are labels in `methods`).
     pub violations: Vec<String>,
-    /// May hold script- or target-authored text (a script's own error, a target's reject).
+    /// May hold script- or target-authored text (a script's own error, a target's reject),
+    /// with control and bidi characters escaped.
     pub error: Option<String>,
     /// Links all entries of one run: the id of the run's `Started` entry, or the entry's
     /// own id if the run never sent a message. Script hashes alone can't tell apart two
@@ -193,12 +194,14 @@ pub fn set_limits(l: Limits) {
 
 // ---------- allowlist ----------
 
-/// Caps on admin input, so `get_policy` (one reply, at most 2 MiB) always fits.
+/// Caps on admin input, so `get_policy` (one reply, at most 2 MiB) always fits: about
+/// 0.8 MB of allowlist, 0.15 MB of tokens and 0.15 MB of override rows at most.
 pub const MAX_ALLOWLISTED: u64 = 1000;
 pub const MAX_METHODS_PER_CANISTER: usize = 256;
 /// Method name bytes over the whole allowlist.
 pub const MAX_ALLOWLIST_BYTES: usize = 512 * 1024;
 pub const MAX_TOKENS: u64 = 1000;
+pub const MAX_CANDID_OVERRIDES: u64 = 1000;
 pub const MAX_LABEL_BYTES: usize = 128;
 
 /// Methods that hand authority to someone else: an approval outlives token revocation
@@ -307,6 +310,13 @@ pub fn shown(s: &str) -> Cow<'_, str> {
     }
 }
 
+/// `s` with control, bidi and other invisible characters escaped (as Rust's Debug does)
+/// and printable text, quotes included, kept. For free text such as a script's own error:
+/// it stays on one line and cannot hide or reorder what follows.
+pub fn escape_invisible(s: &str) -> String {
+    s.chars().map(|c| if matches!(c, '"' | '\'' | '\\') { c.to_string() } else { c.escape_debug().to_string() }).collect()
+}
+
 pub fn check_call(canister: &Principal, method: &str, calls_made: u32, instructions_used: u64) -> Result<(), String> {
     // Also for entries stored before `set_allowed` refused these targets.
     if let Some(e) = refused_target(canister, self_id()) {
@@ -376,11 +386,19 @@ pub fn verify_token(token: &str) -> Option<String> {
 
 // ---------- candid overrides ----------
 
-pub fn set_candid_override(canister: Principal, did: Option<String>) {
-    CANDID_OVERRIDES.with(|m| match did {
-        Some(d) => m.borrow_mut().insert(canister.to_text(), d),
-        None => m.borrow_mut().remove(&canister.to_text()),
-    });
+pub fn set_candid_override(canister: Principal, did: Option<String>) -> Result<(), String> {
+    CANDID_OVERRIDES.with(|m| {
+        let mut m = m.borrow_mut();
+        let key = canister.to_text();
+        match did {
+            Some(_) if !m.contains_key(&key) && m.len() >= MAX_CANDID_OVERRIDES => {
+                return Err(format!("at most {MAX_CANDID_OVERRIDES} candid overrides can be registered"));
+            }
+            Some(d) => m.insert(key, d),
+            None => m.remove(&key),
+        };
+        Ok(())
+    })
 }
 
 /// (canister, interface size in bytes, SHA-256 of the interface text) for every override.
@@ -516,6 +534,25 @@ pub fn audit_page_before(before: Option<u64>, limit: u64) -> Vec<AuditEntry> {
     page_of((0..end).rev().take(limit.min(MAX_AUDIT_PAGE) as usize))
 }
 
+/// Ids `audit_run` looks at per call, so one query stays well inside its instruction limit.
+pub const MAX_RUN_SCAN: u64 = 5_000;
+
+/// The entries of run `run_id`, oldest first, from id `from` (`None`: the run's start).
+/// A run's entries all lie at or after its id, interleaved with other runs'; each call
+/// looks at the next `MAX_RUN_SCAN` ids at most. To continue, pass the last id returned
+/// plus one, or `from + MAX_RUN_SCAN` after an empty page. The run is complete once an
+/// entry with a status other than `Started`/`Call` is among them.
+pub fn audit_run(run_id: u64, from: Option<u64>) -> Vec<AuditEntry> {
+    let start = from.unwrap_or(run_id).max(run_id);
+    let end = start.saturating_add(MAX_RUN_SCAN).min(audit_len());
+    // ponytail: decodes every scanned entry; index by run_id if scans get slow.
+    let ids: Vec<u64> = AUDIT.with(|l| {
+        let l = l.borrow();
+        (start..end).filter(|&i| l.get(i).is_some_and(|e| e.run_id == Some(run_id))).take(MAX_AUDIT_PAGE as usize).collect()
+    });
+    page_of(ids.into_iter())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -647,9 +684,9 @@ mod tests {
         set_allowed(p, vec![]).unwrap();
         assert!(check_interface_fetch(&p, 0, 0).is_ok());
 
-        set_candid_override(p, Some("service : { ping : () -> () }".into()));
+        set_candid_override(p, Some("service : { ping : () -> () }".into())).unwrap();
         assert_eq!(candid_override(&p.to_text()).as_deref(), Some("service : { ping : () -> () }"));
-        set_candid_override(p, None);
+        set_candid_override(p, None).unwrap();
         assert!(candid_override(&p.to_text()).is_none());
 
         assert!(add_token_hash(&"0".repeat(63), "short".into()).is_err());
@@ -673,11 +710,11 @@ mod tests {
     #[test]
     fn overrides_need_the_allowlist_and_the_size_cap() {
         let p = Principal::from_text(LEDGER).unwrap();
-        set_candid_override(p, Some("service : {}".into()));
+        set_candid_override(p, Some("service : {}".into())).unwrap();
         assert!(served_override(&p).unwrap_err().contains("not allowlisted"));
         set_allowed(p, vec![]).unwrap();
         assert_eq!(served_override(&p).unwrap().as_deref(), Some("service : {}"));
-        set_candid_override(p, Some("a".repeat(crate::bridge::MAX_DID_BYTES + 1)));
+        set_candid_override(p, Some("a".repeat(crate::bridge::MAX_DID_BYTES + 1))).unwrap();
         assert!(candid_override(&p.to_text()).is_none());
         assert_eq!(served_override(&p), Ok(None));
         assert_eq!(list_candid_overrides()[0].1, crate::bridge::MAX_DID_BYTES as u64 + 1, "still listed for the admin");
@@ -726,6 +763,10 @@ mod tests {
         assert!(shown("x ryjl3-tyaaa-aaaaa-aaaba-cai.icrc1_transfer").starts_with('"'));
         assert_eq!(shown("icrc1_transfer"), "icrc1_transfer");
         assert_eq!(shown(""), "\"\"");
+        // A script's own error, as run_script stores it in `error`.
+        let e = escape_invisible("Error: policy: method `x` on y is not allowlisted\n\u{202e}Z\u{1b}[31m \"q\"");
+        assert!(!e.contains('\n') && !e.contains('\u{202e}') && !e.contains('\u{1b}'), "{e}");
+        assert!(e.ends_with("allowlisted\\n\\u{202e}Z\\u{1b}[31m \"q\""), "{e}");
     }
 
     /// #138: the 16-character id shown by get_policy revokes, unless ambiguous.
@@ -796,6 +837,43 @@ mod tests {
         assert_eq!(ids, (100..300).rev().collect::<Vec<_>>());
         assert_eq!(audit_page_before(Some(0), 10), vec![]);
         assert_eq!(audit_page_before(Some(u64::MAX), 1)[0].id, 309);
+    }
+
+    /// #182: one run's entries, without paging through the runs interleaved with it.
+    #[test]
+    fn a_run_is_read_by_its_id() {
+        let a = append_audit(entry("a", AuditStatus::Started, None));
+        let b = append_audit(entry("b", AuditStatus::Started, None));
+        append_audit(entry("a", AuditStatus::Call, Some(a)));
+        append_audit(entry("b", AuditStatus::Ok, Some(b)));
+        let done = append_audit(entry("a", AuditStatus::Ok, Some(a)));
+        let ids = |v: Vec<AuditEntry>| v.iter().map(|e| e.id).collect::<Vec<_>>();
+        assert_eq!(ids(audit_run(a, None)), vec![a, a + 2, done]);
+        assert_eq!(ids(audit_run(a, Some(a + 3))), vec![done]);
+        assert_eq!(ids(audit_run(b, Some(0))), vec![b, b + 2], "never before the run's id");
+        assert_eq!(ids(audit_run(done + 1, None)), Vec::<u64>::new());
+        // The scan is bounded: matches past MAX_RUN_SCAN ids need another call.
+        for _ in 0..MAX_RUN_SCAN {
+            append_audit(entry("x", AuditStatus::Ok, None));
+        }
+        let late = append_audit(entry("a", AuditStatus::Ok, Some(a)));
+        assert!(!ids(audit_run(a, Some(done + 1))).contains(&late));
+        assert_eq!(ids(audit_run(a, Some(done + 1 + MAX_RUN_SCAN))), vec![late]);
+    }
+
+    /// #170: the override count is capped like tokens, so get_policy stays under the
+    /// reply limit. Replacing or clearing an existing one is still allowed at the cap.
+    #[test]
+    fn candid_overrides_are_capped() {
+        let p = |i: u64| Principal::from_slice(&i.to_be_bytes());
+        for i in 0..MAX_CANDID_OVERRIDES {
+            set_candid_override(p(i), Some("service : {}".into())).unwrap();
+        }
+        assert!(set_candid_override(p(MAX_CANDID_OVERRIDES), Some("service : {}".into())).unwrap_err().contains("at most"));
+        set_candid_override(p(0), Some("service : { a : () -> () }".into())).unwrap();
+        set_candid_override(p(1), None).unwrap();
+        set_candid_override(p(MAX_CANDID_OVERRIDES), Some("service : {}".into())).unwrap();
+        assert_eq!(list_candid_overrides().len() as u64, MAX_CANDID_OVERRIDES);
     }
 
     /// #150, #180: a full stable memory makes the append fail without trapping.

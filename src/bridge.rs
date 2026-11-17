@@ -739,10 +739,10 @@ pub mod mock {
         assert_eq!(MockBridge::default().instruction_deadline(), u64::MAX);
         assert_eq!(now_ms(), 0);
         let p = candid::Principal::from_text("ryjl3-tyaaa-aaaaa-aaaba-cai").unwrap();
-        crate::policy::set_candid_override(p, Some("service : { ping : () -> () }".into()));
+        crate::policy::set_candid_override(p, Some("service : { ping : () -> () }".into())).unwrap();
         assert!(cached_service(&p, true).is_some());
         assert!(cached_service(&p, true).is_some()); // override cache hit
         evict_interface(&p);
-        crate::policy::set_candid_override(p, None);
+        crate::policy::set_candid_override(p, None).unwrap();
     }
 }

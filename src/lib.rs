@@ -142,7 +142,7 @@ async fn http_request_update(req: HttpUpdateRequest) -> HttpResponse {
 
 async fn run_tool(caller_hash: &str, req: ToolRequest) -> serde_json::Value {
     let minute = this_minute();
-    if let Some(e) = rate_check(caller_hash, minute) {
+    if let Some(e) = rate_check(caller_hash, minute).or_else(|| cycles_check(ic_cdk::api::canister_liquid_cycle_balance())) {
         return mcp::tool_result(Err(e), vec![]);
     }
     rate_count(caller_hash, minute);
@@ -254,6 +254,15 @@ fn rate_check(token_hash: &str, minute: u64) -> Option<String> {
     (used >= limit).then(|| format!("rate limited: at most {limit} tool calls per minute per token; retry in a minute"))
 }
 
+/// Liquid cycles (above the freezing threshold) below which no run is started. A run
+/// grows the audit log; on the IC, growing stable memory without the cycles to reserve
+/// storage traps rather than failing, which would lose the run's closing entry.
+const MIN_LIQUID_CYCLES: u128 = 100_000_000_000;
+
+fn cycles_check(liquid: u128) -> Option<String> {
+    (liquid < MIN_LIQUID_CYCLES).then(|| "canister is low on cycles: no new runs until a controller tops it up".into())
+}
+
 fn rate_count(token_hash: &str, minute: u64) {
     RATE.with(|r| {
         let mut r = r.borrow_mut();
@@ -342,7 +351,8 @@ async fn run_script(caller_hash: &str, call: ToolCall) -> serde_json::Value {
         (Ok(_), true) => AuditStatus::Ok,
     };
     let error = out.as_ref().err().map(|e| {
-        let mut e = e.clone();
+        // Script-authored: escaped so it cannot forge lines or hide text in the log.
+        let mut e = policy::escape_invisible(e);
         bridge::truncate(&mut e, MAX_AUDIT_ERROR_BYTES);
         e
     });
@@ -449,10 +459,12 @@ fn set_candid_override(canister: Principal, did: Option<String>) -> Result<(), S
             return Err(format!("interface is {} bytes, over the {}-byte limit", d.len(), bridge::MAX_DID_BYTES));
         }
         // Parsed here, in an update, and kept: the query path never parses an override.
-        bridge::remember_override(&canister, d.clone(), candid_bridge::Service::parse(d)?);
+        let svc = candid_bridge::Service::parse(d)?;
+        policy::set_candid_override(canister, did.clone())?;
+        bridge::remember_override(&canister, d.clone(), svc);
+        return Ok(());
     }
-    policy::set_candid_override(canister, did);
-    Ok(())
+    policy::set_candid_override(canister, None)
 }
 
 #[ic_cdk::query(guard = "controller")]
@@ -480,6 +492,15 @@ fn get_audit_logs(offset: u64, limit: u64) -> Vec<AuditEntry> {
 #[ic_cdk::query(guard = "controller")]
 fn get_audit_logs_before(before: Option<u64>, limit: u64) -> Vec<AuditEntry> {
     policy::audit_page_before(before, limit)
+}
+
+/// The entries of one run (`run_id`), oldest first, from id `from` (`null`: the run's
+/// start). Looks at 5,000 ids per call at most: pass the last id returned plus one, or
+/// `from` + 5,000 after an empty page, to continue. The run is complete once an entry with
+/// a status other than `Started`/`Call` is returned.
+#[ic_cdk::query(guard = "controller")]
+fn get_audit_run(run_id: u64, from: Option<u64>) -> Vec<AuditEntry> {
+    policy::audit_run(run_id, from)
 }
 
 #[ic_cdk::query(guard = "controller")]
@@ -629,6 +650,13 @@ mod tests {
         drop(held);
         drop(again);
         assert!(RunSlot::take("a").is_ok(), "per-token counts are returned too");
+    }
+
+    /// #180: runs are refused before the canister is too low on cycles to grow the log.
+    #[test]
+    fn runs_need_a_cycles_margin() {
+        assert!(super::cycles_check(super::MIN_LIQUID_CYCLES - 1).unwrap().contains("low on cycles"));
+        assert!(super::cycles_check(super::MIN_LIQUID_CYCLES).is_none());
     }
 
     #[test]

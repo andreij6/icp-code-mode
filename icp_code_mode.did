@@ -23,7 +23,8 @@ type AuditEntry = record {
   // Instructions the run used so far. On a `Trapped` entry, a lower bound (it leaves out
   // the trapped execution).
   instructions : nat64;
-  // May hold script- or target-authored text (a script's own error, a target's reject).
+  // May hold script- or target-authored text (a script's own error, a target's reject),
+  // with control and bidi characters escaped.
   error : opt text;
   language : text;
   canisters : vec text;
@@ -120,6 +121,11 @@ service : (opt InitArgs) -> {
   // Pass the last id of a page to get the next one: unlike offsets, ids do not shift as
   // entries are appended.
   get_audit_logs_before : (opt nat64, nat64) -> (vec AuditEntry) query;
+  // The entries of one run (`run_id`), oldest first, from id `from` (`null`: the run's
+  // start). Looks at 5,000 ids per call at most: pass the last id returned plus one, or
+  // `from` + 5,000 after an empty page, to continue. The run is complete once an entry with
+  // a status other than `Started`/`Call` is returned.
+  get_audit_run : (nat64, opt nat64) -> (vec AuditEntry) query;
   get_policy : () -> (PolicyView) query;
   http_request : (HttpRequest) -> (HttpResponse) query;
   http_request_update : (HttpUpdateRequest) -> (HttpResponse);
