@@ -1140,8 +1140,7 @@ mod tests {
     /// Python tests read the same process-wide counter, so take turns with them.
     fn counted<T>(f: impl FnOnce() -> T) -> T {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        #[cfg(feature = "python")]
-        let _turn = crate::runtimes::python::test_serial::Turn::take();
+        let _turn = crate::counting_alloc::test_serial::Turn::take();
         let _lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = crate::counting_alloc::COUNT_THIS_THREAD.with(|c| c.replace(true));
         let r = f();

@@ -314,56 +314,8 @@ fn uses_dynamic_code(code: &str) -> Option<&'static str> {
     })
 }
 
-/// Monty's memory counter is one process-wide number. The canister has a single thread,
-/// but `cargo test` runs tests on several, so Python runs on different test threads would
-/// see each other's allocations. Tests therefore take turns: a thread holds this lock while
-/// it has any Python run in flight (several may interleave on one thread).
 #[cfg(test)]
-pub(crate) mod test_serial {
-    use std::cell::RefCell;
-    use std::sync::{Mutex, MutexGuard};
-
-    static LOCK: Mutex<()> = Mutex::new(());
-    thread_local!(static HELD: RefCell<(usize, Option<MutexGuard<'static, ()>>)> = const { RefCell::new((0, None)) });
-
-    pub struct Turn;
-    impl Turn {
-        pub fn take() -> Self {
-            HELD.with(|h| {
-                let mut h = h.borrow_mut();
-                if h.0 == 0 {
-                    h.1 = Some(LOCK.lock().unwrap_or_else(|e| e.into_inner()));
-                }
-                h.0 += 1;
-            });
-            Turn
-        }
-    }
-    impl Drop for Turn {
-        fn drop(&mut self) {
-            HELD.with(|h| {
-                let mut h = h.borrow_mut();
-                h.0 -= 1;
-                if h.0 == 0 {
-                    h.1 = None;
-                }
-            });
-        }
-    }
-
-    /// Counts this thread's allocations for the run, then restores the previous setting.
-    pub struct CountThisThread(bool);
-    impl CountThisThread {
-        pub fn on() -> Self {
-            CountThisThread(crate::counting_alloc::COUNT_THIS_THREAD.with(|c| c.replace(true)))
-        }
-    }
-    impl Drop for CountThisThread {
-        fn drop(&mut self) {
-            crate::counting_alloc::COUNT_THIS_THREAD.with(|c| c.set(self.0));
-        }
-    }
-}
+use crate::counting_alloc::test_serial;
 
 pub async fn run<B: HostBridge>(code: &str, bridge: &B) -> Result<Value, String> {
     #[cfg(test)]

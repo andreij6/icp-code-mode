@@ -518,7 +518,8 @@ pub(crate) mod counting_alloc {
     /// JavaScript has none, so one builtin call (`json.dumps(x, indent=10**8)`,
     /// `"x".repeat(n)`) could otherwise grow the heap toward 4 GiB, and Wasm memory never
     /// shrinks. Past the ceiling an allocation fails, which traps the message and rolls
-    /// the growth back. Room for `MAX_CONCURRENT_RUNS` Python heaps and then some.
+    /// the growth back. Room for `MAX_CONCURRENT_RUNS` Python heaps and then some; eight Rhai
+    /// runs all at their 128 MiB cap would reach it, and the message that crosses it traps.
     // ponytail: one global ceiling, not per run; per-run accounting if runs ever need more.
     pub const HEAP_CEILING: usize = 1 << 30;
 
@@ -593,6 +594,58 @@ pub(crate) mod counting_alloc {
 
     #[global_allocator]
     static ALLOC: Counting = Counting;
+
+    /// The memory counter is one process-wide number. The canister has a single thread,
+    /// but `cargo test` runs tests on several, so runs with a memory cap (Python, Rhai, JS) on
+    /// different test threads would see each other's allocations. Tests therefore take
+    /// turns: a thread holds this lock while it has any such run in flight (several may
+    /// interleave on one thread).
+    #[cfg(test)]
+    pub mod test_serial {
+        use std::cell::RefCell;
+        use std::sync::{Mutex, MutexGuard};
+
+        static LOCK: Mutex<()> = Mutex::new(());
+        thread_local!(static HELD: RefCell<(usize, Option<MutexGuard<'static, ()>>)> = const { RefCell::new((0, None)) });
+
+        pub struct Turn;
+        impl Turn {
+            pub fn take() -> Self {
+                HELD.with(|h| {
+                    let mut h = h.borrow_mut();
+                    if h.0 == 0 {
+                        h.1 = Some(LOCK.lock().unwrap_or_else(|e| e.into_inner()));
+                    }
+                    h.0 += 1;
+                });
+                Turn
+            }
+        }
+        impl Drop for Turn {
+            fn drop(&mut self) {
+                HELD.with(|h| {
+                    let mut h = h.borrow_mut();
+                    h.0 -= 1;
+                    if h.0 == 0 {
+                        h.1 = None;
+                    }
+                });
+            }
+        }
+
+        /// Counts this thread's allocations for the run, then restores the previous setting.
+        pub struct CountThisThread(bool);
+        impl CountThisThread {
+            pub fn on() -> Self {
+                CountThisThread(super::COUNT_THIS_THREAD.with(|c| c.replace(true)))
+            }
+        }
+        impl Drop for CountThisThread {
+            fn drop(&mut self) {
+                super::COUNT_THIS_THREAD.with(|c| c.set(self.0));
+            }
+        }
+    }
 }
 
 ic_cdk::export_candid!();

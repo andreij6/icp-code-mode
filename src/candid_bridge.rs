@@ -631,6 +631,21 @@ mod tests {
     }
 
     #[test]
+    fn replies_over_the_value_limits_are_refused_after_decoding() {
+        use crate::bridge::decode_checked;
+        let target = Service::parse("service : { f : (vec nat8) -> () }").unwrap();
+        let ours = Service::parse("service : { f : () -> (vec nat8) }").unwrap();
+        let f = ours.method("f").unwrap();
+        let reply = |n: usize| target.encode_args("f", &json!(vec![7; n])).unwrap().bytes;
+        assert_eq!(decode_checked(&ours, f, &reply(1_000), "x.f").unwrap(), json!(vec![7; 1_000]));
+        // Each decoded byte is one element: a 250 KB blob is over the 200,000 limit.
+        let (e, stale) = decode_checked(&ours, f, &reply(250_000), "x.f").unwrap_err();
+        assert!(!stale && e.contains("x.f is over the value limits") && e.contains("the call was executed"), "{e}");
+        // A reply that does not decode means our copy of the interface is stale.
+        assert!(decode_checked(&ours, f, b"DIDL", "x.f").unwrap_err().1);
+    }
+
+    #[test]
     fn deep_and_recursive_interfaces_are_safe() {
         // Rejected before the parser recurses (5,000 levels overflowed an 8 MiB stack).
         let deep = format!("service : {{ f : ({}nat) -> () }}", "vec ".repeat(100_000));
