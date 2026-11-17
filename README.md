@@ -404,8 +404,10 @@ includes interface fetches, which go to the management canister and, if needed, 
 - The entry and the message are committed together when that message execution ends. If
   the execution traps first, the IC discards both, so the log never shows a message that was
   not sent, and never misses one that was.
-- An entry means the system accepted the message. Whether the target executed it is in the
-  script's result or error: a reject, or "outcome unknown" after a call timeout.
+- An entry means the system accepted the message. Whether the target executed it shows in the
+  script's result or error (a reject, or "outcome unknown" after a timeout) only if the script
+  got to use the reply. If the run failed, trapped or hit a limit after sending, the entry is
+  the only record that the message went out; check its effect on the target itself.
 
 **Closing entries.** A script run ends with exactly one of these:
 
@@ -477,6 +479,11 @@ allowlist check, the interface cache and the override lookup.
   and the client gets a 503. If it happens after one, the entries for every message already
   sent remain and the run is closed with a `Trapped` entry, whose `instructions` leaves out
   the trapped execution. The per-token rate limit bounds how often anyone can cause this.
+- **Shared engine state is charged to whoever triggers it.** Boa's garbage collector is
+  process-wide, so a run's `instructions` can include collecting other runs' garbage.
+- **A trap in one reply of a batch ends the run's bookkeeping early.** Its run slot is freed and
+  it leaves `pending_run_ids` while the batch's other calls may still be outstanding; their
+  entries remain, and they finish on their own.
 - **Concurrent cold fetches are not merged.** `Promise.all` over several calls to a canister
   whose interface is not cached yet sends one fetch per call, each counted against the call
   cap. Fetch once (`icp.candid`) before the batch, or run any search first.

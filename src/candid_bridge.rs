@@ -239,7 +239,18 @@ fn key_matches(k: &str, label: &Label) -> bool {
 }
 
 fn field_value<'a>(obj: &'a Map<String, Value>, label: &Label) -> Option<&'a Value> {
+    if let Label::Named(n) = label {
+        if let Some(v) = obj.get(n) {
+            return Some(v); // the common case, without a scan
+        }
+    }
     obj.iter().find(|(k, _)| key_matches(k, label)).map(|(_, v)| v)
+}
+
+/// A variant tag: the label's name, or `_<id>_` with its numeric id. No allocation: this
+/// runs once per tag for every variant value encoded.
+fn tag_matches(tag: &str, label: &Label) -> bool {
+    key_matches(tag, label) || tag.strip_prefix('_').and_then(|t| t.strip_suffix('_')).and_then(|t| t.parse::<u32>().ok()) == Some(label.get_id())
 }
 
 fn num_text(v: &Value) -> Option<String> {
@@ -370,8 +381,12 @@ pub fn json_to_idl(env: &TypeEnv, ty: &Type, v: &Value, depth: usize) -> Result<
                     }
                 }
                 Value::Object(obj) => {
-                    // A typo in an optional field must not silently become `null`.
-                    if let Some(k) = obj.keys().find(|k| !fields.iter().any(|f| key_matches(k, &f.id))) {
+                    // A typo in an optional field must not silently become `null`. More keys
+                    // than fields means an unknown one: say so without a keys x fields scan.
+                    if obj.len() > fields.len() || obj.keys().any(|k| !fields.iter().any(|f| key_matches(k, &f.id))) {
+                        let k = obj.keys().find(|k| !fields.iter().any(|f| key_matches(k, &f.id))).map_or("?", |k| k.as_str());
+                        let mut k = k.to_string();
+                        crate::bridge::truncate(&mut k, 64);
                         return Err(format!("unknown record field `{k}`"));
                     }
                     for f in fields {
@@ -398,7 +413,7 @@ pub fn json_to_idl(env: &TypeEnv, ty: &Type, v: &Value, depth: usize) -> Result<
             let (idx, f) = fields
                 .iter()
                 .enumerate()
-                .find(|(_, f)| label_name(&f.id) == tag || format!("_{}_", f.id.get_id()) == tag)
+                .find(|(_, f)| tag_matches(tag, &f.id))
                 .ok_or_else(|| format!("unknown variant tag `{tag}`"))?;
             let val = json_to_idl(env, &f.ty, payload, d).map_err(|e| format!("{tag}: {e}"))?;
             IDLValue::Variant(VariantValue(Box::new(IDLField { id: (*f.id).clone(), val }), idx as u64))
