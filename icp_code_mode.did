@@ -88,6 +88,9 @@ type PolicyView = record {
   pending_run_ids : vec nat64;
   // (token hash prefix, label)
   tokens : vec record { text; text };
+  // Interfaces set with `set_candid_override` (canister, bytes, SHA-256). Each one is
+  // used instead of fetching that canister's own interface.
+  candid_overrides : vec record { text; nat64; text };
   allowlist : vec record { principal; vec text };
   // Scripts running right now (at most `MAX_CONCURRENT_RUNS`).
   active_runs : nat32;

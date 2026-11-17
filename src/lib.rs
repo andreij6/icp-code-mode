@@ -33,6 +33,9 @@ pub struct PolicyView {
     pub active_runs: u32,
     /// Runs (by `run_id`) that have sent messages and not ended: still waiting on a reply.
     pub pending_run_ids: Vec<u64>,
+    /// Interfaces set with `set_candid_override` (canister, bytes, SHA-256). Each one is
+    /// used instead of fetching that canister's own interface.
+    pub candid_overrides: Vec<(String, u64, String)>,
 }
 
 fn apply(args: Option<InitArgs>) {
@@ -447,6 +450,7 @@ fn get_policy() -> PolicyView {
         tokens: policy::list_tokens(),
         active_runs: ACTIVE_RUNS.with(|a| a.get()),
         pending_run_ids: bridge::pending_run_ids(),
+        candid_overrides: policy::list_candid_overrides(),
     }
 }
 
@@ -461,11 +465,17 @@ fn get_audit_log_len() -> u64 {
     policy::audit_len()
 }
 
-/// Monty's `ResourceLimits::max_memory` is only enforced when the global
-/// allocator reports into `monty_types::LIVE_MEMORY`.
-#[cfg(feature = "python")]
+/// Counts live heap bytes, for the heap ceiling (every build) and for Monty's
+/// `ResourceLimits::max_memory`, which reads `monty_types::LIVE_MEMORY`.
+///
+/// The ceiling also keeps linear memory well below 4 GiB. The 8 MiB stack sits below the
+/// heap; at a full 4 GiB a stack overflow would wrap to the top of memory instead of
+/// trapping.
 pub(crate) mod counting_alloc {
+    #[cfg(feature = "python")]
     use monty_types::LIVE_MEMORY;
+    #[cfg(not(feature = "python"))]
+    static LIVE_MEMORY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::sync::atomic::Ordering::Relaxed;
 

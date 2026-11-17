@@ -115,7 +115,7 @@
         canister time are measured. On the Classic side, each tool call is run as its own one-call script, so its result is exactly
         what a per-method tool would return.</p>
         <p><b>Modelled:</b> an agent loop where each LLM turn re-reads its whole context: the tool definitions, the task, and every
-        earlier tool call and result. Classic tool definitions are built from the store's real Candid interface: 10 tools, each with
+        earlier tool call and result. Classic tool definitions are built from the store's real Candid interface: one tool per allowlisted method (8), each with
         its signature and referenced types (a lower bound; JSON Schemas are usually larger). Code Mode's definitions are this server's
         real <code>tools/list</code>. On the Classic side, the page does the model's work between turns (ranking, filtering) only to
         decide which calls come next.</p>
@@ -387,6 +387,16 @@ async function tool(name, args) {
   return { text, ms };
 }
 
+// Run async thunks with at most `n` in flight; results in order.
+async function pool(fns, n) {
+  const out = [];
+  let next = 0;
+  await Promise.all(Array.from({ length: n }, async () => {
+    while (next < fns.length) { const k = next++; out[k] = await fns[k](); }
+  }));
+  return out;
+}
+
 // One store method as one Classic-MCP tool call.
 async function classicCall(S, method, args) {
   const code = `return await icp.call(${JSON.stringify(S)}, ${JSON.stringify(method)}, ${JSON.stringify(args)})`;
@@ -399,10 +409,11 @@ async function findStore() {
   const { text } = await tool("search_icp_canisters", { query: "list_products" });
   const c = JSON.parse(text).canisters.find((c) => c.methods && c.methods.some((m) => m.name === "list_products"));
   if (!c) throw new Error("demo_store is not allowlisted. Run scripts/demo-setup.sh");
+  cache.allowed = c.allowed_methods; // Classic gets the same methods Code Mode may call
   return (cache.store = c.canister_id);
 }
 
-// Classic MCP tool definitions: one per store method, with its signature and the types it references.
+// Classic MCP tool definitions: one per allowlisted store method, with its signature and the types it references.
 async function classicDefsChars(S) {
   if (cache.defs) return cache.defs;
   const { text } = await tool("execute_icp_script", { language: "javascript", code: `return await icp.candid(${JSON.stringify(S)})` });
@@ -410,7 +421,9 @@ async function classicDefsChars(S) {
   for (const m of text.matchAll(/^type (\w+) = ([\s\S]*?);\n(?=type |service)/gm)) types[m[1]] = m[2];
   const svc = text.slice(text.indexOf("service"));
   const tools = [];
+  const allowed = cache.allowed || ["*"];
   for (const m of svc.matchAll(/^\s*(\w+) : (\(.*\)) -> (\(.*\))( query)?;/gm)) {
+    if (!allowed.includes("*") && !allowed.includes(m[1])) continue;
     const used = new Set(), todo = [m[2] + m[3]];
     while (todo.length) for (const w of todo.pop().match(/\b[A-Z]\w*\b/g) || []) if (types[w] && !used.has(w)) { used.add(w); todo.push(types[w]); }
     tools.push({ name: m[1], description: `Calls ${m[1]} on the store canister. Candid: ${m[2]} -> ${m[3]}${m[4] || ""}`,
@@ -455,7 +468,8 @@ async function runComparison() {
     // Classic: turns of parallel single-method tool calls.
     const classicTurns = [];
     const turn = async (calls) => {
-      const rs = await Promise.all(calls.map(([m, a]) => classicCall(S, m, a)));
+      // At most 4 at once: the canister runs at most 4 scripts per token.
+      const rs = await pool(calls.map(([m, a]) => () => classicCall(S, m, a)), 4);
       classicTurns.push(rs);
       return rs.map((r) => r.value);
     };

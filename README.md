@@ -1,6 +1,6 @@
 # ICP Code Mode — an MCP server inside a canister
 
-[![Watch the 52-second explainer: same answer, 2.6x fewer input tokens](video/poster.jpg)](video/icp-code-mode-explainer.mp4)
+[![Watch the 52-second explainer (recorded when the comparison counted all 10 store methods; the 8-method figure is 2.3x)](video/poster.jpg)](video/icp-code-mode-explainer.mp4)
 
 ▶ **[Watch the 52-second explainer](video/icp-code-mode-explainer.mp4)** (1080p, with voiceover and captions).
 It shows the same task run with classic MCP and with Code Mode, both against a demo store canister.
@@ -198,11 +198,14 @@ Measured on the local network:
 
 | Task | Classic MCP | Code Mode | Total input tokens |
 |---|---|---|---|
-| Top 3 customers by spend | 4 tool calls, ≈3.2k tok of results | 2 tool calls, ≈0.5k tok | 2.6× fewer |
-| What needs restocking? | 13 tool calls | 2 tool calls | 1.2× fewer |
-| Tea sales report | 2 tool calls, ≈3.1k tok of results | 2 tool calls, ≈0.5k tok | 1.4× fewer |
+| Top 3 customers by spend | 4 tool calls, ≈3.2k tok of results | 2 tool calls, ≈0.5k tok | 2.3× fewer |
+| What needs restocking? | 13 tool calls, ≈0.4k tok of results | 2 tool calls, ≈0.5k tok | 1.1× *more* |
+| Tea sales report | 2 tool calls, ≈3.1k tok of results | 2 tool calls, ≈0.5k tok | 1.2× fewer |
 
-Code Mode's cost here is mostly its fixed overhead: two tool definitions plus one search.
+Both sides see the same 8 allowlisted methods (Classic MCP as 8 tool definitions). Code
+Mode's cost here is mostly its fixed overhead: two tool definitions plus one search. On the
+restocking task the store's results are small, so Classic MCP comes out slightly ahead; the
+gap favours Code Mode as results grow.
 Classic MCP grows with every row and call, so the gap widens with real data volumes.
 
 ## Explainer video

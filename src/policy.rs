@@ -263,6 +263,11 @@ pub fn set_candid_override(canister: Principal, did: Option<String>) {
     });
 }
 
+/// (canister, interface size in bytes, SHA-256 of the interface text) for every override.
+pub fn list_candid_overrides() -> Vec<(String, u64, String)> {
+    CANDID_OVERRIDES.with(|m| m.borrow().iter().map(|e| (e.key().clone(), e.value().len() as u64, sha256_hex(e.value().as_bytes()))).collect())
+}
+
 pub fn candid_override(canister: &str) -> Option<String> {
     CANDID_OVERRIDES.with(|m| m.borrow().get(&canister.to_string()))
 }
