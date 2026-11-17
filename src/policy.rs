@@ -158,8 +158,8 @@ pub fn limits() -> Limits {
 
 /// Highest `max_instructions` accepted. Budgets are checked between steps, not on every
 /// instruction, and one step can be large; this leaves 10B of headroom under the IC's 40B
-/// per-message limit, so the budget error fires before the IC traps. It is also the
-/// Python VM's per-turn limit, so no single turn can run past it.
+/// per-message limit, so the budget error fires before the IC traps. Python's VM caps each
+/// turn lower (`MAX_TURN_INSTRUCTIONS` in runtimes/python.rs).
 pub const MAX_INSTRUCTIONS_CAP: u64 = 30_000_000_000;
 
 /// Stores `l` with out-of-range values clamped: `max_instructions` to
