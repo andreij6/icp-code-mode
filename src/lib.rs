@@ -283,10 +283,33 @@ impl RunSlot {
         if ACTIVE_RUNS.with(|a| a.get()) >= MAX_CONCURRENT_RUNS {
             return Err(format!("busy: {MAX_CONCURRENT_RUNS} scripts are already running; retry shortly"));
         }
+        if heap_busy() {
+            return Err("busy: the canister heap is over half full; retry shortly".into());
+        }
         ACTIVE_RUNS.with(|a| a.set(a.get() + 1));
         RUNS_BY_TOKEN.with(|m| *m.borrow_mut().entry(token.to_string()).or_default() += 1);
         Ok(RunSlot(token.to_string()))
     }
+}
+
+/// Whether the heap is too full to start a run. A JS run that trapped can leave garbage in
+/// the shared GC heap, so that is collected before refusing.
+fn heap_busy() -> bool {
+    let full = || counting_alloc::live() > counting_alloc::HEAP_CEILING / 2;
+    #[cfg(feature = "js")]
+    if full() {
+        boa_gc::force_collect();
+    }
+    full()
+}
+
+/// Runs once free Wasm memory falls below `wasm_memory_threshold` (icp.yaml). Memory never
+/// shrinks, but freeing the shared JS heap lets later runs reuse it.
+#[ic_cdk::on_low_wasm_memory]
+fn on_low_wasm_memory() {
+    #[cfg(feature = "js")]
+    boa_gc::force_collect();
+    ic_cdk::println!("low wasm memory: {} heap bytes live", counting_alloc::live());
 }
 
 impl Drop for RunSlot {
@@ -498,6 +521,11 @@ pub(crate) mod counting_alloc {
     /// the growth back. Room for `MAX_CONCURRENT_RUNS` Python heaps and then some.
     // ponytail: one global ceiling, not per run; per-run accounting if runs ever need more.
     pub const HEAP_CEILING: usize = 1 << 30;
+
+    /// Heap bytes live now.
+    pub fn live() -> usize {
+        LIVE_MEMORY.load(Relaxed)
+    }
 
     pub fn over_ceiling(live: usize, extra: usize) -> bool {
         live.saturating_add(extra) > HEAP_CEILING

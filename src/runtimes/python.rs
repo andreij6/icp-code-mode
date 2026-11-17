@@ -238,7 +238,7 @@ fn uses_dynamic_code(code: &str) -> Option<&'static str> {
 /// see each other's allocations. Tests therefore take turns: a thread holds this lock while
 /// it has any Python run in flight (several may interleave on one thread).
 #[cfg(test)]
-mod test_serial {
+pub(crate) mod test_serial {
     use std::cell::RefCell;
     use std::sync::{Mutex, MutexGuard};
 
@@ -298,7 +298,12 @@ pub async fn run<B: HostBridge>(code: &str, bridge: &B) -> Result<Value, String>
 }
 
 async fn drive<B: HostBridge>(code: &str, bridge: &B, out: &mut String) -> Result<Value, String> {
-    let err = |e: MontyException| e.to_string();
+    // Bounded like JS error text: a raised message can be as large as the heap allows.
+    let err = |e: MontyException| {
+        let mut s = e.to_string();
+        crate::bridge::truncate(&mut s, 8192);
+        s
+    };
     let policy = OsPolicy {
         // Determinism: block time, no sleeping, seeded `random`.
         datetime: DateTimeSource::Fixed { unix_seconds: (now_ms() / 1000) as i64, microsecond: 0 },
@@ -493,6 +498,12 @@ mod tests {
         // A call started with call_async and never awaited was not sent: an error.
         let e = py(&format!("import asyncio\nicp.call_async('{L}', 'icrc1_decimals')\n1")).0.unwrap_err();
         assert!(e.contains("never awaited") || e.contains("never"), "{e}");
+    }
+
+    #[test]
+    fn raised_error_text_is_bounded() {
+        let e = py("raise ValueError('x' * (1 << 24))").0.unwrap_err();
+        assert!(e.len() < 8300 && e.contains("ValueError"), "{}", e.len());
     }
 
     #[test]
