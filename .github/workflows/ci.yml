@@ -1,0 +1,80 @@
+# Native tests and release Wasm builds for the all-in-one router and each single-language
+# worker, an ic0-only import check on every Wasm, an advisory scan, a two-build
+# reproducibility check, and the PocketIC harness (harness/) on the default Wasm. The Rust toolchain comes from rust-toolchain.toml (rustup
+# installs it on the first cargo call).
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: default, features: "" }
+          - { name: js, features: "--no-default-features --features js" }
+          - { name: python, features: "--no-default-features --features python" }
+          - { name: rhai, features: "--no-default-features --features rhai" }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install wabt (wasm-objdump)
+        run: sudo apt-get update && sudo apt-get install -y wabt
+      - name: Native tests
+        run: cargo test --lib --locked ${{ matrix.features }}
+      - name: Release Wasm
+        run: cargo build --target wasm32-unknown-unknown --release --locked ${{ matrix.features }}
+      - name: Wasm imports only ic0 (no wasm-bindgen)
+        run: scripts/check-wasm-imports.sh target/wasm32-unknown-unknown/release/icp_code_mode.wasm
+      - name: Reproducible (clean rebuild gives the same hash)
+        if: matrix.name == 'default'
+        run: |
+          W=target/wasm32-unknown-unknown/release/icp_code_mode.wasm
+          first=$(sha256sum "$W" | cut -d' ' -f1)
+          cargo clean --release --target wasm32-unknown-unknown
+          cargo build --target wasm32-unknown-unknown --release --locked
+          second=$(sha256sum "$W" | cut -d' ' -f1)
+          echo "first $first second $second"
+          test "$first" = "$second"
+      - name: PocketIC harness (the release Wasm under a corpus of wasm32-only traps)
+        if: matrix.name == 'default'
+        run: cd harness && cargo test --locked
+      # Last, so a lint never hides the Wasm, import and reproducibility results above.
+      - name: Clippy
+        if: ${{ !cancelled() }}
+        run: cargo clippy --lib --tests --locked ${{ matrix.features }} -- -D warnings
+
+  tooling:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Audit workflow dry run
+        run: node scripts/test-audit-workflow.mjs
+      - name: demo-setup.sh with a stub icp
+        run: scripts/test-demo-setup.sh
+      - name: README MCP URLs resolve for Node/Python clients
+        run: node scripts/check-readme-urls.mjs
+      - name: Demo page checks
+        run: node scripts/test-demo-page.mjs
+      - name: Video tooling (.env reader; the Chrome check runs only where CHROME is set)
+        run: node video/test-tools.mjs
+        env:
+          CHROME: /nonexistent
+
+  advisories:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories

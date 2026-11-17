@@ -13,18 +13,22 @@ rmSync(frames, { recursive: true, force: true });
 mkdirSync(frames, { recursive: true });
 
 const b = await launch({ width: 1920, height: 1080 });
-await b.goto("file://" + resolve(comp));
-// Wait for web fonts (window.READY) so no frame renders with fallback type.
-await b.eval("Promise.resolve(window.READY || document.fonts.ready).then(() => true)");
-const duration = await b.eval("window.DURATION");
-const n = Math.ceil(duration * fps);
-const t0 = Date.now();
-for (let i = 0; i < n; i++) {
-  await b.eval(`Promise.resolve(window.renderAt(${(i / fps).toFixed(5)})).then(() => true)`);
-  writeFileSync(`${frames}/f${String(i).padStart(5, "0")}.jpg`, await b.shot({ format: "jpeg", quality: 93 }));
-  if (i % 150 === 0) process.stderr.write(`frame ${i}/${n} (${((Date.now() - t0) / 1000).toFixed(0)}s)\n`);
+let duration, n;
+try {
+  await b.goto("file://" + resolve(comp));
+  // Wait for web fonts (window.READY) so no frame renders with fallback type.
+  await b.eval("Promise.resolve(window.READY || document.fonts.ready).then(() => true)");
+  duration = await b.eval("window.DURATION");
+  n = Math.ceil(duration * fps);
+  const t0 = Date.now();
+  for (let i = 0; i < n; i++) {
+    await b.eval(`Promise.resolve(window.renderAt(${(i / fps).toFixed(5)})).then(() => true)`);
+    writeFileSync(`${frames}/f${String(i).padStart(5, "0")}.jpg`, await b.shot({ format: "jpeg", quality: 93 }));
+    if (i % 150 === 0) process.stderr.write(`frame ${i}/${n} (${((Date.now() - t0) / 1000).toFixed(0)}s)\n`);
+  }
+} finally {
+  await b.close();
 }
-await b.close();
 
 const args = ["-y", "-loglevel", "error", "-framerate", String(fps), "-i", `${frames}/f%05d.jpg`];
 if (audio) args.push("-i", audio);

@@ -5,11 +5,11 @@
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { homedir } from "node:os";
+import { readEnv } from "./env.mjs";
 
 const here = new URL(".", import.meta.url).pathname;
 const arg = (k, d) => { const i = process.argv.indexOf(k); return i > 0 ? process.argv[i + 1] : d; };
-const fromFile = (f) => { try { return (readFileSync(f, "utf8").match(/^GEMINI_API_KEY=(.+)$/m) || [])[1]?.trim().replace(/^["']|["']$/g, ""); } catch {} };
-const KEY = process.env.GEMINI_API_KEY || fromFile(here + "../.env") || fromFile(homedir() + "/.env");
+const KEY = readEnv("GEMINI_API_KEY", [here + "../.env", homedir() + "/.env"]);
 if (!KEY) { console.error("GEMINI_API_KEY missing: set it in the env, .env or ~/.env"); process.exit(1); }
 const API = "https://generativelanguage.googleapis.com/v1beta";
 const headers = { "x-goog-api-key": KEY, "content-type": "application/json" };

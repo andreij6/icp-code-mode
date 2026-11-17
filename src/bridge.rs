@@ -1418,7 +1418,7 @@ mod ic {
     #[cfg(test)]
     #[test]
     fn budget_refusal_after_sends_is_not_a_violation() {
-        let b = IcBridge::new("c".into(), "javascript", "h".into());
+        let b = IcBridge::new("c", "javascript", "h".into());
         let over = || "policy: instruction budget exceeded (11 > 10)".to_string();
         b.deny(over());
         assert_eq!(b.violations.borrow().len(), 1);

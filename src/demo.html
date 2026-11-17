@@ -301,7 +301,7 @@ const SCENARIOS = [
       const people = await turn(top.map(([p]) => ["get_customer", p]));
       return top.map(([, cents], i) => ({ name: people[i].name, tier: Object.keys(people[i].tier)[0], spend_usd: cents / 100 }));
     },
-    code: (S) => `const S = "${S}";
+    code: (S) => `const S = ${JSON.stringify(S)};
 const orders = await icp.call(S, "list_orders", null);
 const spend = {};
 for (const o of orders) if ("Delivered" in o.status) spend[o.customer] = (spend[o.customer] || 0) + o.total_cents;
@@ -317,7 +317,7 @@ return top.map(([, cents], i) => ({ name: people[i].name, tier: Object.keys(peop
       const inv = await turn(products.map((p) => ["get_inventory", p.id]));
       return lowStock(products, inv);
     },
-    code: (S) => `const S = "${S}";
+    code: (S) => `const S = ${JSON.stringify(S)};
 const products = await icp.call(S, "list_products", [null]);
 const inv = await Promise.all(products.map((p) => icp.call(S, "get_inventory", p.id)));
 return products.map((p, i) => ({ product: p.name, available: inv[i].on_hand - inv[i].reserved, reserved: inv[i].reserved, reorder_level: inv[i].reorder_level }))
@@ -331,7 +331,7 @@ return products.map((p, i) => ({ product: p.name, available: inv[i].on_hand - in
       const [teas, orders] = await turn([["list_products", ["tea"]], ["list_orders", [null]]]);
       return teaReport(teas, orders);
     },
-    code: (S) => `const S = "${S}";
+    code: (S) => `const S = ${JSON.stringify(S)};
 const [teas, orders] = await Promise.all([icp.call(S, "list_products", ["tea"]), icp.call(S, "list_orders", null)]);
 const units = {};
 for (const o of orders) if ("Delivered" in o.status || "Shipped" in o.status)
@@ -409,25 +409,28 @@ async function findStore() {
   const { text } = await tool("search_icp_canisters", { query: "list_products" });
   const c = JSON.parse(text).canisters.find((c) => c.methods && c.methods.some((m) => m.name === "list_products"));
   if (!c) throw new Error("demo_store is not allowlisted. Run scripts/demo-setup.sh");
-  cache.allowed = c.allowed_methods; // Classic gets the same methods Code Mode may call
+  if (!/^[a-z0-9]{5}(-[a-z0-9]{1,5})*$/.test(c.canister_id)) throw new Error("search returned a malformed canister id");
   return (cache.store = c.canister_id);
 }
 
 // Classic MCP tool definitions: one per allowlisted store method, with its signature and the types it references.
+// Built from the canister's own search output (parsed server-side), not by regex over .did text.
 async function classicDefsChars(S) {
   if (cache.defs) return cache.defs;
-  const { text } = await tool("execute_icp_script", { language: "javascript", code: `return await icp.candid(${JSON.stringify(S)})` });
-  const types = {};
-  for (const m of text.matchAll(/^type (\w+) = ([\s\S]*?);\n(?=type |service)/gm)) types[m[1]] = m[2];
-  const svc = text.slice(text.indexOf("service"));
+  const { text } = await tool("search_icp_canisters", { canister_id: S });
+  const c = JSON.parse(text).canisters.find((c) => c.canister_id === S);
+  if (!c || !c.methods) throw new Error("demo_store interface unavailable" + (c && c.error ? ": " + c.error : ""));
+  const types = c.types || {};
   const tools = [];
-  const allowed = cache.allowed || ["*"];
-  for (const m of svc.matchAll(/^\s*(\w+) : (\(.*\)) -> (\(.*\))( query)?;/gm)) {
-    if (!allowed.includes("*") && !allowed.includes(m[1])) continue;
-    const used = new Set(), todo = [m[2] + m[3]];
-    while (todo.length) for (const w of todo.pop().match(/\b[A-Z]\w*\b/g) || []) if (types[w] && !used.has(w)) { used.add(w); todo.push(types[w]); }
-    tools.push({ name: m[1], description: `Calls ${m[1]} on the store canister. Candid: ${m[2]} -> ${m[3]}${m[4] || ""}`,
-      inputSchema: { type: "object", properties: { args: { description: "Candid arguments " + m[2] } },
+  for (const { name, signature } of c.methods) {
+    // Arguments: the first top-level parenthesised group of "(args) -> (rets) [query]".
+    let depth = 0, end = 0;
+    for (; end < signature.length; end++) { depth += signature[end] === "(" ? 1 : signature[end] === ")" ? -1 : 0; if (!depth) break; }
+    const argsText = signature.slice(0, end + 1);
+    const used = new Set(), todo = [signature];
+    while (todo.length) for (const w of todo.pop().match(/\w+/g) || []) if (Object.hasOwn(types, w) && !used.has(w)) { used.add(w); todo.push(types[w]); }
+    tools.push({ name, description: `Calls ${name} on the store canister. Candid: ${signature}`,
+      inputSchema: { type: "object", properties: { args: { description: "Candid arguments " + argsText } },
                      $defs: Object.fromEntries([...used].map((t) => [t, "type " + t + " = " + types[t]])) } });
   }
   cache.defs = { chars: JSON.stringify(tools).length, count: tools.length };

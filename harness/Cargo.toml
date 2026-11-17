@@ -1,0 +1,18 @@
+# Runs the shipped Wasm under PocketIC. Its own workspace, so the canister crate's
+# dependencies and Cargo.lock stay as they are. Run after a release build:
+#   cargo build --target wasm32-unknown-unknown --release --locked
+#   cd harness && cargo test --locked
+# The pocket-ic crate fetches the matching PocketIC server unless POCKET_IC_BIN is set.
+[package]
+name = "wasm_harness"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dev-dependencies]
+pocket-ic = "16.0.0"
+candid = "0.10.40"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
