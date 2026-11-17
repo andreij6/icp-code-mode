@@ -41,7 +41,7 @@ pub const MAX_ALIAS_CHAIN: usize = 64;
 
 /// Checks on the interface text that must run before candid_parser sees it, from its
 /// tokens: nesting (each `vec`/`opt` prefix and each open bracket is a level), fields per
-/// brace, record field ids (the parser computes `id + 1` unchecked, which overflows past
+/// brace, record field ids (the parser computes `id + 1` unchecked for records, which overflows past
 /// `u32::MAX`), and alias chains. Lexical errors end the scan; the parser reports them.
 fn check_shape(did: &str) -> Result<(), String> {
     use candid_parser::token::{Token, Tokenizer};
@@ -50,6 +50,8 @@ fn check_shape(did: &str) -> Result<(), String> {
     struct Open {
         level: usize,
         brace: bool,
+        // opened by `record`: only records number their fields (`id + 1`); variants sort
+        record: bool,
         fields: usize,
         next_id: u64,
         // the current field: tokens so far, and whether it starts with `label :`
@@ -64,7 +66,7 @@ fn check_shape(did: &str) -> Result<(), String> {
             if f.fields > MAX_FIELDS {
                 return Err(format!("more than {MAX_FIELDS} fields in one record, variant or service"));
             }
-            if id >= u64::from(u32::MAX) {
+            if f.record && id >= u64::from(u32::MAX) {
                 return Err(format!("field id {id} is out of range"));
             }
         }
@@ -105,7 +107,7 @@ fn check_shape(did: &str) -> Result<(), String> {
             // keywords that come before the bracket they open
             Token::Record | Token::Variant | Token::Func | Token::Service | Token::Arrow => {}
             Token::LParen | Token::LBrace => {
-                open.push(Open { level: base + run + 1, brace: tok == Token::LBrace, ..Default::default() });
+                open.push(Open { level: base + run + 1, brace: tok == Token::LBrace, record: prev == Token::Record, ..Default::default() });
                 run = 0;
             }
             Token::RParen | Token::RBrace => {
@@ -669,6 +671,7 @@ pub fn idl_to_json(v: &IDLValue, depth: usize, budget: &mut ValueBudget) -> Resu
             if tuple {
                 Value::Array(fields.iter().map(|f| idl_to_json(&f.val, d, budget)).collect::<Result<_, _>>()?)
             } else {
+                budget.object(fields.len())?;
                 let mut m = Map::new();
                 for f in fields {
                     m.insert(text(label_key(&f.id), budget)?, idl_to_json(&f.val, d, budget)?);
@@ -1075,6 +1078,27 @@ mod tests {
         assert!(Service::parse(&wide(MAX_FIELDS + 1)).err().unwrap().contains("fields"));
         let tags = |n: usize| format!("service : {{ f : (variant {{ {} }}) -> () }}", (0..n).map(|i| format!("t{i};")).collect::<String>());
         assert!(Service::parse(&tags(MAX_FIELDS + 1)).err().unwrap().contains("fields"));
+        // Wide objects are bounded in total too: building one is quadratic when its keys collide.
+        use crate::bridge::MAX_WIDE_KEYS;
+        let s = Service::parse(&wide(MAX_FIELDS).replace("(record", "(vec record")).unwrap();
+        let rec = Value::Object((0..MAX_FIELDS).map(|i| (format!("f{i}"), json!(i))).collect());
+        let reply = |n: usize| s.decode_reply(&reply_of(&s, "f"), &s.encode_args("f", &json!([vec![rec.clone(); n]])).unwrap().bytes);
+        assert!(reply(MAX_WIDE_KEYS / MAX_FIELDS).is_ok());
+        let e = reply(MAX_WIDE_KEYS / MAX_FIELDS + 1).err().unwrap();
+        assert!(e.msg.contains("keys in objects") && !e.stale, "{}", e.msg);
+    }
+
+    #[test]
+    fn opt_values_pay_for_the_subtype_memo() {
+        // Finding 86 (vendor/candid/src/de.rs): every `opt` value clones the decoder's memo of
+        // subtype checks, which a service reference with many methods fills. Upstream charged
+        // nothing for the copy; this reply decoded, slowly, within the quota.
+        let methods: String = (0..MAX_FIELDS).map(|i| format!("m{i} : (R{i}) -> ();")).collect();
+        let recs: String = (0..MAX_FIELDS).map(|i| format!("type R{i} = record {{ f{i} : nat }};")).collect();
+        let s = Service::parse(&format!("{recs} type S = service {{ {methods} }}; service : {{ f : (S, vec opt nat8) -> () }}")).unwrap();
+        let enc = s.encode_args("f", &json!(["aaaaa-aa", vec![1; 60_000]])).unwrap();
+        let e = s.decode_reply(&reply_of(&s, "f"), &enc.bytes).err().unwrap();
+        assert!(e.msg.contains("Decoding cost exceeds the limit") && !e.stale, "{}", e.msg);
     }
 
     #[test]
@@ -1220,6 +1244,11 @@ mod tests {
             assert!(e.contains("out of range"), "{ty}: {e}");
         }
         assert!(Service::parse("service : { f : (record { 4294967293 : bool; nat }) -> () }").is_ok());
+        // Variants only sort their tags (no `id + 1`), so the top id is legal there; a bare
+        // tag is a name, not the next number.
+        for ty in ["variant { 4294967295 : nat }", "variant { 4294967294 : nat; A }", "variant { 4294967295 }"] {
+            assert!(Service::parse(&format!("service : {{ f : ({ty}) -> () }}")).is_ok(), "{ty}");
+        }
         // Finding 200: imports are refused, not silently ignored.
         assert!(Service::parse("import \"/etc/passwd\"; service : {}").err().unwrap().contains("import"));
         assert!(Service::parse("import service \"ledger.did\"; service : { m : () -> () }").err().unwrap().contains("import"));
