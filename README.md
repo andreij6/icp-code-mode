@@ -1,5 +1,10 @@
 # ICP Code Mode — an MCP server inside a canister
 
+[![Watch the 52-second explainer: same answer, 2.6x fewer input tokens](video/poster.jpg)](video/icp-code-mode-explainer.mp4)
+
+▶ **[Watch the 52-second explainer](video/icp-code-mode-explainer.mp4)** (1080p, with voiceover and captions).
+It shows the same task run with classic MCP and with Code Mode, both against a demo store canister.
+
 An Internet Computer canister that speaks the **Model Context Protocol** (2025-03-26,
 Streamable HTTP via the ICP HTTP gateway) and follows the search-and-execute pattern
 with two tools:
@@ -80,6 +85,7 @@ MCP client ──POST /mcp──▶ HTTP gateway ──▶ http_request (query)
 | `src/demo.html` | Demo UI served at `GET /`, including the Classic MCP vs Code Mode comparison |
 | `demo_store/` | Demo target canister: 10 store methods with seed data |
 | `scripts/demo-setup.sh` | Allowlists `demo_store` in `icp_code_mode` |
+| `video/` | Explainer video: script, HTML composition, Gemini TTS and render pipeline, final MP4 |
 | `src/search.rs` | `search_icp_canisters`: allowlist × interface → filtered signatures and referenced type definitions |
 | `src/policy.rs` | Stable-memory guardrails: allowlist, limits, SHA-256 token hashes, append-only audit log |
 | `src/runtimes/` | `LanguageRouter` + `js.rs` (Boa), `python.rs` (Monty), `rhai_rt.rs` (Rhai) |
@@ -194,6 +200,27 @@ Measured on the local network:
 
 Code Mode's cost here is mostly its fixed overhead: two tool definitions plus one search.
 Classic MCP grows with every row and call, so the gap widens with real data volumes.
+
+## Explainer video
+
+`video/` builds the explainer from source:
+- `script.md` has the script and the tweet copy.
+- `composition.html` holds the scenes, styled after the ICP dashboard. A `renderAt(t)` function draws any moment of the video.
+- `render.mjs` renders it frame by frame in headless Chrome, then encodes with ffmpeg.
+- `tts.mjs` voices each scene with Gemini TTS. Scenes are timed to the real audio.
+- `capture-demo.mjs` takes screenshots of the live demo page.
+
+Requirements:
+- Chrome, Node ≥ 22 and ffmpeg
+- `GEMINI_API_KEY` in the environment, in this project's `.env`, or in `~/.env`
+
+The voice argument is optional (default `Puck`):
+
+```bash
+video/build.sh Puck
+```
+
+The output goes to `video/out/` (gitignored) and is copied to `video/icp-code-mode-explainer.mp4`.
 
 ## Demo page
 

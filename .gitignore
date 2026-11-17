@@ -1,3 +1,6 @@
 target/
 .icp/cache/
 .env
+video/out/
+video/stills/
+*.frames/

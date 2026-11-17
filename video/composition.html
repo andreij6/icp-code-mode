@@ -1,0 +1,431 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>ICP Code Mode explainer</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,300..600;1,6..72,300..600&family=Inter:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&display=block" rel="stylesheet">
+<style>
+  /* Design language after dashboard.internetcomputer.org: Flexoki paper and ink,
+     Newsreader display serif with italic blue emphasis, Inter UI, monospace figures,
+     white hairline cards, tracked uppercase labels, teal status accents. */
+  :root {
+    --paper: #fffcf0; --paper-2: #f2f0e5; --card: #ffffff; --ink: #100f0f; --ink-2: #403e3c; --muted: #6f6e69;
+    --faint: #b7b5ac; --line: #e6e4d9; --line-2: #dad8ce;
+    --blue: #205ea6; --teal: #24837b; --teal-2: #2a9d93; --red: #af3029; --red-2: #c54237; --red-bg: #ffe1d5;
+    --ochre: #ad8301; --purple: #5e409d; --green: #66800b;
+    --serif: "Newsreader", Charter, Georgia, serif; --sans: "Inter", -apple-system, system-ui, sans-serif;
+    --mono: "Geist Mono", "SF Mono", Menlo, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { width: 1920px; height: 1080px; overflow: hidden; background: var(--paper); color: var(--ink); font-family: var(--sans); }
+  .mono { font-family: var(--mono); }
+  .serif { font-family: var(--serif); }
+  .scene { position: absolute; inset: 0; opacity: 0; }
+  /* Sized for a phone (1920px frames shown ~0.2x), set in the dashboard's idiom. */
+  .eyebrow { font: 600 24px/1 var(--sans); letter-spacing: .14em; text-transform: uppercase; color: var(--ink); }
+  .lbl { font: 600 22px/1 var(--sans); letter-spacing: .14em; text-transform: uppercase; color: var(--ink); }
+  .th { color: var(--muted); }
+  .card { position: absolute; background: var(--card); border: 1px solid var(--line); border-radius: 8px;
+    box-shadow: 0 1px 2px rgba(16,15,15,.05); }
+  .card .title { font: 500 34px/1.1 var(--serif); padding: 26px 30px 0; display: flex; align-items: center; gap: 16px; }
+  .tag { font: 400 22px/1 var(--mono); color: var(--teal); letter-spacing: .4px; }
+  .tag.muted { color: var(--muted); }
+  .hr { height: 1px; background: var(--line); margin: 20px 30px 0; }
+  .pill { display: inline-flex; align-items: center; gap: 12px; padding: 12px 22px; border-radius: 999px; background: var(--card);
+    border: 1px solid var(--line); font: 500 32px/1 var(--mono); }
+  .dot { width: 12px; height: 12px; border-radius: 50%; background: var(--teal-2); display: inline-block; flex: none; }
+  .dot.red { background: var(--red-2); }
+  .bar { height: 12px; border-radius: 1px; background: var(--line); overflow: hidden; }
+  .bar > i { display: block; height: 100%; width: 0; background: var(--teal-2); border-radius: 1px; }
+  .stat { font: 600 92px/1 var(--mono); letter-spacing: -.02em; }
+  .unit { font: 400 30px/1 var(--mono); margin-left: 10px; letter-spacing: 0; }
+  .code { font: 400 30px/1.55 var(--mono); white-space: pre; color: var(--ink); padding: 18px 30px; }
+  .k { color: var(--blue); } .s { color: var(--teal); } .f { color: var(--purple); } .c { color: var(--muted); } .n { color: var(--ochre); }
+  .row { display: flex; align-items: center; gap: 22px; padding: 24px 30px; border-top: 1px solid var(--line); }
+  .shot { position: absolute; background: var(--card); border: 1px solid var(--line); border-radius: 8px; overflow: hidden;
+    box-shadow: 0 1px 2px rgba(16,15,15,.05); }
+  .shot .bar-top { height: 46px; display: flex; align-items: center; gap: 10px; padding: 0 18px; border-bottom: 1px solid var(--line);
+    font: 400 18px/1 var(--mono); color: var(--muted); background: var(--paper); }
+  .header { position: absolute; left: 0; right: 0; top: 0; height: 88px; display: flex; align-items: center; padding: 0 64px;
+    border-bottom: 1px solid var(--line); background: rgba(255,252,240,.92); z-index: 5; }
+  .header .name { font: 600 26px/1 var(--sans); letter-spacing: -.3px; }
+  .header .right { margin-left: auto; display: flex; gap: 14px; }
+  .header .navpill { font: 500 19px/1 var(--sans); padding: 11px 18px; border-radius: 9px; background: var(--paper-2); color: var(--ink-2); }
+  .caption { position: absolute; left: 110px; right: 110px; bottom: 34px; z-index: 6; display: flex; align-items: center; gap: 22px;
+    font: 600 46px/1.25 var(--sans); padding: 20px 32px; border-radius: 8px; background: var(--card); border: 1px solid var(--line);
+    box-shadow: 0 1px 2px rgba(16,15,15,.05); }
+  .caption::before { content: ""; width: 14px; height: 14px; border-radius: 50%; background: var(--teal-2); flex: none; }
+  .progress { position: absolute; left: 0; bottom: 0; height: 5px; background: var(--teal); z-index: 7; }
+  #globe { position: absolute; right: -140px; top: 10px; width: 1160px; height: 1160px; opacity: .8; }
+</style>
+</head>
+<body>
+<svg id="globe" viewBox="-560 -560 1120 1120"></svg>
+
+<div class="header">
+  <span class="name">ICP Code Mode</span><span class="tag" style="margin-left:14px">on chain</span>
+  <div class="right"><span class="navpill">MCP server</span><span class="navpill mono" style="font-family:var(--mono)">search + execute</span></div>
+</div>
+
+<!-- 1. Hook -->
+<div class="scene" id="s1">
+  <div style="position:absolute; left:120px; top:240px; width:1120px">
+    <div class="eyebrow" id="s1e">Internet Computer · MCP server</div>
+    <div class="serif" style="font-size:104px; font-weight:380; letter-spacing:-2px; line-height:1.04; margin-top:30px">
+      <div id="s1a">Same question.</div>
+      <div id="s1b">Same answer.</div>
+      <div id="s1c" style="font-style:italic; color:var(--blue)">2.6× fewer input tokens.</div>
+    </div>
+    <div class="serif" id="s1d" style="font-size:31px; line-height:1.45; color:var(--ink-2); margin-top:34px; width:860px">
+      Same task run both ways with real calls on a local ICP network. Token counts are estimates.</div>
+    <div id="s1r" style="width:70px; height:3px; background:var(--blue); margin-top:34px"></div>
+  </div>
+  <div class="card" id="s1card" style="left:1300px; top:300px; width:520px">
+    <div class="title">Top 3 customers <span class="tag muted">demo store</span></div>
+    <div class="hr"></div>
+    <div style="padding:26px 30px 6px">
+      <div style="display:flex; align-items:baseline"><span class="stat" style="font-size:76px" id="s1n1">4 → 2</span></div>
+      <div class="lbl" style="margin-top:12px">Tool calls</div>
+    </div>
+    <div style="padding:26px 30px 30px">
+      <div style="display:flex; align-items:baseline"><span class="stat" style="font-size:72px">≈<span id="s1n2">3,838</span></span><span class="unit">tok</span></div>
+      <div class="lbl" style="margin-top:12px">Input tokens</div>
+      <div class="mono" style="font-size:26px; color:var(--ink-2); margin-top:12px">was ≈9,954 with classic MCP</div>
+    </div>
+  </div>
+</div>
+
+<!-- 2. Classic MCP -->
+<div class="scene" id="s2">
+  <div class="card" id="s2tools" style="left:110px; top:150px; width:700px">
+    <div class="title">Classic MCP <span class="tag muted">10 tools · one per method</span></div>
+    <div style="display:flex; padding:24px 30px 14px; border-bottom:1px solid var(--ink)" class="lbl th"><span style="flex:1">Tool</span><span>Store method</span></div>
+    <div id="s2rows"></div>
+  </div>
+  <div class="card" id="s2ctx" style="left:900px; top:150px; width:920px; height:680px; overflow:hidden">
+    <div class="title">LLM context <span class="tag muted">what the model has to read</span></div>
+    <div class="hr"></div>
+    <div style="padding:26px 30px 0">
+      <div style="display:flex; align-items:baseline"><span class="stat" id="s2count" style="font-size:132px">0</span><span class="unit" style="font-size:36px">chars</span></div>
+      <div class="lbl" style="margin-top:12px">From one <span class="mono" style="text-transform:none; letter-spacing:0; color:var(--ink)">list_orders</span> call</div>
+      <div class="bar" style="margin-top:22px"><i id="s2fill" style="background:var(--red-2)"></i></div>
+    </div>
+    <div style="position:absolute; left:0; right:0; top:380px; bottom:0; overflow:hidden; border-top:1px solid var(--line); background:var(--paper)">
+      <div class="mono" id="s2json" style="position:absolute; left:30px; right:30px; top:18px; font-size:19px; line-height:1.5; color:var(--muted); opacity:.7; white-space:pre-wrap"></div>
+    </div>
+  </div>
+</div>
+
+<!-- 3. Code Mode -->
+<div class="scene" id="s3">
+  <div style="position:absolute; left:110px; top:150px">
+    <div class="eyebrow" style="margin-bottom:22px">Code Mode · two tools</div>
+    <span class="pill" id="s3t1"><span class="dot"></span>search_icp_canisters</span>
+    <span class="pill" id="s3t2" style="margin-left:14px"><span class="dot"></span>execute_icp_script</span>
+  </div>
+  <div class="card" id="s3code" style="left:110px; top:340px; width:1040px; height:430px">
+    <div style="display:flex; gap:34px; padding:24px 30px 0; font:500 22px/1 var(--sans); color:var(--muted)">
+      <span style="color:var(--ink); border-bottom:3px solid var(--blue); padding-bottom:12px">JavaScript</span><span>Python</span><span>Rhai</span></div>
+    <div class="hr" style="margin-top:0"></div>
+    <div class="code" id="s3src"></div>
+  </div>
+  <div class="card" id="s3can" style="left:1210px; top:150px; width:610px; height:500px">
+    <div class="title">ICP canister <span class="tag">Wasm sandbox</span></div>
+    <div class="serif" style="font-size:24px; color:var(--muted); padding:10px 30px 0; font-style:italic">a smart contract running WebAssembly</div>
+    <div class="hr"></div>
+    <div id="s3rows" style="display:grid; grid-template-columns:repeat(10, 1fr); gap:9px; padding:22px 30px"></div>
+  </div>
+  <div class="card" id="s3out" style="left:1210px; top:672px; width:610px; height:128px; display:flex; align-items:center; gap:18px; padding:0 30px">
+    <span class="dot"></span><span class="lbl">Only the answer</span>
+    <span class="mono" style="font-size:52px; font-weight:600; margin-left:auto">162<span class="unit">chars</span></span>
+  </div>
+</div>
+
+<!-- 4. Side by side -->
+<div class="scene" id="s4">
+  <div style="position:absolute; left:110px; top:140px">
+    <div class="eyebrow">Same task · both ways · real calls</div>
+    <div class="serif" style="font-size:62px; font-weight:400; letter-spacing:-1px; margin-top:16px">Top 3 customers <i style="color:var(--blue)">by spend</i></div>
+  </div>
+  <div class="card" id="s4c" style="left:110px; top:300px; width:440px">
+    <div class="title" style="font-size:30px">Classic MCP</div>
+    <div class="hr"></div>
+    <div style="padding:22px 30px 0"><span class="stat" id="s4c1" style="font-size:108px">0</span><div class="lbl" style="margin-top:12px">Tool calls</div></div>
+    <div style="padding:26px 30px 30px"><div style="display:flex; align-items:baseline"><span class="stat" style="font-size:66px">≈<span id="s4ct">0</span></span><span class="unit">tok</span></div>
+      <div class="lbl" style="margin-top:12px">Input tokens</div><div class="bar" style="margin-top:18px; height:16px"><i id="s4bc" style="background:var(--red-2)"></i></div></div>
+  </div>
+  <div class="card" id="s4m" style="left:580px; top:300px; width:440px">
+    <div class="title" style="font-size:30px">Code Mode <span class="tag">on chain</span></div>
+    <div class="hr"></div>
+    <div style="padding:22px 30px 0"><span class="stat" id="s4m1" style="font-size:108px">0</span><div class="lbl" style="margin-top:12px">Tool calls</div></div>
+    <div style="padding:26px 30px 30px"><div style="display:flex; align-items:baseline"><span class="stat" style="font-size:66px">≈<span id="s4mt">0</span></span><span class="unit">tok</span></div>
+      <div class="lbl" style="margin-top:12px">Input tokens</div><div class="bar" style="margin-top:18px; height:16px"><i id="s4bm"></i></div></div>
+  </div>
+  <div id="s4same" style="position:absolute; left:110px; top:770px; display:flex; align-items:center; gap:14px; padding:12px 22px; border-radius:999px;
+    background:rgba(42,157,147,.12); color:var(--teal); font:600 32px/1 var(--sans)"><span class="dot"></span>Identical answer</div>
+  <div class="shot" id="s4shot" style="left:1100px; top:300px; width:720px">
+    <div class="bar-top"><span class="dot" style="width:10px;height:10px"></span>icp_code_mode.local.localhost:8010 · the real demo page</div>
+    <img src="assets/top3-columns.png" style="width:100%; display:block">
+  </div>
+  <div id="s4grow" class="serif" style="position:absolute; left:1100px; top:650px; width:720px; font-size:50px; line-height:1.15; font-style:italic; color:var(--blue)">
+    …and the gap grows with your data.</div>
+  <div id="s4note" class="mono" style="position:absolute; left:1100px; top:790px; width:720px; font-size:22px; color:var(--muted)">
+    demo store: 60 orders · tokens ≈ chars ÷ 4</div>
+</div>
+
+<!-- 5. Guardrails -->
+<div class="scene" id="s5">
+  <div class="card" id="s5rules" style="left:110px; top:150px; width:740px">
+    <div class="title">Guardrails <span class="tag">on chain</span></div>
+    <div style="height:20px"></div>
+    <div class="row" id="s5b1"><span class="dot"></span><span class="lbl" style="width:240px">Allowlist</span><span class="mono" style="font-size:32px">deny by default</span></div>
+    <div class="row" id="s5b2"><span class="dot"></span><span class="lbl" style="width:240px">Call cap</span><span class="mono" style="font-size:32px">25 per script</span></div>
+    <div class="row" id="s5b3"><span class="dot"></span><span class="lbl" style="width:240px">Audit log</span><span class="mono" style="font-size:32px">append-only</span></div>
+  </div>
+  <div class="card" id="s5code" style="left:900px; top:150px; width:920px">
+    <div class="title" style="font-size:28px">Script <span class="tag muted">javascript</span></div>
+    <div class="hr"></div>
+    <div class="code" style="font-size:27px"><span class="k">await</span> icp.<span class="f">call</span>(ledger, <span class="s">"icrc1_transfer"</span>, {
+  to: { owner: <span class="s">"aaaaa-aa"</span> }, amount: <span class="n">1</span>,
+});</div>
+    <div id="s5why" style="display:flex; align-items:center; gap:16px; padding:0 30px 26px">
+      <span style="display:inline-flex; align-items:center; gap:12px; padding:14px 26px; border-radius:999px; background:var(--red-bg); color:var(--red); font:600 40px/1 var(--sans)">
+        <span class="dot red"></span>Refused · not allowlisted</span>
+      <span class="mono" style="font-size:28px; color:var(--ink-2)">0 messages sent</span>
+    </div>
+  </div>
+  <div class="card" id="s5log" style="left:110px; top:560px; width:1710px">
+    <div class="title" style="font-size:28px">Audit log <span class="tag muted">entry #98</span></div>
+    <div style="display:flex; padding:22px 30px 14px; border-bottom:1px solid var(--ink)" class="lbl th">
+      <span style="width:200px">Id</span><span style="width:480px">Status</span><span style="width:700px">Script SHA-256</span><span>Calls</span></div>
+    <div style="display:flex; align-items:center; padding:24px 30px; font:400 32px/1 var(--mono)">
+      <span style="width:200px">98</span>
+      <span style="width:480px"><span style="padding:10px 18px; border-radius:999px; background:var(--red-bg); color:var(--red); font:600 28px/1 var(--sans)">PolicyViolation</span></span>
+      <span style="width:700px">f8cc02b6…ce38378bb67a4</span><span>0</span></div>
+  </div>
+</div>
+
+<!-- 6. CTA -->
+<div class="scene" id="s6">
+  <div style="position:absolute; left:120px; top:250px; width:1500px">
+    <div class="eyebrow" id="s6a">Open source</div>
+    <div class="serif" id="s6b" style="font-size:150px; font-weight:380; letter-spacing:-3px; line-height:1; margin-top:30px">ICP Code Mode</div>
+    <div class="serif" id="s6c" style="font-size:54px; line-height:1.2; font-style:italic; color:var(--blue); margin-top:22px">an MCP server inside an ICP canister.<br>Two tools, not one per method.</div>
+    <div id="s6r" style="width:70px; height:3px; background:var(--blue); margin-top:40px"></div>
+    <div class="card" id="s6d" style="position:relative; display:inline-flex; align-items:center; gap:18px; margin-top:44px; padding:24px 36px">
+      <span class="dot"></span><span class="mono" style="font-size:52px; font-weight:500">github.com/andreij6/icp-code-mode</span></div>
+  </div>
+</div>
+
+<div class="caption" id="caption"></div>
+<div class="progress" id="progress"></div>
+
+<script>
+// ---------- timing ----------
+const LINES = [
+  "Same question. Same answer. Two point six times fewer input tokens.",
+  "Classic MCP: one tool per API method. Raw results flow through the model. One list orders call dumps about twelve thousand characters into context.",
+  "Code Mode: two tools. Search and execute. The model writes a short script. It runs in a sandbox inside an ICP canister, and only the answer comes back.",
+  "Top three customers by spend. Classic: four tool calls, almost ten thousand input tokens. Code Mode: two calls, under four thousand. The gap grows with your data.",
+  "Guardrails live on chain. A transfer that isn't allowlisted? Refused before anything is sent. Every run is audited.",
+  "Open source. github slash andreij6 slash icp-code-mode.",
+];
+// What the captions show (the spoken URL reads better as text).
+const CAPTIONS = LINES.map((l) => l.replace("Two point six times", "2.6×").replace("twelve thousand", "12,000")
+  .replace("almost ten thousand", "almost 10,000").replace("under four thousand", "under 4,000").replace("Top three", "Top 3")
+  .replace("github slash andreij6 slash icp-code-mode.", "github.com/andreij6/icp-code-mode").replace("list orders", "list_orders"));
+// Per-scene durations (s): ?d=a,b,c,... from the real voiceover; else estimated at 2.6 words/s.
+const q = new URLSearchParams(location.search);
+const LEAD = Number(q.get("lead") || 0.3), TAIL = Number(q.get("tail") || 1.2);
+const DUR = q.get("d") ? q.get("d").split(",").map(Number) : LINES.map((l) => l.split(/\s+/).length / 2.6 + 0.4);
+const START = DUR.reduce((a, d, i) => (a.push(i ? a[i - 1] + DUR[i - 1] : LEAD), a), []);
+window.DURATION = LEAD + DUR.reduce((a, b) => a + b, 0) + TAIL;
+// Renderers wait on this before the first frame.
+window.READY = Promise.all([
+  '380 118px "Newsreader"', 'italic 400 46px "Newsreader"', '500 34px "Newsreader"',
+  '500 19px "Inter"', '600 26px "Inter"', '400 28px "Geist Mono"', '500 92px "Geist Mono"',
+].map((f) => document.fonts.load(f))).then(() => document.fonts.ready).then(() => true);
+
+// ---------- helpers ----------
+const $ = (id) => document.getElementById(id);
+const clamp = (x) => Math.max(0, Math.min(1, x));
+const easeOut = (x) => 1 - Math.pow(1 - clamp(x), 3);
+const easeIO = (x) => { x = clamp(x); return x < .5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2; };
+const prog = (u, a, b) => clamp((u - a) / (b - a));
+const fmt = (n) => Math.round(n).toLocaleString("en-US");
+function show(el, p, dy = 24, scale = false) {
+  const e = typeof el === "string" ? $(el) : el;
+  e.style.opacity = p;
+  e.style.transform = scale ? `scale(${0.85 + 0.15 * p})` : `translateY(${(1 - p) * dy}px)`;
+}
+
+// Captions: split at sentence ends followed by a space ("2.6×", URLs stay whole), timed by character share.
+function chunks(text) { return text.split(/(?<=[.?!:])\s+/).map((s) => s.trim()).filter(Boolean); }
+function captionAt(i, u) {
+  const parts = chunks(CAPTIONS[i]), spoken = chunks(LINES[i]);
+  const total = spoken.reduce((a, s) => a + s.length, 0);
+  const speech = DUR[i] - 0.35; // inter-scene gap inside each clip
+  let acc = 0;
+  for (let k = 0; k < parts.length; k++) {
+    acc += spoken[k].length;
+    if (u < (acc / total) * speech || k === parts.length - 1) return parts[k];
+  }
+  return "";
+}
+
+// ---------- globe (faint graticule + network nodes, like the dashboard hero) ----------
+const R = 520;
+const NODES = [[-0.62, 0.42], [-0.58, 0.47], [-0.55, 0.4], [-0.5, 0.5], [-0.2, 0.55], [-0.15, 0.6], [0.05, 0.45], [0.3, 0.42],
+  [0.34, 0.38], [0.65, 0.2], [0.7, 0.25], [-0.45, -0.1], [0.1, -0.25], [0.15, -0.3], [0.5, -0.4], [-0.15, 0.1], [0.8, 0.55],
+  [-0.75, -0.45], [0.9, 0.05], [-0.9, 0.3], [0.45, 0.6], [-0.3, -0.5], [0.0, 0.2], [0.25, 0.05]];
+function drawGlobe(t) {
+  const rot = t * 0.12;
+  let s = `<defs><radialGradient id="gf" cx="38%" cy="32%" r="75%"><stop offset="0" stop-color="#f1f4f0"/><stop offset="1" stop-color="#d4ded9"/></radialGradient></defs>`
+    + `<circle r="${R}" fill="url(#gf)" stroke="#cfd8d1" stroke-width="2"/>`;
+  for (let k = 0; k < 8; k++) { // meridians
+    const a = ((k / 8) * Math.PI + rot) % Math.PI;
+    s += `<ellipse rx="${Math.abs(Math.cos(a)) * R}" ry="${R}" fill="none" stroke="#cfd9d3" stroke-width="1.5"/>`;
+  }
+  for (let k = -3; k <= 3; k++) { // parallels
+    const y = (k / 4) * R, w = Math.sqrt(R * R - y * y);
+    s += `<line x1="${-w}" x2="${w}" y1="${y}" y2="${y}" stroke="#cfd9d3" stroke-width="1.5"/>`;
+  }
+  NODES.forEach(([lon, lat], n) => { // nodes ride the rotation; every third is a blue crossed marker
+    const a = lon * Math.PI + rot, x = Math.sin(a) * Math.cos(lat) * R, y = -Math.sin(lat) * R;
+    if (Math.cos(a) < 0.08) return;
+    if (n % 3 === 0) s += `<circle cx="${x}" cy="${y}" r="13" fill="rgba(74,120,201,.12)" stroke="#4a78c9" stroke-width="2.5"/>`
+      + `<path d="M${x - 7} ${y}h14M${x} ${y - 7}v14" stroke="#4a78c9" stroke-width="2.5"/>`;
+    else s += `<circle cx="${x}" cy="${y}" r="13" fill="rgba(42,157,147,.15)" stroke="#2a9d93" stroke-width="2.5"/><circle cx="${x}" cy="${y}" r="4" fill="#24837b"/>`;
+  });
+  $("globe").innerHTML = s;
+}
+
+// ---------- scene content ----------
+const TOOLS = ["list_products", "get_product", "search_products", "get_inventory", "get_customer",
+  "list_orders", "sales_summary", "create_order", "cancel_order", "restock"];
+$("s2rows").innerHTML = TOOLS.map((t, i) => `<div class="mono" style="display:flex; padding:11px 30px; font-size:25px; border-top:${i ? "1px solid var(--line)" : "0"}">
+  <span style="flex:1">${t}</span><span style="color:var(--muted); font-size:20px">store.${t}()</span></div>`).join("");
+const ORDER = (k) => `{"id":${k},"customer":"${["eywkj-36a77", "oqkiw-sga77", "qbn26-w6a77", "2vxsx-fae"][k % 4]}…","items":[{"product_id":${(k * 7) % 12 + 1},"quantity":${1 + k % 3}}],"total_cents":${(1100 + k * 397) % 9000},"status":{"${["Delivered", "Shipped", "Pending", "Cancelled"][k % 4]}":null}}`;
+$("s2json").textContent = Array.from({ length: 60 }, (_, k) => ORDER(k + 1)).join(",\n");
+const SCRIPT = [
+  ['<span class="k">const</span> orders = <span class="k">await</span> icp.<span class="f">call</span>(S, <span class="s">"list_orders"</span>, <span class="k">null</span>);', 52],
+  ['<span class="k">const</span> top = <span class="f">rank</span>(orders).<span class="f">slice</span>(<span class="n">0</span>, <span class="n">3</span>);', 38],
+  ['<span class="k">const</span> people = <span class="k">await</span> Promise.<span class="f">all</span>(', 37],
+  ['  top.<span class="f">map</span>(([p]) => icp.<span class="f">call</span>(S, <span class="s">"get_customer"</span>, p)));', 50],
+  ['<span class="k">return</span> top.<span class="f">map</span>(...);  <span class="c">// 3 rows</span>', 33],
+];
+// One square per demo-store order (60), like the dashboard's certificate grid.
+$("s3rows").innerHTML = Array.from({ length: 60 }, () => `<div style="height:36px; border-radius:2px; background:var(--line)"></div>`).join("");
+const KEEP = new Set([7, 23, 41]); // three answer rows survive
+
+// Real measured values (video/assets/demo-results.json, task "Top 3 customers").
+const M = { classicCalls: 4, codeCalls: 2, classicTok: 9954, codeTok: 3838, listOrdersChars: 12186 };
+
+// ---------- scene renderers (u = seconds into scene, d = scene duration) ----------
+const SCENES = [
+  (u, d) => {
+    show("s1e", easeOut(prog(u, 0, .4)));
+    show("s1a", easeOut(prog(u, .05, .5)));
+    show("s1b", easeOut(prog(u, .9, 1.35)));
+    show("s1c", easeOut(prog(u, 1.8, 2.3)));
+    show("s1d", easeOut(prog(u, 2.4, 2.9)));
+    $("s1r").style.width = (70 * easeOut(prog(u, 2.6, 3.2))) + "px";
+    show("s1card", easeOut(prog(u, 2.0, 2.6)), 30);
+  },
+  (u, d) => {
+    show("s2tools", easeOut(prog(u, 0, .5)));
+    const rows = $("s2rows").children;
+    for (let i = 0; i < rows.length; i++) show(rows[i], easeOut(prog(u, .15 + i * .1, .5 + i * .1)), 12);
+    const hot = u > d * .3;
+    rows[5].style.background = hot ? "#fff3ec" : "";
+    rows[5].style.boxShadow = hot ? "inset 4px 0 0 var(--red-2)" : "";
+    show("s2ctx", easeOut(prog(u, d * .3, d * .3 + .5)));
+    const fill = easeIO(prog(u, d * .45, d * .9));
+    $("s2count").textContent = fmt(fill * M.listOrdersChars);
+    $("s2fill").style.width = (fill * 100) + "%";
+    $("s2json").style.transform = `translateY(${-fill * 900}px)`;
+  },
+  (u, d) => {
+    show("s3t1", easeOut(prog(u, .1, .55)), 12, true);
+    show("s3t2", easeOut(prog(u, .5, .95)), 12, true);
+    show("s3code", easeOut(prog(u, d * .3, d * .3 + .5)));
+    const tp = prog(u, d * .33, d * .64);
+    const totalChars = SCRIPT.reduce((a, [, n]) => a + n, 0);
+    let budget = tp * totalChars, html = "";
+    for (const [line, n] of SCRIPT) {
+      if (budget <= 0) break;
+      html += (budget >= n ? line : line.replace(/<[^>]+>/g, "").slice(0, Math.floor(budget))) + "\n";
+      budget -= n;
+    }
+    $("s3src").innerHTML = html;
+    show("s3can", easeOut(prog(u, d * .45, d * .45 + .5)));
+    const squash = easeIO(prog(u, d * .66, d * .84));
+    const rows = $("s3rows").children;
+    for (let i = 0; i < rows.length; i++) {
+      const keep = KEEP.has(i);
+      rows[i].style.opacity = keep ? 1 : 1 - 0.75 * squash;
+      rows[i].style.background = keep && squash > .4 ? "var(--teal-2)" : "var(--line)";
+    }
+    show("s3out", easeOut(prog(u, d * .82, d * .9)), 24);
+  },
+  (u, d) => {
+    show("s4shot", .6 * easeOut(prog(u, .1, .6)), 30); // background proof, not the focal point
+    show("s4c", easeOut(prog(u, .05, .5)));
+    show("s4m", easeOut(prog(u, .2, .65)));
+    const c = easeIO(prog(u, d * .12, d * .45)), m = easeIO(prog(u, d * .45, d * .7));
+    $("s4c1").textContent = Math.round(c * M.classicCalls);
+    $("s4ct").textContent = fmt(c * M.classicTok);
+    $("s4bc").style.width = (c * 100) + "%";
+    $("s4m1").textContent = Math.round(m * M.codeCalls);
+    $("s4mt").textContent = fmt(m * M.codeTok);
+    $("s4bm").style.width = (m * 100 * M.codeTok / M.classicTok) + "%";
+    show("s4same", easeOut(prog(u, d * .7, d * .78)));
+    show("s4grow", easeOut(prog(u, d * .8, d * .88)));
+    show("s4note", easeOut(prog(u, d * .82, d * .9)));
+  },
+  (u, d) => {
+    show("s5rules", easeOut(prog(u, 0, .45)));
+    show("s5b1", easeOut(prog(u, .15, .55)), 12);
+    show("s5b2", easeOut(prog(u, d * .3, d * .3 + .4)), 12);
+    show("s5b3", easeOut(prog(u, d * .7, d * .7 + .4)), 12);
+    show("s5code", easeOut(prog(u, d * .22, d * .22 + .45)));
+    const st = easeOut(prog(u, d * .5, d * .58));
+    $("s5why").style.opacity = st;
+    $("s5why").style.transform = `scale(${1.15 - .15 * st})`;
+    $("s5why").style.transformOrigin = "left center";
+    show("s5log", easeOut(prog(u, d * .72, d * .8)), 24);
+  },
+  (u, d) => {
+    show("s6a", easeOut(prog(u, 0, .4)));
+    show("s6b", easeOut(prog(u, .1, .6)));
+    show("s6c", easeOut(prog(u, .5, 1)));
+    $("s6r").style.width = (70 * easeOut(prog(u, .8, 1.3))) + "px";
+    show("s6d", easeOut(prog(u, .9, 1.4)), 24);
+  },
+];
+
+window.renderAt = (t) => {
+  let i = 0;
+  for (let k = 0; k < START.length; k++) if (t >= START[k] - 0.0001) i = k;
+  const u = t - START[i];
+  const fadeIn = Math.min(1, (t - START[i]) / 0.25 + (i === 0 ? 1 : 0));
+  const end = i < DUR.length - 1 ? START[i + 1] : window.DURATION + 1;
+  const fadeOut = clamp((end - t) / 0.25);
+  document.querySelectorAll(".scene").forEach((s, k) => (s.style.opacity = k === i ? Math.min(fadeIn, fadeOut) : 0));
+  SCENES[i](Math.max(0, u), DUR[i]);
+  const cap = t >= START[0] && u < DUR[i] ? captionAt(i, u) : "";
+  // Capitalize chunks that start after a colon split, but never the URL.
+  $("caption").textContent = cap && !cap.startsWith("github") ? cap[0].toUpperCase() + cap.slice(1) : cap;
+  $("caption").style.opacity = cap ? 1 : 0;
+  $("progress").style.width = (100 * t / window.DURATION) + "%";
+  // Globe only behind the hero and the closing card, where there is room for it.
+  const globeOn = i === 0 || i === 5 ? 1 : 0.0;
+  $("globe").style.opacity = String(0.8 * globeOn);
+  if (globeOn) drawGlobe(t);
+};
+window.READY.then(() => window.renderAt(0));
+</script>
+</body>
+</html>
