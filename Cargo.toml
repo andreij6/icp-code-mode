@@ -44,13 +44,15 @@ monty-types = { version = "=1.6.0", optional = true }
 rhai = { version = "1.27.0", features = ["no_time", "serde"], optional = true }
 
 # web-time and chrono exist only to keep wasm-bindgen out of the canister (ICP rejects any
-# import outside `ic0`); see the header comment in each. boa_engine and monty carry small
-# sandboxing patches, listed in vendor/<crate>/PATCHES.md.
+# import outside `ic0`); see the header comment in each. boa_engine, monty and candid carry
+# small sandboxing patches, listed in vendor/<crate>/PATCHES.md (candid: its recursion
+# bound applies on wasm too).
 [patch.crates-io]
 web-time = { path = "shims/web-time" }
 chrono = { path = "vendor/chrono" }
 boa_engine = { path = "vendor/boa_engine" }
 monty = { path = "vendor/monty" }
+candid = { path = "vendor/candid" }
 
 [profile.release]
 opt-level = "z"
@@ -58,6 +60,9 @@ lto = true
 strip = true
 codegen-units = 1
 panic = "abort"
+# Overflow is a trap (rolled back), as in debug builds, never a silent wrap: candid_parser
+# computes record field ids with unchecked `+ 1`, for one.
+overflow-checks = true
 
 [dev-dependencies]
 futures = { version = "0.3", default-features = false, features = ["executor"] }

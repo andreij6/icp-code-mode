@@ -52,9 +52,27 @@ pub const MAX_VALUE_BYTES: usize = 4 << 20;
 pub struct ValueBudget {
     nodes: usize,
     bytes: usize,
+    wide_keys: usize,
 }
 
+/// Objects with more keys than this count toward `MAX_WIDE_KEYS`.
+pub const WIDE_OBJECT: usize = 64;
+/// Keys summed over wide objects. Engines build objects in time quadratic in their key count
+/// when the keys collide (hash seeds are public here): 194 objects of 1,024 colliding keys took
+/// 1 s natively in Boa, and this allows 16 (about 80 ms).
+pub const MAX_WIDE_KEYS: usize = 16 * 1024;
+
 impl ValueBudget {
+    /// Count an object's keys toward the wide-object bound.
+    pub fn object(&mut self, keys: usize) -> Result<(), String> {
+        if keys > WIDE_OBJECT {
+            self.wide_keys += keys;
+            if self.wide_keys > MAX_WIDE_KEYS {
+                return Err(format!("value has more than {MAX_WIDE_KEYS} keys in objects of over {WIDE_OBJECT} keys"));
+            }
+        }
+        Ok(())
+    }
     /// Count one value (of any kind).
     pub fn node(&mut self) -> Result<(), String> {
         self.nodes += 1;
@@ -96,9 +114,15 @@ pub fn check_value(v: &Value) -> Result<(), String> {
 /// when the reply did not decode, most likely because the target was upgraded and our copy
 /// of its interface is out of date.
 pub fn decode_checked(svc: &Service, func: &candid::types::Function, bytes: &[u8], label: &str) -> Result<Value, (String, bool)> {
-    let v = svc
-        .decode_reply(func, bytes)
-        .map_err(|e| (format!("{e}; the cached interface was dropped, so the next call fetches it again"), true))?;
+    let done = "the call executed on the target, but its reply could not be read";
+    let v = svc.decode_reply(func, bytes).map_err(|e| {
+        if e.stale {
+            // Most likely the target was upgraded and our copy of its interface is stale.
+            (format!("{done}: {}; the cached interface was dropped, so the next call fetches it again", e.msg), true)
+        } else {
+            (format!("{done}: {}", e.msg), false)
+        }
+    })?;
     check_value(&v).map_err(|e| (format!("reply from {label} is over the value limits ({e}); the call was executed"), false))?;
     Ok(v)
 }
@@ -328,6 +352,22 @@ mod ic {
         DID_CACHE.with(|c| c.borrow_mut().remove(&key));
         DID_FAILED.with(|c| c.borrow_mut().remove(&key));
         OVERRIDES.with(|c| c.borrow_mut().remove(&key));
+    }
+
+    /// Held across an interface fetch. If the canister traps before the fetch finishes (say,
+    /// parsing a hostile interface), the rollback loses everything else, but ic-cdk drops the
+    /// future in the cleanup callback, whose changes are kept: the failure is remembered, so
+    /// later requests don't send the same messages again. Concurrent fetches of the same
+    /// interface are not blocked (an in-flight marker would fail them).
+    struct TrapMarksFailed(String);
+
+    impl Drop for TrapMarksFailed {
+        fn drop(&mut self) {
+            if ic_cdk::futures::is_recovering_from_trap() {
+                let msg = format!("could not fetch candid for {} (the canister trapped while the fetch was in progress)", self.0);
+                DID_FAILED.with(|c| c.borrow_mut().insert(std::mem::take(&mut self.0), (msg, ic_cdk::api::time())));
+            }
+        }
     }
 
     fn failed_get(key: &str) -> Option<String> {
@@ -564,6 +604,7 @@ mod ic {
                 return Err(e); // failed moments ago: don't send the same messages again
             }
             self.reserve(&p, None)?;
+            let _trap = TrapMarksFailed(key.clone());
             let fetched = self
                 .fetch_did(p)
                 .await

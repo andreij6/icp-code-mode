@@ -447,8 +447,6 @@ checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 [[package]]
 name = "candid"
 version = "0.10.40"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eabf7c87ac020b0d9e07b02b63e6a109224044a524ce5b7ce98307bc5ea4d7e1"
 dependencies = [
  "anyhow",
  "binrw",

@@ -652,8 +652,9 @@ ic_cdk::export_candid!();
 
 /// ICP replicas have no OS RNG. getrandom 0.3 and 0.4 (pulled in by ahash and
 /// boa's `rand`) both resolve the "custom" backend (see .cargo/config.toml) to this
-/// symbol. Replicas must agree bit-for-bit, so it is a fixed deterministic stream:
-/// fine for hash seeding, never use it for secrets.
+/// symbol. Replicas must agree bit-for-bit, so it is a fixed deterministic stream, and
+/// public: hash seeds drawn from it are predictable and give no collision resistance
+/// (input caps bound that work instead). Never use it for secrets.
 #[cfg(target_arch = "wasm32")]
 #[unsafe(no_mangle)]
 unsafe extern "Rust" fn __getrandom_v03_custom(dest: *mut u8, len: usize) -> Result<(), getrandom::Error> {

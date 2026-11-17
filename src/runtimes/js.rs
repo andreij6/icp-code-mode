@@ -955,6 +955,8 @@ async fn drive<B: HostBridge>(code: &str, bridge: &B, st: &Shared, ctx: &mut Con
         // Resumed in a new message execution, on a fresh stack.
         ctx.set_stack_floor(stack_floor());
         for (p, reply) in batch.iter().zip(replies) {
+            // Each reply is within the value budget; several of them are not.
+            check_budget(bridge)?;
             let (f, arg) = match reply {
                 Ok(j) => (&p.resolvers.resolve, JsValue::from_json(&j, ctx).map_err(|e| error_string(e, st, ctx))?),
                 Err(msg) => (&p.resolvers.reject, JsNativeError::error().with_message(msg).into_opaque(ctx).into()),

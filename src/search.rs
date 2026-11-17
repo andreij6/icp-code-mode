@@ -34,9 +34,10 @@ pub struct Entry {
 }
 
 /// Allowlist entries in scope for `args`. A `canister_id` that is not allowlisted (or
-/// not a principal) yields no entries; `render` reports that instead of failing.
+/// not a principal) yields no entries; `render` reports that instead of failing. Parsed
+/// exactly as `icp.call` parses it (no trimming), so search never lists what calls refuse.
 pub fn scope(args: &SearchArgs, allowlist: Vec<(Principal, Vec<String>)>) -> Vec<(Principal, Vec<String>)> {
-    let wanted = args.canister_id.as_deref().map(|id| Principal::from_text(id.trim()).ok());
+    let wanted = args.canister_id.as_deref().map(|id| Principal::from_text(id).ok());
     allowlist
         .into_iter()
         .filter(|(p, _)| match &wanted {
@@ -111,6 +112,7 @@ pub fn render(args: &SearchArgs, entries: &[Entry]) -> Value {
             .iter()
             .filter(|(name, _)| any || e.allowed.contains(name))
             .filter_map(|(name, t)| svc.env.as_func(t).ok().map(|f| (name, f)))
+            .filter(|(name, f)| svc.uncallable(name, f).is_none())
             .collect();
 
         let mut shown = vec![];
@@ -118,7 +120,8 @@ pub fn render(args: &SearchArgs, entries: &[Entry]) -> Value {
         let mut vars = BTreeSet::new();
         for (name, f) in methods {
             let sig = signature(f);
-            let hay = format!("{name} {sig}").to_lowercase();
+            let doc = svc.docs.get(name.as_str());
+            let hay = format!("{name} {sig} {}", doc.map_or("", |d| d.as_str())).to_lowercase();
             if !terms.iter().all(|t| hay.contains(t)) {
                 continue;
             }
@@ -128,7 +131,11 @@ pub fn render(args: &SearchArgs, entries: &[Entry]) -> Value {
             }
             budget -= 1;
             f.args.iter().chain(&f.rets).for_each(|t| collect_vars(&svc.env, t, &mut vars));
-            shown.push(json!({ "name": name, "signature": sig }));
+            let mut m = json!({ "name": name, "signature": sig });
+            if let Some(d) = doc {
+                m["doc"] = json!(d);
+            }
+            shown.push(m);
         }
         omitted += cut;
         // With a keyword filter, skip canisters that have no matching method.
@@ -153,7 +160,14 @@ pub fn render(args: &SearchArgs, entries: &[Entry]) -> Value {
         out["note"] = json!(format!("{omitted} more matching methods; narrow the query or pass canister_id"));
     } else if canisters.is_empty() {
         out["note"] = json!(match (&args.canister_id, terms.is_empty()) {
-            (Some(id), _) if entries.is_empty() => format!("canister {id} is not allowlisted"),
+            (Some(id), _) if entries.is_empty() => {
+                let mut shown = id.clone();
+                crate::bridge::truncate(&mut shown, 80);
+                match Principal::from_text(id) {
+                    Ok(_) => format!("canister {shown} is not allowlisted"),
+                    Err(e) => format!("invalid canister id `{shown}`: {e}"),
+                }
+            }
             (_, false) => "no allowed method matches the query".to_string(),
             _ => "the allowlist is empty; a controller adds canisters with set_allowlist".to_string(),
         });
@@ -231,7 +245,9 @@ mod tests {
         assert_eq!(scope(&a, allow.clone()), vec![(p, vec!["*".to_string()])]);
         let a = SearchArgs { query: None, canister_id: Some("not-a-principal".into()) };
         assert!(scope(&a, allow.clone()).is_empty());
-        assert_eq!(render(&a, &[])["note"], "canister not-a-principal is not allowlisted");
+        assert!(render(&a, &[])["note"].as_str().unwrap().starts_with("invalid canister id `not-a-principal`"));
+        let a = SearchArgs { query: None, canister_id: Some("aaaaa-aa".into()) };
+        assert_eq!(render(&a, &[])["note"], "canister aaaaa-aa is not allowlisted");
         assert_eq!(scope(&SearchArgs::default(), allow).len(), 2);
         assert_eq!(render(&SearchArgs::default(), &[])["note"], "the allowlist is empty; a controller adds canisters with set_allowlist");
     }
@@ -285,6 +301,52 @@ mod tests {
         let raw_svc = Service::parse(did).unwrap();
         collect_vars(&raw_svc.env, &class_ty, &mut vars);
         assert!(vars.contains("Pair") && vars.contains("Svc"));
+    }
+
+    #[test]
+    fn scope_parses_ids_exactly_as_calls_do() {
+        // Finding 186: a padded id answered in search but was refused by icp.call.
+        let p = Principal::from_text(LEDGER).unwrap();
+        let allow = vec![(p, vec!["*".to_string()])];
+        let padded = format!(" {LEDGER}");
+        let newline = format!("{LEDGER}\n");
+        for id in ["", padded.as_str(), newline.as_str(), "RYJL3-TYAAA-AAAAA-AAABA-CAI", LEDGER] {
+            let a = SearchArgs { query: None, canister_id: Some(id.into()) };
+            assert_eq!(scope(&a, allow.clone()).is_empty(), Principal::from_text(id).is_err(), "{id:?}");
+        }
+        let a = SearchArgs { query: None, canister_id: Some(String::new()) };
+        assert!(render(&a, &[])["note"].as_str().unwrap().starts_with("invalid canister id ``"));
+    }
+
+    #[test]
+    fn lists_only_callable_methods_and_searches_docs() {
+        // Finding 192: methods icp.call always refuses were listed, label spellings in the
+        // types were refused as keys, and comments and argument names were not searched.
+        let long = "m".repeat(crate::bridge::MAX_METHOD_LEN + 1);
+        let did = format!(
+            "type R = record {{ 1_000 : nat; \"true\" : nat }};\n\
+             service : {{\n\
+               // Moves tokens between ledgers\n\
+               shift : (recipient : principal, R) -> ();\n\
+               o : () -> () oneway;\n\
+               c : () -> () composite_query;\n\
+               e : (empty) -> ();\n\
+               {long} : () -> ();\n\
+             }}"
+        );
+        let svc = Rc::new(Service::parse(&did).unwrap());
+        let out = render(&SearchArgs::default(), &[entry(&["*"], Ok(Some(svc.clone())))]);
+        let c = &out["canisters"][0];
+        let names: Vec<_> = c["methods"].as_array().unwrap().iter().map(|m| m["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["shift"]);
+        assert!(c["methods"][0]["doc"].as_str().unwrap().contains("Moves tokens"));
+        for q in ["ledgers", "recipient"] {
+            let out = render(&SearchArgs { query: Some(q.into()), canister_id: None }, &[entry(&["*"], Ok(Some(svc.clone())))]);
+            assert_eq!(out["canisters"][0]["methods"][0]["name"], "shift", "{q}");
+        }
+        // Every key spelled as the rendered type spells it encodes.
+        assert_eq!(c["types"]["R"], "record { 1_000 : nat; true : nat }");
+        assert!(svc.encode_args("shift", &json!(["aaaaa-aa", { "1_000": 1, "true": 2 }])).is_ok());
     }
 }
 
