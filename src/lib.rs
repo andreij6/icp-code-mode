@@ -495,7 +495,8 @@ pub(crate) mod counting_alloc {
     /// JavaScript has none, so one builtin call (`json.dumps(x, indent=10**8)`,
     /// `"x".repeat(n)`) could otherwise grow the heap toward 4 GiB, and Wasm memory never
     /// shrinks. Past the ceiling an allocation fails, which traps the message and rolls
-    /// the growth back. Room for `MAX_CONCURRENT_RUNS` Python heaps and then some.
+    /// the growth back. Room for `MAX_CONCURRENT_RUNS` Python heaps and then some; eight Rhai
+    /// runs all at their 128 MiB cap would reach it, and the message that crosses it traps.
     // ponytail: one global ceiling, not per run; per-run accounting if runs ever need more.
     pub const HEAP_CEILING: usize = 1 << 30;
 

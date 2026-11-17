@@ -27,14 +27,16 @@ pub const MAX_REQUESTS: usize = 64;
 /// 2 MiB, a quarter of the canister's 8 MiB stack.
 pub const MAX_EXPR_DEPTH: usize = 128;
 pub const MAX_FN_EXPR_DEPTH: usize = 64;
-/// Heap a run may grow by, as in Python. Rhai's size limits bound one value, not how many
-/// a script holds, and do not count map keys or values captured by closures.
-pub const MAX_MEMORY_BYTES: usize = 64 << 20;
+/// Heap a run may grow by. Rhai's size limits bound one value, not how many a script holds,
+/// and do not count map keys or values captured by closures. Twice Python's: Rhai copies a
+/// whole array on `for` and on assignment, and the largest reply the bridge passes (99,999
+/// one-field records) is about 47 MiB per copy natively, 33 MiB on wasm32.
+pub const MAX_MEMORY_BYTES: usize = 128 << 20;
 /// Deepest value accepted when converting to JSON.
 const MAX_VALUE_DEPTH: usize = crate::candid_bridge::MAX_DEPTH;
 const SUSPEND: &str = "__icp_suspend__";
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 enum Request {
     Candid(String),
     Call(String, String, Value),
@@ -42,8 +44,11 @@ enum Request {
 
 #[derive(Default)]
 struct RunState {
-    /// (request, answer) by sequence number. Errors are cached too so replays see them.
-    answers: Vec<(Request, Result<Value, String>)>,
+    /// (request, answer) by sequence number, as JSON text (see `key`). Errors are cached
+    /// too so replays see them. The cache outlives every replay, so its bytes are charged
+    /// to the memory cap; text is a small fraction of the same serde_json value's heap.
+    answers: Vec<(String, Result<String, String>)>,
+    cached_bytes: usize,
     seq: usize,
     pending: Option<Request>,
     diverged: Option<String>,
@@ -67,6 +72,23 @@ impl RunState {
 
 type Shared = Arc<Mutex<RunState>>;
 
+/// A request as compact, unambiguous text (`{:?}` quotes and escapes the names).
+fn key(req: &Request) -> String {
+    match req {
+        Request::Candid(id) => format!("{id:?}"),
+        Request::Call(id, m, a) => format!("{id:?} {m:?} {a}"),
+    }
+}
+
+/// A cached reply, parsed straight into Rhai values. The bridge held it to 128 levels, one
+/// more than serde_json's default limit.
+fn reply_to_dynamic(json: &str) -> Res<Dynamic> {
+    use serde::Deserialize;
+    let mut de = serde_json::Deserializer::from_str(json);
+    de.disable_recursion_limit();
+    Dynamic::deserialize(&mut de).map_err(|e| format!("reply: {e}").into())
+}
+
 fn suspend(pos: Position) -> Box<EvalAltResult> {
     EvalAltResult::ErrorTerminated(SUSPEND.into(), pos).into()
 }
@@ -80,11 +102,11 @@ fn request(st: &Shared, req: Request, pos: Position) -> Result<Dynamic, Box<Eval
     let seq = s.seq;
     s.seq += 1;
     match s.answers.get(seq) {
-        Some((cached, _)) if *cached != req => {
+        Some((cached, _)) if *cached != key(&req) => {
             s.diverged = Some(format!("non-deterministic script: request #{seq} changed between replays"));
             Err(suspend(pos))
         }
-        Some((_, Ok(v))) => rhai::serde::to_dynamic(v),
+        Some((_, Ok(v))) => reply_to_dynamic(v),
         Some((_, Err(e))) => Err(EvalAltResult::ErrorRuntime(e.clone().into(), pos).into()),
         None => {
             s.pending = Some(req);
@@ -229,6 +251,45 @@ fn register_safe_builtins(engine: &mut Engine) {
         Ok(())
     });
 
+    type Sizes = (usize, usize, usize);
+    fn plus(t: Sizes, (a, m, s): Sizes) -> Sizes {
+        (t.0 + a, t.1 + m, t.2 + s)
+    }
+    fn array_sizes(a: &Array) -> Sizes {
+        a.iter().fold((a.len(), 0, 0), |t, x| plus(t, sizes(x)))
+    }
+    /// Deep (array elements, map entries, string bytes) as Rhai counts them, plus map keys,
+    /// which Rhai skips.
+    fn sizes(d: &Dynamic) -> Sizes {
+        if let Ok(a) = d.as_array_ref() {
+            array_sizes(&a)
+        } else if let Ok(m) = d.as_map_ref() {
+            m.iter().fold((0, m.len(), 0), |t, (k, x)| plus(t, plus((0, 0, k.len()), sizes(x))))
+        } else if let Ok(b) = d.as_blob_ref() {
+            (b.len(), 0, 0)
+        } else if let Ok(s) = d.as_immutable_string_ref() {
+            (0, 0, s.len())
+        } else {
+            (0, 0, 0)
+        }
+    }
+    // Rhai's `pad` checks the size before growing, but without map keys: one call could
+    // copy a map with a 1 MB key 1,000 times before the memory cap is next checked.
+    engine.register_fn("pad", |ctx: NativeCallContext, a: &mut Array, len: rhai::INT, item: Dynamic| -> Res<()> {
+        let Some(n) = usize::try_from(len).ok().and_then(|l| l.checked_sub(a.len())).filter(|&n| n > 0) else {
+            return Ok(());
+        };
+        let (ha, hm, hs) = array_sizes(a);
+        let (ia, im, is) = sizes(&item);
+        let e = ctx.engine();
+        let over = |have: usize, each: usize, max: usize| max > 0 && have.saturating_add(each.saturating_mul(n)) > max;
+        if over(ha, ia + 1, e.max_array_size()) || over(hm, im, e.max_map_size()) || over(hs, is, e.max_string_size()) {
+            return Err(format!("pad to {len} would go over the size limits (map keys count as text)").into());
+        }
+        a.resize(a.len() + n, item);
+        Ok(())
+    });
+
     // Rhai's parse_json is quadratic and runs as one operation; serde_json is linear and
     // limited to 128 levels.
     engine.register_fn("parse_json", |s: &str| -> Res<Dynamic> {
@@ -300,7 +361,7 @@ fn build_engine(state: &Shared, principal: String, deadline: u64) -> Engine {
             s.diverged = Some(e);
             return Some(Dynamic::from(SUSPEND));
         }
-        if crate::counting_alloc::live().saturating_sub(s.mem_base) > MAX_MEMORY_BYTES {
+        if crate::counting_alloc::live().saturating_sub(s.mem_base) + s.cached_bytes > MAX_MEMORY_BYTES {
             s.diverged = Some(format!("script used more than {} MiB of memory", MAX_MEMORY_BYTES >> 20));
             return Some(Dynamic::from(SUSPEND));
         }
@@ -381,11 +442,15 @@ pub async fn run<B: HostBridge>(code: &str, bridge: &B) -> Result<Value, String>
         if state.lock().unwrap().answers.len() >= MAX_REQUESTS {
             break Err(format!("script exceeded {MAX_REQUESTS} icp requests"));
         }
-        let answer = match &req {
-            Request::Candid(id) => bridge.candid(id).await.map(Value::String),
-            Request::Call(id, m, a) => bridge.call(id, m, a.clone()).await,
-        };
-        state.lock().unwrap().answers.push((req, answer));
+        let k = key(&req);
+        let answer = match req {
+            Request::Candid(id) => bridge.candid(&id).await.map(Value::String),
+            Request::Call(id, m, a) => bridge.call(&id, &m, a).await,
+        }
+        .map(|v| v.to_string());
+        let mut s = state.lock().unwrap();
+        s.cached_bytes += k.len() + answer.as_ref().map_or_else(String::len, String::len);
+        s.answers.push((k, answer));
     };
     for line in std::mem::take(&mut state.lock().unwrap().logs) {
         bridge.log(line);
@@ -530,7 +595,7 @@ mod tests {
 
         // Trigger request divergence branch directly between cached request and replay request.
         let st: Shared = Arc::default();
-        st.lock().unwrap().answers.push((Request::Candid("a".into()), Ok(Value::Null)));
+        st.lock().unwrap().answers.push((key(&Request::Candid("a".into())), Ok("null".into())));
         let e = request(&st, Request::Candid("b".into()), Position::NONE);
         assert!(e.is_err());
         assert!(st.lock().unwrap().diverged.as_ref().unwrap().contains("non-deterministic"));
@@ -561,17 +626,28 @@ mod tests {
             json!(vec![7; 20_000]),
             // 199,997 values: 49,999 records of three fields.
             json!(vec![json!({ "a": 1, "b": true, "c": "x" }); 49_999]),
+            // The costliest in Rhai: one-field records, each its own map.
+            json!(vec![json!({ "a": 1 }); 99_999]),
+            json!(vec![json!({ "a": "" }); 99_999]),
+            json!(vec![json!({ "a": 1, "b": 2 }); 66_666]),
             json!(vec![true; MAX_VALUE_NODES - 1]),
             json!("x".repeat(MAX_VALUE_BYTES)),
+            // As deep as the bridge allows (one more than serde_json's default limit).
+            json!([(0..127).fold(json!(1), |v, _| json!([v]))]),
         ];
         for reply in fits {
             check_value(&reply).unwrap();
             let n = reply.as_array().map_or_else(|| reply.as_str().unwrap().len(), Vec::len);
-            let out = block_on(run(&format!(r#"icp::call_canister("{L}", "m").len()"#), &Fixed(reply)));
-            assert_eq!(out.unwrap(), json!(n));
+            let call = format!(r#"let r = icp::call_canister("{L}", "m");"#);
+            // `for` and assignment copy the whole array in Rhai: two copies must fit.
+            for tail in ["r.len()", "let r2 = r; r2.len()", "let n = 0; for x in r { n += 1; } n"] {
+                let tail = if reply.is_string() { "r.len()" } else { tail };
+                let out = block_on(run(&format!("{call} {tail}"), &Fixed(reply.clone())));
+                assert_eq!(out.unwrap(), json!(n), "{tail}");
+            }
         }
         // The bridge refuses larger replies for every runtime (the call has run by then).
-        let deep = (0..130).fold(json!(1), |v, _| json!([v]));
+        let deep = (0..129).fold(json!(1), |v, _| json!([v]));
         for over in [
             json!(vec![1; 250_000]),
             json!(vec![json!({ "a": 1, "b": true, "c": "x" }); 100_000]),
@@ -584,6 +660,7 @@ mod tests {
 
     #[test]
     fn memory_cap_counts_map_keys_and_captures() {
+        use crate::bridge::MAX_VALUE_BYTES;
         let b = MockBridge::default();
         let mem = |code: &str| block_on(run(code, &b)).unwrap_err();
         // Rhai's size limits skip map keys: 300 keys of 1 MB each.
@@ -591,6 +668,15 @@ mod tests {
         assert!(e.contains("MiB of memory"), "{e}");
         // And values captured by closures: 2,000 copies of a 9,000-element array.
         let e = mem("let t = []; for i in 0..9000 { t.push(i); } let fs = []; for i in 0..2000 { let a = t; fs.push(|| a.len()); } fs.len()");
+        assert!(e.contains("MiB of memory"), "{e}");
+        // One `pad` copying a map with a 1 MB key: refused before it allocates.
+        let e = mem(r#"let k = "x"; k.pad(1000000, 'x'); let m = #{}; m[k] = 1; let a = []; a.pad(300, m); a.len()"#);
+        assert!(e.contains("pad to 300"), "{e}");
+        assert_eq!(block_on(run("let a = [1]; a.pad(3, #{x: [1, 2]}); a", &b)).unwrap(), json!([1, { "x": [1, 2] }, { "x": [1, 2] }]));
+        assert_eq!(block_on(run("let a = [1, 2]; a.pad(1, 0); a.pad(-1, 0); a", &b)).unwrap(), json!([1, 2]));
+        // Cached replies outlive every replay, so they count: 24 MiB of JSON each.
+        let reply = json!("\u{1}".repeat(MAX_VALUE_BYTES));
+        let e = block_on(run(&format!(r#"for i in 0..10 {{ icp::call_canister("{L}", "m"); }} 1"#), &Fixed(reply))).unwrap_err();
         assert!(e.contains("MiB of memory"), "{e}");
         // Values at Rhai's own size limits are well under the cap.
         let ok = "let a = []; a.pad(200000, 0); let s = \"\"; s.pad(4000000, 'x'); a.len() + s.len()";

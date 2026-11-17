@@ -92,6 +92,17 @@ pub fn check_value(v: &Value) -> Result<(), String> {
     walk(v, 0, &mut ValueBudget::default())
 }
 
+/// Decode a call's reply and hold it to the value limits. `Err((message, stale))`: `stale`
+/// when the reply did not decode, most likely because the target was upgraded and our copy
+/// of its interface is out of date.
+pub fn decode_checked(svc: &Service, func: &candid::types::Function, bytes: &[u8], label: &str) -> Result<Value, (String, bool)> {
+    let v = svc
+        .decode_reply(func, bytes)
+        .map_err(|e| (format!("{e}; the cached interface was dropped, so the next call fetches it again"), true))?;
+    check_value(&v).map_err(|e| (format!("reply from {label} is over the value limits ({e}); the call was executed"), false))?;
+    Ok(v)
+}
+
 /// Deterministic "now" for script clocks: block time on-chain, 0 off-chain (tests).
 pub fn now_ms() -> u64 {
     #[cfg(target_arch = "wasm32")]
@@ -601,17 +612,16 @@ mod ic {
             let secs = self.call_timeout.unwrap_or(policy::DEFAULT_CALL_TIMEOUT_SECONDS);
             let call = Call::bounded_wait(p, method).change_timeout(secs);
             let label = format!("{p}.{}", method.escape_debug());
-            let reply = self.sent(&p, label, call.with_raw_args(&enc.bytes).into_future()).await.map_err(|e| {
+            let reply = self.sent(&p, label.clone(), call.with_raw_args(&enc.bytes).into_future()).await.map_err(|e| {
                 let unknown = !e.is_clean_reject();
                 format!("call {p}.{} failed: {e}{}", method.escape_debug(), if unknown { " (outcome unknown: the call may have executed)" } else { "" })
             })?;
-            let v = svc.decode_reply(&enc.func, &reply.into_bytes()).map_err(|e| {
-                // Most likely the target was upgraded and our copy of its interface is stale.
-                evict_interface(&p);
-                format!("{e}; the cached interface was dropped, so the next call fetches it again")
-            })?;
-            check_value(&v).map_err(|e| format!("reply from {p}.{} is over the value limits ({e}); the call was executed", method.escape_debug()))?;
-            Ok(v)
+            decode_checked(&svc, &enc.func, &reply.into_bytes(), &label).map_err(|(e, stale)| {
+                if stale {
+                    evict_interface(&p);
+                }
+                e
+            })
         }
 
         fn principal(&self) -> String {
