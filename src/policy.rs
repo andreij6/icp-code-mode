@@ -186,7 +186,7 @@ pub fn list_allowed() -> Vec<(Principal, Vec<String>)> {
 }
 
 /// Decide whether a script may issue one more call. Pure function of its inputs
-/// so it is unit-testable; `check_call` feeds it live state.
+/// so it is unit-testable; `check_call` feeds it the allowlist.
 pub fn authorize(
     allowed: Option<&AllowedMethods>,
     canister: &str,
@@ -213,16 +213,17 @@ pub fn authorize(
     Ok(())
 }
 
-pub fn check_call(canister: &Principal, method: &str, calls_made: u32, instructions_used: u64) -> Result<(), String> {
+/// `limits`: the run's snapshot (see `IcBridge::limits`), so a run keeps the limits it started with.
+pub fn check_call(canister: &Principal, method: &str, calls_made: u32, instructions_used: u64, limits: &Limits) -> Result<(), String> {
     let allowed = ALLOWLIST.with(|m| m.borrow().get(canister));
-    authorize(allowed.as_ref(), &canister.to_text(), method, calls_made, instructions_used, &limits())
+    authorize(allowed.as_ref(), &canister.to_text(), method, calls_made, instructions_used, limits)
 }
 
 /// Interface fetches (`icp.candid`) may target any allowlisted canister and count
 /// against the same per-script cap and budget as calls.
-pub fn check_interface_fetch(canister: &Principal, calls_made: u32, instructions_used: u64) -> Result<(), String> {
+pub fn check_interface_fetch(canister: &Principal, calls_made: u32, instructions_used: u64, limits: &Limits) -> Result<(), String> {
     let any = ALLOWLIST.with(|m| m.borrow().contains_key(canister)).then(|| AllowedMethods(vec!["*".into()]));
-    authorize(any.as_ref(), &canister.to_text(), "<candid interface>", calls_made, instructions_used, &limits())
+    authorize(any.as_ref(), &canister.to_text(), "<candid interface>", calls_made, instructions_used, limits)
 }
 
 // ---------- bearer tokens ----------
@@ -246,6 +247,12 @@ pub fn revoke_token_hash(sha256_hex: &str) -> bool {
 
 pub fn list_tokens() -> Vec<(String, String)> {
     TOKENS.with(|t| t.borrow().iter().map(|e| (e.key()[..16].to_string(), e.value())).collect())
+}
+
+/// Whether a token hash (from `verify_token`) is still registered: a run checks it again
+/// before every message, so a revoked token's run sends nothing more.
+pub fn token_registered(sha256_hex: &str) -> bool {
+    TOKENS.with(|t| t.borrow().contains_key(&sha256_hex.to_string()))
 }
 
 /// Returns the token's hash if it is registered.
@@ -345,13 +352,13 @@ mod tests {
     #[test]
     fn stable_state_check_call() {
         let ledger = Principal::from_text(LEDGER).unwrap();
-        assert!(check_call(&ledger, "icrc1_balance_of", 0, 0).is_err());
+        assert!(check_call(&ledger, "icrc1_balance_of", 0, 0, &limits()).is_err());
         set_allowed(ledger, vec!["icrc1_balance_of".into()]);
-        assert!(check_call(&ledger, "icrc1_balance_of", 0, 0).is_ok());
-        assert!(check_call(&ledger, "icrc1_transfer", 0, 0).is_err());
-        assert!(check_call(&Principal::management_canister(), "raw_rand", 0, 0).is_err());
+        assert!(check_call(&ledger, "icrc1_balance_of", 0, 0, &limits()).is_ok());
+        assert!(check_call(&ledger, "icrc1_transfer", 0, 0, &limits()).is_err());
+        assert!(check_call(&Principal::management_canister(), "raw_rand", 0, 0, &limits()).is_err());
         set_limits(Limits { max_calls_per_script: 0, max_instructions: 1, ..Limits::default() });
-        assert!(check_call(&ledger, "icrc1_balance_of", 0, 0).unwrap_err().contains("call limit"));
+        assert!(check_call(&ledger, "icrc1_balance_of", 0, 0, &limits()).unwrap_err().contains("call limit"));
         assert!(remove_allowed(ledger));
         assert_eq!(list_allowed(), vec![]);
     }
@@ -443,9 +450,9 @@ mod tests {
     fn interface_fetch_and_overrides_and_token_edge_cases() {
         let p = Principal::from_text(LEDGER).unwrap();
         set_limits(Limits::default());
-        assert!(check_interface_fetch(&p, 0, 0).is_err());
+        assert!(check_interface_fetch(&p, 0, 0, &limits()).is_err());
         set_allowed(p, vec![]);
-        assert!(check_interface_fetch(&p, 0, 0).is_ok());
+        assert!(check_interface_fetch(&p, 0, 0, &limits()).is_ok());
 
         set_candid_override(p, Some("service : { ping : () -> () }".into()));
         assert_eq!(candid_override(&p.to_text()).as_deref(), Some("service : { ping : () -> () }"));

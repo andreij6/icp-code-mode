@@ -161,21 +161,21 @@ async fn run_search(caller_hash: &str, args: SearchArgs) -> serde_json::Value {
     let caller = caller_hash.get(..16).unwrap_or(caller_hash).to_string();
     let key = format!("search:{}:{}", args.query.as_deref().unwrap_or(""), args.canister_id.as_deref().unwrap_or(""));
     let script_sha256 = policy::sha256_hex(key.as_bytes());
-    let bridge = IcBridge::new(caller.clone(), "search", script_sha256.clone());
+    let bridge = IcBridge::new(caller_hash, "search", script_sha256.clone());
     let mut entries = vec![];
     let mut fetch_errors = vec![];
     let mut halted: Option<String> = None;
     for (canister, allowed) in search::scope(&args, policy::list_allowed()) {
         let service = match (bridge::cached_service(&canister, true), &halted) {
             (Some(s), _) => s.map(Some),
-            // After a policy refusal (call cap, budget) every further fetch would be refused
-            // too; don't try, and don't log one violation per remaining canister.
+            // After a run-wide refusal (call cap, budget, stopping) every further fetch would
+            // be refused too; don't try, and don't log one violation per remaining canister.
             (None, Some(why)) => Err(format!("not fetched: {why}; search with canister_id")),
             (None, None) => {
                 use bridge::HostBridge;
                 let r = bridge.candid(&canister.to_text()).await.map(|_| bridge::cached_service(&canister, true).and_then(Result::ok));
                 if let Err(e) = &r {
-                    if e.starts_with("policy:") {
+                    if bridge::refuses_whole_run(e) {
                         halted = Some(e.clone());
                     } else {
                         fetch_errors.push(e.clone());
@@ -187,14 +187,11 @@ async fn run_search(caller_hash: &str, args: SearchArgs) -> serde_json::Value {
         entries.push(Entry { canister, allowed, service });
     }
     let mut result = Ok(search::render(&args, &entries));
-    let (used, max) = (bridge.instructions_used(), policy::limits().max_instructions);
+    let (used, max) = (bridge.instructions_used(), bridge.limits().max_instructions);
     if used > max {
         result = Err(bridge.deny(format!("policy: instruction budget exceeded ({used} > {max})")));
     }
-    let mut violations = bridge.violations.take();
-    if let n @ 1.. = bridge.violations_dropped.get() {
-        violations.push(format!("…and {n} more"));
-    }
+    let violations = bridge.closing_violations();
     // Audit whenever a fetch was attempted: sent messages (a `Started` entry is open) or
     // was refused by policy (refusals must be logged even though nothing was sent).
     if bridge.calls() > 0 || !violations.is_empty() {
@@ -311,7 +308,7 @@ async fn run_script(caller_hash: &str, call: ToolCall) -> serde_json::Value {
     };
     let caller = caller_hash.get(..16).unwrap_or(caller_hash).to_string();
     let script_sha256 = policy::sha256_hex(call.code.as_bytes());
-    let bridge = IcBridge::new(caller.clone(), call.language.as_str(), script_sha256.clone());
+    let bridge = IcBridge::new(caller_hash, call.language.as_str(), script_sha256.clone());
     let mut out = LanguageRouter::execute(call.language, &call.code, &bridge).await;
     // A result too big to send is an error, and recorded as one.
     if let Ok(v) = &out {
@@ -320,15 +317,12 @@ async fn run_script(caller_hash: &str, call: ToolCall) -> serde_json::Value {
         }
     }
     let instructions = bridge.instructions_used();
-    let max = policy::limits().max_instructions;
+    let max = bridge.limits().max_instructions;
     if instructions > max {
         let e = format!("policy: instruction budget exceeded ({instructions} > {max})");
         out = Err(bridge.deny(e));
     }
-    let mut violations = bridge.violations.take();
-    if let n @ 1.. = bridge.violations_dropped.get() {
-        violations.push(format!("…and {n} more"));
-    }
+    let violations = bridge.closing_violations();
     let status = match (&out, violations.is_empty()) {
         (_, false) => AuditStatus::PolicyViolation,
         (Err(_), true) => AuditStatus::Error,
