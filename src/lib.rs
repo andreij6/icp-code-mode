@@ -72,7 +72,9 @@ fn strict_args(bytes: &[u8], expected: impl FnOnce(&mut candid::types::internal:
     use candid::types::{Field, Label, Type, TypeInner};
     let bytes = if bytes.is_empty() { b"DIDL\x00\x00".as_slice() } else { bytes };
     let bad = |e: &dyn std::fmt::Display| format!("arguments do not match the method's Candid types: {e}");
-    let header = candid::binary_parser::Header::read_le_args(&mut std::io::Cursor::new(bytes), (None,)).map_err(|e| bad(&e))?;
+    // binrw's error is a multi-line backtrace (with build paths); one line is enough here.
+    let header = candid::binary_parser::Header::read_le_args(&mut std::io::Cursor::new(bytes), (None,))
+        .map_err(|_| "arguments are not valid Candid".to_string())?;
     let (wire_env, wire) = header.to_types().map_err(|e| bad(&e))?;
     let tuple = |ts: Vec<Type>| -> Type {
         TypeInner::Record(ts.into_iter().enumerate().map(|(i, ty)| Field { id: Label::Unnamed(i as u32).into(), ty }).collect()).into()
@@ -122,7 +124,10 @@ fn init(args: Option<InitArgs>) {
 /// answer in the canister's name.
 fn set_certified_data() {
     let certified = policy::limits().certified_reads == Some(true);
-    ic_cdk::api::certified_data_set(if certified { [0; 32] } else { SKIP_CERT_DATA });
+    // Off-chain (native tests) there is no certified data to set.
+    if cfg!(target_family = "wasm") {
+        ic_cdk::api::certified_data_set(if certified { [0; 32] } else { SKIP_CERT_DATA });
+    }
 }
 
 /// Upgrade arguments are accepted (the same `opt InitArgs` type keeps old deploy scripts
@@ -775,9 +780,17 @@ unsafe extern "Rust" fn __getrandom_v03_custom(dest: *mut u8, len: usize) -> Res
 
 #[cfg(test)]
 mod tests {
-    /// 104: a record without the optional fields keeps their stored values.
+    /// 104: a record without the optional fields keeps their stored values (through the
+    /// endpoint itself, not only `merge_limits`).
     #[test]
     fn set_limits_keeps_omitted_options() {
+        let kept = super::Limits { call_timeout_seconds: Some(60), certified_reads: Some(true), tool_calls_per_minute: Some(7), ..Default::default() };
+        crate::policy::set_limits(kept);
+        super::set_limits(super::Limits { max_calls_per_script: 3, ..Default::default() });
+        let l = crate::policy::limits();
+        crate::policy::set_limits(super::Limits::default());
+        assert_eq!((l.max_calls_per_script, l.call_timeout_seconds, l.certified_reads, l.tool_calls_per_minute), (3, Some(60), Some(true), Some(7)));
+
         let old = super::Limits { call_timeout_seconds: Some(60), certified_reads: Some(true), tool_calls_per_minute: Some(7), ..Default::default() };
         let new = super::Limits { max_calls_per_script: 3, max_instructions: 9, call_timeout_seconds: None, certified_reads: None, tool_calls_per_minute: None };
         let m = super::merge_limits(new, &old);
@@ -816,6 +829,8 @@ mod tests {
         assert!(over("(principal \"aaaaa-aa\", opt blob \"x\")").is_err());
         assert_eq!(over("(principal \"aaaaa-aa\", opt \"service : {}\")"), Ok(()));
         assert_eq!(over("(principal \"aaaaa-aa\", null)"), Ok(()));
+        // Bytes that are not Candid get one short line, not binrw's backtrace.
+        assert_eq!(strict_args(b"DIDLxx", |c| vec![c.add::<Limits>()]), Err("arguments are not valid Candid".into()));
     }
 
     /// 178: one canister, one hash, however its id is spelled.
@@ -835,8 +850,21 @@ mod tests {
         let held: Vec<RunSlot> = (0..MAX_RUNS_PER_TOKEN).map(|_| RunSlot::take("s").unwrap()).collect();
         assert!(search_slot(true, "s").err().unwrap().contains("busy"));
         assert!(search_slot(false, "s").unwrap().is_none());
+        // run_search itself refuses before fetching: an allowlisted canister with nothing cached.
+        let p = candid::Principal::from_text("qoctq-giaaa-aaaaa-aaaea-cai").unwrap();
+        crate::policy::set_allowed(p, vec!["*".into()]);
+        let args = crate::search::SearchArgs { canister_id: Some(p.to_text()), query: None };
+        let out = futures::executor::block_on(super::run_search("s", args)).to_string();
+        crate::policy::remove_allowed(p);
+        assert!(out.contains("busy"), "{out}");
         drop(held);
         assert!(search_slot(true, "s").unwrap().is_some());
+    }
+
+    /// 181: the canister log is large enough to keep the low-memory line next to later traps.
+    #[test]
+    fn icp_yaml_sets_a_larger_canister_log() {
+        assert!(include_str!("../icp.yaml").contains("log_memory_limit: 2097152"));
     }
 
     /// 77: once messages went out, running out of budget is not reported as a refusal.

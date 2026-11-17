@@ -334,14 +334,14 @@ mod ic {
     }
 
     fn failed_get(key: &str) -> Option<String> {
-        let now = ic_cdk::api::time();
+        let now = now_ms() * 1_000_000;
         DID_FAILED.with(|c| c.borrow().get(key).filter(|(_, at)| now.saturating_sub(*at) <= DID_FAIL_TTL_NS).map(|(e, _)| e.clone()))
     }
 
     /// A cached interface, unless it is older than `DID_CACHE_TTL_NS` (then it is
     /// re-fetched, so a target's interface change is picked up without an upgrade here).
     fn cache_get(key: &str) -> Option<(String, Rc<Service>)> {
-        let now = ic_cdk::api::time();
+        let now = now_ms() * 1_000_000;
         DID_CACHE.with(|c| {
             c.borrow().get(key).filter(|(_, _, at)| now.saturating_sub(*at) <= DID_CACHE_TTL_NS).map(|(d, s, _)| (d.clone(), s.clone()))
         })
@@ -415,7 +415,12 @@ mod ic {
             instruction_counter().saturating_sub(self.base_instructions)
         }
 
+        /// Record a policy refusal as a violation. Running out of budget once messages went
+        /// out is not one: the run closes as `Error` (see `close_over_budget` in lib.rs).
         pub fn deny(&self, e: String) -> String {
+            if self.calls() > 0 && e.starts_with("policy: instruction budget exceeded") {
+                return e;
+            }
             let mut v = self.violations.borrow_mut();
             if v.len() < MAX_VIOLATIONS {
                 let mut short = e.clone();
@@ -647,6 +652,21 @@ mod ic {
         fn instruction_deadline(&self) -> u64 {
             self.base_instructions.saturating_add(self.max_instructions)
         }
+    }
+
+    /// 77: a budget refusal at send time is a violation only while nothing was sent.
+    #[cfg(test)]
+    #[test]
+    fn budget_refusal_after_sends_is_not_a_violation() {
+        let b = IcBridge::new("c".into(), "javascript", "h".into());
+        let over = || "policy: instruction budget exceeded (11 > 10)".to_string();
+        b.deny(over());
+        assert_eq!(b.violations.borrow().len(), 1);
+        b.messages.borrow_mut().push("x.icrc1_transfer".into());
+        b.deny(over());
+        assert_eq!(b.violations.borrow().len(), 1, "not recorded once a message went out");
+        b.deny("policy: method `m` on x is not allowlisted".into());
+        assert_eq!(b.violations.borrow().len(), 2, "other refusals still are");
     }
 }
 
