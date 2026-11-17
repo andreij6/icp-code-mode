@@ -363,7 +363,7 @@ How values are encoded:
 | Guardrail | Value |
 |---|---|
 | Allowlist | `Principal → ["method" \| "*"]`, deny by default. Checked before any message is sent, including the interface fetch |
-| Calls per script | 25 (`set_limits`). Counts `icp.call` and every interface fetch that misses the cache. Reserved before the await, so concurrent batches count |
+| Calls per script | 25 (`set_limits`). Counts every `icp.call` attempt that passes policy and every interface fetch that misses the cache. Reserved before the await, so concurrent batches count |
 | Instruction budget | 20B per script, measured from the script's own start. Checked before each host request, between JS rounds, and on every Rhai operation; Python has its own 10B VM budget |
 | Requests | At most 50 messages per JSON-RPC batch. One `execute_icp_script` and five searches per HTTP request (further ones get `-32600`). At most 8 scripts run at once across all requests; more get a "busy" error. JS: at most 64 concurrent requests per round and 64 rounds. Rhai: at most 64 requests |
 | Values | Any value leaving a script (result, call arguments, printed values) is limited to 128 levels, 200k elements and 4 MiB of text, in all three languages |
@@ -371,33 +371,59 @@ How values are encoded:
 | Python (Monty) | Recursion 200, 64 MiB memory, 256 suspensions. The VM stops when the policy's instruction budget is spent. Fixed `datetime`, zero sleep, seeded `random`, no OS access |
 | Rhai | 1M operations per run, 32 call levels, size limits on strings/arrays/maps. `eval` and modules disabled |
 | Output | Script source ≤ 100 KiB. Captured logs ≤ 64 KiB, enforced while running. Result ≤ 1 MB of *escaped* JSON. Any reply that would exceed 1.9 MB, whatever it contains, is replaced by a small error, so replying can never trap |
-| Audit | Append-only `StableLog`: time, token-hash prefix, language, script SHA-256, canisters, methods, calls, instructions, status, violations (≤ 16, each ≤ 512 B), error (≤ 4 KiB). One entry is written before every outbound message, plus a final entry per run |
+| Audit | Append-only `StableLog`: time, token-hash prefix, language, script SHA-256, canisters, methods, calls, instructions, status, violations (≤ 16, each ≤ 512 B), error (≤ 4 KiB). One entry per outbound message, written as the system accepts it, plus one closing entry per run (`Trapped` if the run was cut short) |
 | Unpaid-call filter | `inspect_message` rejects update calls that carry no registered token (or, for admin methods, don't come from a controller) before the canister is charged for them |
 | Stack | 8 MiB wasm stack (`.cargo/config.toml`), up from Rust's 1 MiB default |
 
 Policy, tokens and the audit log live in `ic-stable-structures`, so they survive upgrades
 without `pre_upgrade` code. `post_upgrade` accepts the same optional `InitArgs` as `init`.
 
-**The audit log is written ahead of every outbound message.** Before a script's first
-message the canister appends a `Started` entry, and before each later one a `Call` entry. Each
-names the target and method (`methods`), and IC state commits when the message is sent. So
-if the script traps afterwards, which rolls back its final entry, the log still shows every
-call that went out. The final `Ok` / `Error` / `PolicyViolation` entry lists all of them.
+### How to read the audit log
 
-All entries of one run carry the same `run_id` (the `Started` entry's id).
+Every entry of one run carries the same `run_id` (the id of the run's first entry). The
+script hash can't link entries: the same code can run several times, and runs interleave
+across awaits.
 
-A run whose entries are only `Started`/`Call` has no final entry yet. That is not proof of a
-trap. It means one of two things:
+**Entries for messages.** Each outbound message gets its own entry, naming the target and
+method in `methods`: `Started` for the run's first message, `Call` for each later one. This
+includes interface fetches, which go to the management canister and, if needed, the target.
 
-- **Pending:** the run is still waiting on a reply. `get_policy` lists these runs in
-  `pending_run_ids`, next to `active_runs`.
-- **Ended without a final entry:** the canister trapped after the messages went out, which
-  rolled back the final entry.
+- The entry is written at the moment the system accepts the message. If the system refuses
+  it on the spot (no cycles, queue full), or the arguments fail to encode, nothing was sent
+  and there is no entry.
+- The entry and the message are committed together when that message execution ends. If
+  the execution traps first, the IC discards both, so the log never shows a message that was
+  not sent, and never misses one that was.
+- An entry means the system accepted the message. Whether the target executed it is in the
+  script's result or error: a reject, or "outcome unknown" after a call timeout.
 
-The pending list is kept in memory and is empty after an upgrade, so for older runs treat a
-missing final entry as "pending or unknown". The script hash can't
-link entries: the same code can run several times, and runs interleave across awaits. A run
-that never reaches the network writes a single entry whose `run_id` is its own id.
+**Closing entries.** A script run ends with exactly one of these:
+
+| Closing entry | Meaning |
+|---|---|
+| `Ok` | The script returned a result |
+| `Error` | The script failed, or a search could not fetch an interface |
+| `PolicyViolation` | A call was refused by policy, or the instruction budget ran out |
+| `Trapped` | The canister trapped while handling a reply, after messages had gone out. The run's own closing entry was rolled back with the trap, so this one is written during cleanup. It lists the messages sent and the violations recorded up to the last message |
+
+`calls` counts messages sent, and `methods` lists them in order.
+
+Two kinds of request write no entries, because they send nothing: a search answered from
+cached interfaces, and a script refused as "busy" when 8 are already running.
+
+**A run with no closing entry** is one of three things:
+
+- **Pending:** it is still waiting on a reply. `get_policy` lists these runs in
+  `pending_run_ids`. With the default unbounded wait, a target that never answers leaves a
+  run pending indefinitely; `call_timeout_seconds` prevents that.
+- **Unknown:** cleanup after a trap did not complete (it can itself fail), or the canister
+  was upgraded while the run was waiting. The pending list is kept in memory and is empty
+  after an upgrade.
+- **Not in the log at all:** a run that traps before sending any message leaves no entries,
+  because the IC rolls back that whole request. It changed nothing and returned nothing.
+
+So a missing closing entry is "pending or unknown", never proof of a trap. A trap is
+recorded as `Trapped`.
 
 **Options** (both off by default, set with `set_limits`):
 
@@ -429,7 +455,7 @@ allowlist check, the interface cache and the override lookup.
   interrupted inside a single native operation, such as `new Array(2e8).fill(0)`. Every other
   path stops with a clean error. If this happens before any outbound message, nothing changed,
   nothing is logged, and the client gets a 503 with no result. If it happens after one, the
-  `Started`/`Call` entries for every message already sent remain.
+  entries for every message already sent remain and the run is closed with a `Trapped` entry.
 - **Bearer tokens are visible to the subnet's node operators and the HTTP gateway**, because
   request contents are replicated to the nodes that run the canister. That is how HTTP
   requests work on ICP. Treat tokens as revocable credentials: one per client, rotated, and
@@ -442,7 +468,7 @@ allowlist check, the interface cache and the override lookup.
 - **The interface cache lives on the heap**, so it is also re-fetched after an upgrade.
   `canister_metadata` is tried first, but the local pocket-ic replica does not implement it
   yet, so the code falls back to `__get_candid_interface_tmp_hack`.
-- **Adding the `Started` and `Call` audit statuses were Candid-breaking changes** for
+- **Adding the `Started`, `Call` and `Trapped` audit statuses were Candid-breaking changes** for
   `get_audit_logs` clients compiled against an older `.did`. Upgrading needed `icp deploy --yes`.
 
 ## Where this differs from the original spec, and why

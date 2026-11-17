@@ -132,6 +132,23 @@ pub fn instruction_counter() -> u64 {
     0
 }
 
+/// Await `fut`, calling `f` once at the first moment it is found pending (never, if it is
+/// ready on its first poll).
+pub async fn on_first_pending<T>(fut: impl std::future::Future<Output = T>, f: impl FnOnce()) -> T {
+    let mut fut = std::pin::pin!(fut);
+    let mut f = Some(f);
+    std::future::poll_fn(|cx| {
+        let r = fut.as_mut().poll(cx);
+        if r.is_pending() {
+            if let Some(f) = f.take() {
+                f();
+            }
+        }
+        r
+    })
+    .await
+}
+
 /// Truncate to at most `max` bytes on a char boundary, marking the cut.
 pub fn truncate(s: &mut String, max: usize) {
     if s.len() > max {
@@ -152,6 +169,7 @@ mod ic {
     use candid::types::FuncMode;
     use candid::{CandidType, Deserialize, Principal};
     use ic_cdk::call::{Call, CallErrorExt};
+    use std::future::IntoFuture;
     use std::cell::{Cell, RefCell};
     use std::collections::{BTreeMap, BTreeSet};
     use std::rc::Rc;
@@ -217,11 +235,34 @@ mod ic {
 
     /// The run is over, however it ended: normally, or by ic-cdk dropping the future while
     /// cleaning up after a trap.
+    ///
+    /// In the trap case this runs in the cleanup callback, whose state changes are kept. The
+    /// final entry the run would have written was rolled back with the trapped execution,
+    /// so a `Trapped` entry closes the run instead. Memory is back to how it was when the
+    /// last message was sent, so `methods` and `violations` are complete up to that point.
     impl Drop for IcBridge {
         fn drop(&mut self) {
-            if let Some(id) = self.started.get() {
-                PENDING_RUNS.with(|r| r.borrow_mut().remove(&id));
+            let Some(id) = self.started.get() else { return };
+            PENDING_RUNS.with(|r| r.borrow_mut().remove(&id));
+            if self.finished.get() || !ic_cdk::futures::is_recovering_from_trap() {
+                return;
             }
+            let (caller, language, sha) = self.audit_key.clone();
+            policy::append_audit(AuditEntry {
+                id: 0,
+                timestamp_ns: ic_cdk::api::time(),
+                caller,
+                language,
+                script_sha256: sha,
+                canisters: self.touched.borrow().iter().cloned().collect(),
+                calls: self.calls(),
+                instructions: self.instructions_used(),
+                status: AuditStatus::Trapped,
+                violations: self.violations.borrow().clone(),
+                error: Some("the canister trapped while handling a reply (instruction or memory limit, or a bug); the script's result was discarded".into()),
+                run_id: Some(id),
+                methods: Some(self.messages()),
+            });
         }
     }
 
@@ -249,7 +290,11 @@ mod ic {
 
     /// Production bridge: one instance per `tools/call`, so counters start at zero.
     pub struct IcBridge {
-        calls: Cell<u32>,
+        /// Call-cap slots taken (attempts that passed policy), whether or not a message
+        /// ended up being sent.
+        slots: Cell<u32>,
+        /// Set once the run's final audit entry is written.
+        finished: Cell<bool>,
         base_instructions: u64,
         max_instructions: u64,
         /// (caller, language, script sha) for the provisional audit entry.
@@ -268,7 +313,8 @@ mod ic {
     impl IcBridge {
         pub fn new(caller: String, language: &str, script_sha256: String) -> Self {
             Self {
-                calls: Cell::new(0),
+                slots: Cell::new(0),
+                finished: Cell::new(false),
                 base_instructions: instruction_counter(),
                 max_instructions: policy::limits().max_instructions,
                 audit_key: (caller, language.to_string(), script_sha256),
@@ -282,8 +328,14 @@ mod ic {
             }
         }
 
+        /// Messages actually sent so far.
         pub fn calls(&self) -> u32 {
-            self.calls.get()
+            self.messages.borrow().len() as u32
+        }
+
+        /// The final audit entry is written; nothing more to record on drop.
+        pub fn finish(&self) {
+            self.finished.set(true);
         }
 
         /// Outbound messages so far (see `AuditEntry::methods`).
@@ -313,29 +365,38 @@ mod ic {
             e
         }
 
-        /// Policy-check and count one outbound message, before any await so
+        /// Policy-check one outbound request and take a call-cap slot, before any await so
         /// concurrent requests (Promise.all / gather) are all counted.
         fn reserve(&self, p: &Principal, method: Option<&str>) -> Result<(), String> {
-            let n = self.calls.get();
+            let n = self.slots.get();
             let used = self.instructions_used();
             match method {
                 Some(m) => policy::check_call(p, m, n, used),
                 None => policy::check_interface_fetch(p, n, used),
             }
             .map_err(|e| self.deny(e))?;
-            self.calls.set(n + 1);
-            self.touched.borrow_mut().insert(p.to_text());
-            self.record_message(p, format!("{}.{}", p.to_text(), method.unwrap_or("<candid interface>")));
+            self.slots.set(n + 1);
             Ok(())
         }
 
-        /// Write-ahead audit record for one outbound message: `Started` for the run's first,
-        /// `Call` for each later one. State commits when the message is sent, so even if the
-        /// script never finishes (a trap rolls back the final entry), the log still shows
-        /// every message that went out, with its target and method.
+        /// Await an inter-canister call, writing its audit entry at the moment the system
+        /// accepts the message: ic-cdk's call future is pending after its first poll only
+        /// if `call_perform` succeeded, and resolves immediately with an error if the
+        /// message was refused (no cycles, queue full). So the log has an entry exactly for
+        /// the messages that were handed over, never for one that was not sent.
+        async fn sent<T>(&self, p: &Principal, method: &str, call: impl std::future::Future<Output = T>) -> T {
+            on_first_pending(call, || self.record_message(p, format!("{}.{method}", p.to_text()))).await
+        }
+
+        /// Audit record for one outbound message: `Started` for the run's first, `Call` for
+        /// each later one. It is appended in the same message execution that hands the
+        /// message to the system, so the two are committed together when that execution
+        /// ends, or discarded together if it traps first. Later traps cannot remove it.
         fn record_message(&self, p: &Principal, label: String) {
             let (caller, language, sha) = self.audit_key.clone();
             let run = self.started.get();
+            self.touched.borrow_mut().insert(p.to_text());
+            self.messages.borrow_mut().push(label.clone());
             let id = policy::append_audit(AuditEntry {
                 id: 0,
                 timestamp_ns: ic_cdk::api::time(),
@@ -343,19 +404,36 @@ mod ic {
                 language,
                 script_sha256: sha,
                 canisters: vec![p.to_text()],
-                calls: self.calls.get(),
+                calls: self.calls(),
                 instructions: self.instructions_used(),
                 status: if run.is_none() { AuditStatus::Started } else { AuditStatus::Call },
                 violations: vec![],
                 error: None,
                 run_id: run, // None: a Started entry opens its own run
-                methods: Some(vec![label.clone()]),
+                methods: Some(vec![label]),
             });
             if run.is_none() {
                 self.started.set(Some(id));
                 PENDING_RUNS.with(|r| r.borrow_mut().insert(id));
             }
-            self.messages.borrow_mut().push(label);
+        }
+
+        /// 1. management `canister_metadata` (reads the public `candid:service` section; not
+        ///    on every replica yet), 2. the `__get_candid_interface_tmp_hack` query that
+        ///    Motoko and many Rust canisters export. Each message is logged as it is sent.
+        async fn fetch_did(&self, p: Principal) -> Result<String, String> {
+            let mgmt = Principal::management_canister();
+            let meta = Call::bounded_wait(mgmt, "canister_metadata")
+                .with_arg(MetadataArgs { canister_id: p, name: "candid:service".into() })
+                .into_future();
+            if let Ok(r) = self.sent(&mgmt, "canister_metadata", meta).await {
+                if let Ok(m) = r.candid::<MetadataResult>() {
+                    return String::from_utf8(m.value).map_err(|_| "candid:service is not UTF-8".to_string());
+                }
+            }
+            let hack = Call::bounded_wait(p, "__get_candid_interface_tmp_hack").into_future();
+            let reply = self.sent(&p, "__get_candid_interface_tmp_hack", hack).await.map_err(|e| e.to_string())?;
+            reply.candid::<String>().map_err(|e| e.to_string())
         }
 
         async fn service(&self, p: &Principal) -> Result<Rc<Service>, String> {
@@ -383,22 +461,6 @@ mod ic {
         value: Vec<u8>,
     }
 
-    /// 1. management `canister_metadata` (reads the public `candid:service` section; not on
-    ///    every replica yet), 2. the `__get_candid_interface_tmp_hack` query that Motoko and
-    ///    many Rust canisters export.
-    async fn fetch_did(p: Principal) -> Result<String, String> {
-        let meta = Call::bounded_wait(Principal::management_canister(), "canister_metadata")
-            .with_arg(MetadataArgs { canister_id: p, name: "candid:service".into() })
-            .await;
-        if let Ok(r) = meta {
-            if let Ok(m) = r.candid::<MetadataResult>() {
-                return String::from_utf8(m.value).map_err(|_| "candid:service is not UTF-8".to_string());
-            }
-        }
-        let reply = Call::bounded_wait(p, "__get_candid_interface_tmp_hack").await.map_err(|e| e.to_string())?;
-        reply.candid::<String>().map_err(|e| e.to_string())
-    }
-
     fn parse_principal(id: &str) -> Result<Principal, String> {
         let mut shown = id.to_string();
         truncate(&mut shown, 80);
@@ -422,7 +484,8 @@ mod ic {
                 return Err(e); // failed moments ago: don't send the same messages again
             }
             self.reserve(&p, None)?;
-            let fetched = fetch_did(p)
+            let fetched = self
+                .fetch_did(p)
                 .await
                 .and_then(|did| match did.len() {
                     n if n > MAX_DID_BYTES => Err(format!("interface is {n} bytes, over the {MAX_DID_BYTES}-byte limit")),
@@ -462,7 +525,7 @@ mod ic {
                 Some(secs) => Call::bounded_wait(p, method).change_timeout(secs),
                 None => Call::unbounded_wait(p, method),
             };
-            let reply = call.with_raw_args(&enc.bytes).await.map_err(|e| {
+            let reply = self.sent(&p, method, call.with_raw_args(&enc.bytes).into_future()).await.map_err(|e| {
                 let unknown = self.call_timeout.is_some() && !e.is_clean_reject();
                 format!("call {p}.{method} failed: {e}{}", if unknown { " (outcome unknown: the call may have executed)" } else { "" })
             })?;
@@ -523,6 +586,24 @@ pub mod mock {
         fn log(&self, line: String) {
             self.logs.push(line);
         }
+    }
+
+    #[test]
+    fn on_first_pending_fires_once_and_only_if_pending() {
+        use futures::executor::block_on;
+        use std::cell::Cell;
+        let n = Cell::new(0);
+        // Ready on the first poll (a message the system refused): the hook never runs.
+        assert_eq!(block_on(on_first_pending(async { 7 }, || n.set(n.get() + 1))), 7);
+        assert_eq!(n.get(), 0);
+        // Pending first (the message was accepted): the hook runs exactly once.
+        let twice = async {
+            YieldOnce(false).await;
+            YieldOnce(false).await;
+            8
+        };
+        assert_eq!(block_on(on_first_pending(twice, || n.set(n.get() + 1))), 8);
+        assert_eq!(n.get(), 1);
     }
 
     /// Like MockBridge, but every call suspends once, as an inter-canister await does,

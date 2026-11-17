@@ -55,14 +55,18 @@ pub struct AllowedMethods(pub Vec<String>);
 
 #[derive(CandidType, Deserialize, Clone, Debug, PartialEq)]
 pub enum AuditStatus {
-    /// Written before a script's first outbound message. A run whose entries are only
-    /// `Started`/`Call` has no final entry (yet): it is still waiting on a reply, or it
-    /// ended without one because the canister trapped after the message went out. Treat
-    /// it as pending or unknown; `get_policy().pending_run_ids` lists the runs in flight.
+    /// Written as a script's first outbound message is handed to the system. A run whose
+    /// entries are only `Started`/`Call` has no closing entry (yet). Normally that means it
+    /// is still waiting on a reply (`get_policy().pending_run_ids` lists those). A run
+    /// that trapped gets a `Trapped` entry. If neither applies, treat it as unknown.
     Started,
-    /// Written before each later outbound message of the run. Like `Started`, it is
-    /// committed when the message is sent, so it stays even if the run never finishes.
+    /// Written for each later outbound message of the run. Like `Started`, it is
+    /// committed together with the message it describes, so it stays even if the run
+    /// never finishes.
     Call,
+    /// The canister trapped while handling a reply, after messages had gone out. Written
+    /// during cleanup, in place of the final entry that the trap rolled back.
+    Trapped,
     Ok,
     Error,
     PolicyViolation,
