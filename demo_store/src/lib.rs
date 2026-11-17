@@ -4,7 +4,10 @@
 //!
 //! State is heap-only and reseeded on every install/upgrade — it's demo data.
 //! There is no access control: anyone can call the writes. Deploy it on a local network
-//! only.
+//! only. Orders are capped at 1,000, cancelled ones included, and nothing frees a slot:
+//! anyone (scripts through icp_code_mode too) can fill the store, after which
+//! `create_order` returns `StoreFull` for everyone until the next install or upgrade
+//! reseeds it.
 
 use candid::{CandidType, Deserialize, Nat, Principal};
 use std::cell::RefCell;

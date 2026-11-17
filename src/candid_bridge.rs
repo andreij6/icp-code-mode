@@ -239,10 +239,10 @@ fn key_matches(k: &str, label: &Label) -> bool {
 }
 
 fn field_value<'a>(obj: &'a Map<String, Value>, label: &Label) -> Option<&'a Value> {
-    if let Label::Named(n) = label {
-        if let Some(v) = obj.get(n) {
-            return Some(v); // the common case, without a scan
-        }
+    if let Label::Named(n) = label
+        && let Some(v) = obj.get(n)
+    {
+        return Some(v); // the common case, without a scan
     }
     obj.iter().find(|(k, _)| key_matches(k, label)).map(|(_, v)| v)
 }

@@ -247,7 +247,7 @@ fn rate_limited(token_hash: &str) -> Option<String> {
 fn rate_check(token_hash: &str, minute: u64) -> Option<String> {
     let limit = policy::limits().tool_calls_per_minute.unwrap_or(policy::DEFAULT_TOOL_CALLS_PER_MINUTE);
     let used = RATE.with(|r| r.borrow().get(token_hash).filter(|(m, _)| *m == minute).map_or(0, |(_, n)| *n));
-    (used >= limit).then(|| format!("rate limited: at most {limit} tool calls per minute per token; retry in a minute"))
+    (used >= limit).then(|| format!("rate limited: at most {limit} update calls per minute per token; retry in a minute"))
 }
 
 fn rate_count(token_hash: &str, minute: u64) {
@@ -317,10 +317,10 @@ async fn run_script(caller_hash: &str, call: ToolCall) -> serde_json::Value {
     let bridge = IcBridge::new(caller.clone(), call.language.as_str(), script_sha256.clone());
     let mut out = LanguageRouter::execute(call.language, &call.code, &bridge).await;
     // A result too big to send is an error, and recorded as one.
-    if let Ok(v) = &out {
-        if let Err(e) = mcp::result_text(v.clone()) {
-            out = Err(e);
-        }
+    if let Ok(v) = &out
+        && let Err(e) = mcp::result_text(v.clone())
+    {
+        out = Err(e);
     }
     let instructions = bridge.instructions_used();
     let max = policy::limits().max_instructions;
@@ -624,7 +624,7 @@ mod tests {
             assert!(rate_check("a", 5).is_none());
             rate_count("a", 5);
         }
-        assert!(rate_check("a", 5).unwrap().contains("rate limited"));
+        assert!(rate_check("a", 5).unwrap().contains("rate limited: at most 2 update calls"));
         assert!(rate_check("b", 5).is_none(), "per token");
         assert!(rate_check("a", 6).is_none(), "per minute");
         rate_count("a", 6);

@@ -316,8 +316,9 @@ fn classify(msg: &Value) -> Msg {
     let method = msg.get("method").and_then(Value::as_str);
     let valid = msg.get("jsonrpc").and_then(Value::as_str) == Some("2.0") && method.is_some() && id.as_ref().is_none_or(valid_id);
     if !valid {
-        // Responses from the client (e.g. to server requests) carry no method: ignore them.
-        if method.is_none() && (msg.get("result").is_some() || msg.get("error").is_some()) {
+        // Responses from the client (e.g. to server requests) carry no method key: ignore
+        // them. A non-string or null `method` is an invalid request, not a response.
+        if msg.get("method").is_none() && (msg.get("result").is_some() || msg.get("error").is_some()) {
             return Msg::Done(None);
         }
         // Echo the id only if it is a valid one (JSON-RPC: null when undeterminable).
@@ -486,8 +487,9 @@ pub fn may_upgrade(req: &HttpUpdateRequest, certified: bool) -> Option<String> {
 
 /// Update path: everything, including tool execution via `exec(caller_hash, request)`,
 /// which must return a `CallToolResult` value. Unless `certified`, a request with no
-/// valid tool call is refused: the query answers it for free, and canister callers (which
-/// skip `inspect_message`) must not get unrecorded work done here.
+/// `tools/call` at all is refused: the query answers it for free. Invalid calls are still
+/// answered here (-32602 with their id), so canister callers get the same errors as the
+/// query; every authenticated update is rate-counted by the caller.
 pub async fn http_update(req: &HttpUpdateRequest, certified: bool, exec: impl AsyncFn(&str, ToolRequest) -> Value) -> HttpResponse {
     let caller = match authenticate(&req.method, &req.url, &req.headers) {
         Ok(h) => h,
@@ -497,7 +499,7 @@ pub async fn http_update(req: &HttpUpdateRequest, certified: bool, exec: impl As
         Ok(x) => x,
         Err(r) => return r,
     };
-    if !certified && !has_tool_call(&msgs) {
+    if !certified && !msgs.iter().any(|m| m.get("method").and_then(Value::as_str) == Some("tools/call")) {
         return HttpResponse::json(400, &rpc_error(Value::Null, -32600, "nothing in this request needs an update call; send it as a query"));
     }
     let mut replies = vec![];
@@ -675,8 +677,13 @@ mod tests {
     #[test]
     fn tools_call_bad_params_are_protocol_errors() {
         setup();
-        let call = |args: Value, name: &str| body(&query(json!({ "jsonrpc": "2.0", "id": 9, "method": "tools/call",
-            "params": { "name": name, "arguments": args } })));
+        // Same answer from the query and the update (canister callers use the latter).
+        let call = |args: Value, name: &str| {
+            let msg = json!({ "jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": { "name": name, "arguments": args } });
+            let (q, u) = (body(&query(msg.clone())), body(&update(msg)));
+            assert_eq!(q, u);
+            u
+        };
         assert_eq!(call(json!({ "code": "1" }), "other")["error"]["code"], -32602);
         assert_eq!(call(json!({}), TOOL_NAME)["error"]["code"], -32602);
         assert_eq!(call(json!({ "code": "1", "language": "cobol" }), TOOL_NAME)["error"]["code"], -32602);
@@ -703,8 +710,13 @@ mod tests {
         let ping = json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" });
         let r = update(ping.clone());
         assert_eq!((r.status_code, body(&r)["error"]["code"].clone()), (400, json!(-32600)));
+        // An invalid call is still answered with its own -32602, not refused.
         let bad_call = json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {} });
-        assert_eq!(update(json!([bad_call, ping.clone()])).status_code, 400);
+        let b = body(&update(json!([bad_call, ping.clone()])));
+        assert_eq!((b[0]["id"].clone(), b[0]["error"]["code"].clone(), b[1]["result"].clone()), (json!(2), json!(-32602), json!({})));
+        // A tools/call notification gets 202 in both paths.
+        let note = json!({ "jsonrpc": "2.0", "method": "tools/call", "params": {} });
+        assert_eq!((update(note.clone()).status_code, query(note).status_code), (202, 202));
         assert_eq!(body(&update_with(ping, true))["result"], json!({}));
     }
 
@@ -941,6 +953,13 @@ mod tests {
         // Finding 169: a message with a method is a request even if it carries `result`.
         let b = body(&query(json!({ "jsonrpc": "2.0", "id": null, "method": "ping", "result": 0 })));
         assert_eq!((b["id"].clone(), b["error"]["code"].clone()), (Value::Null, json!(-32600)));
+        // A non-string or null `method` is invalid too, not a response to drop.
+        for m in [json!(5), Value::Null] {
+            let b = body(&query(json!({ "jsonrpc": "2.0", "id": 1, "method": m, "result": 0 })));
+            assert_eq!((b["id"].clone(), b["error"]["code"].clone()), (json!(1), json!(-32600)));
+        }
+        let b = body(&query(json!({ "jsonrpc": "2.0", "id": 1, "method": null, "error": {} })));
+        assert_eq!(b["error"]["code"], -32600);
 
         // Empty batch returns -32600 in both query and update.
         assert_eq!(body(&query(json!([])))["error"]["code"], -32600);
@@ -956,7 +975,7 @@ mod tests {
         assert_eq!(block_on(http_update(&unauth, false, async |_, _| json!({}))).status_code, 401);
 
         // Unknown or malformed arguments are refused (the schemas forbid extra keys).
-        let call_tool = |name: &str, args: Value| body(&query(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        let call_tool = |name: &str, args: Value| body(&update(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": { "name": name, "arguments": args } })));
         let call = |args: Value| call_tool(TOOL_NAME, args);
         assert!(call(json!({ "code": "1", "langauge": "rhai" }))["error"]["message"].as_str().unwrap().contains("unknown argument"));
