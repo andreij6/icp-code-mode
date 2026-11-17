@@ -77,6 +77,7 @@ MCP client ──POST /mcp──▶ HTTP gateway ──▶ http_request (query)
 | `src/mcp.rs` | JSON-RPC 2.0 router (`initialize`, `notifications/initialized`, `ping`, `tools/list`, `tools/call`, batches), bearer auth |
 | `src/bridge.rs` | `HostBridge` trait (shared by all runtimes) and `IcBridge` (policy → Candid fetch → call → decode) |
 | `src/candid_bridge.rs` | `.did` parsing (`candid_parser`) and type-directed `serde_json::Value` ⇄ `IDLValue` conversion |
+| `src/demo.html` | Demo UI served at `GET /` |
 | `src/search.rs` | `search_icp_canisters`: allowlist × interface → filtered signatures and referenced type definitions |
 | `src/policy.rs` | Stable-memory guardrails: allowlist, limits, SHA-256 token hashes, append-only audit log |
 | `src/runtimes/` | `LanguageRouter` + `js.rs` (Boa), `python.rs` (Monty), `rhai_rt.rs` (Rhai) |
@@ -153,6 +154,23 @@ Use `vec {"*"}` to allow every method of a canister. The other admin endpoints a
 - `revoke_api_token_hash`
 - `set_candid_override(principal, opt text)`
 - `get_policy`, `get_audit_logs(offset, limit)`, `get_audit_log_len`
+
+## Demo page
+
+The canister serves a demo UI at `GET /`:
+- local: `http://icp_code_mode.local.localhost:8010/`
+- mainnet: `https://<canister-id>.icp0.io/`
+
+Paste the bearer token, then use the buttons:
+- **Initialize** and **List tools**
+- **Search**, with optional keywords
+- **Execute**, with five ready-made scripts: a JS ledger overview, Python balance, Python
+  batching with `asyncio.gather`, a Rhai interface read, and a call that policy blocks
+
+Each button sends a real JSON-RPC request to `POST /mcp` and shows the result, the console
+output and the raw request/response pair. The page contains no secrets. The token stays in
+your browser's localStorage and is sent only as the `Authorization` header.
+The page is `src/demo.html`, compiled into the Wasm with `include_str!`.
 
 ## curl examples (local)
 

@@ -299,10 +299,25 @@ fn finish(replies: Vec<Value>, batch: bool) -> HttpResponse {
     }
 }
 
+/// Demo UI (no secrets inside; it asks for the token and calls `POST /mcp`).
+const DEMO_HTML: &str = include_str!("demo.html");
+
+fn demo_page(method: &str, url: &str) -> Option<HttpResponse> {
+    let path = url.split(['?', '#']).next().unwrap_or("");
+    (method.eq_ignore_ascii_case("GET") && matches!(path, "/" | "/demo")).then(|| {
+        let mut r = HttpResponse::new(200, DEMO_HTML.as_bytes().to_vec(), Some("text/html; charset=utf-8"));
+        r.headers.push(("cache-control".into(), "no-cache".into()));
+        r
+    })
+}
+
 /// Query path: answer read-only methods. `search(args)` answers a search from cached
 /// state, or returns `None` when an interface must be fetched first. Anything that
 /// needs an update (scripts, such searches) upgrades the whole request.
 pub fn http_query(req: &HttpRequest, search: impl Fn(&SearchArgs) -> Option<Value>) -> HttpResponse {
+    if let Some(page) = demo_page(&req.method, &req.url) {
+        return page;
+    }
     if let Err(r) = authenticate(&req.method, &req.url, &req.headers) {
         return r;
     }
@@ -541,6 +556,17 @@ mod tests {
             "params": { "name": SEARCH_TOOL_NAME, "arguments": { "query": 7 } } });
         let r = query(bad);
         assert_eq!((r.upgrade, body(&r)["error"]["code"].clone()), (None, json!(-32602)));
+    }
+
+    #[test]
+    fn demo_page_is_served_without_auth() {
+        let get = |url: &str| http_query(&HttpRequest { method: "GET".into(), url: url.into(), headers: vec![], ..mk_req() }, mock_search);
+        let r = get("/");
+        assert_eq!(r.status_code, 200);
+        assert!(r.headers.contains(&("content-type".into(), "text/html; charset=utf-8".into())));
+        assert!(std::str::from_utf8(&r.body).unwrap().contains("search_icp_canisters"));
+        assert_eq!(get("/demo?x").status_code, 200);
+        assert_eq!(get("/mcp").status_code, 405); // MCP endpoint itself is unchanged
     }
 
     #[test]

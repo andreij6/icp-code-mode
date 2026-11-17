@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ICP Code Mode Demo</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --panel: #ffffff; --text: #1d1d1f; --muted: #6b6b70; --line: #e3e3e0;
+    --accent: #3b5bdb; --accent-text: #ffffff; --ok: #2b8a3e; --err: #c92a2a; --code: #f1f1ee;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #141416; --panel: #1c1c1f; --text: #ececf0; --muted: #9a9aa3; --line: #2e2e33;
+      --accent: #748ffc; --accent-text: #0b0b0d; --ok: #69db7c; --err: #ff8787; --code: #232327;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 980px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  h2 { font-size: 15px; margin: 0 0 12px; }
+  p.lead { color: var(--muted); margin: 0 0 20px; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+  label { font-size: 13px; color: var(--muted); display: block; margin-bottom: 4px; }
+  input, select, textarea { width: 100%; font: inherit; color: var(--text); background: var(--bg);
+         border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; }
+  textarea { font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; min-height: 190px; resize: vertical; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
+  .row > .grow { flex: 1 1 220px; }
+  button { font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--text);
+           border-radius: 6px; padding: 8px 14px; cursor: pointer; }
+  button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 600; }
+  button:disabled { opacity: .55; cursor: progress; }
+  .chips { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+  .status { font-size: 13px; color: var(--muted); margin-left: auto; }
+  .status.ok { color: var(--ok); } .status.err { color: var(--err); }
+  pre { background: var(--code); border-radius: 6px; padding: 12px; margin: 8px 0 0; overflow: auto;
+        max-height: 420px; font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; word-break: break-word; }
+  .out-label { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin-top: 12px; }
+  details summary { cursor: pointer; color: var(--muted); font-size: 13px; margin-top: 12px; }
+  .hint { font-size: 13px; color: var(--muted); margin-top: 6px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>ICP Code Mode</h1>
+  <p class="lead">An MCP server running inside this canister. Each button sends a real JSON-RPC request to <code>POST /mcp</code>.</p>
+
+  <section>
+    <h2>1. Connect</h2>
+    <div class="row">
+      <div class="grow">
+        <label for="token">Bearer token</label>
+        <input id="token" type="password" autocomplete="off" placeholder="Paste the API token (MCP_TOKEN in .env)">
+      </div>
+      <button id="btn-init" class="primary">Initialize</button>
+      <button id="btn-list">List tools</button>
+    </div>
+    <div class="hint">The token stays in this browser (localStorage). Only its SHA-256 hash is stored on-chain.</div>
+  </section>
+
+  <section>
+    <h2>2. Search: what may scripts call?</h2>
+    <div class="row">
+      <div class="grow">
+        <label for="q">Keywords (optional)</label>
+        <input id="q" placeholder="e.g. balance">
+      </div>
+      <button id="btn-search" class="primary">Search</button>
+    </div>
+  </section>
+
+  <section>
+    <h2>3. Execute a script</h2>
+    <div class="chips" id="examples"></div>
+    <div class="row" style="margin-bottom:10px">
+      <div style="flex:0 0 180px">
+        <label for="lang">Language</label>
+        <select id="lang"><option value="javascript">JavaScript</option><option value="python">Python</option><option value="rhai">Rhai</option></select>
+      </div>
+      <button id="btn-run" class="primary">Run script</button>
+    </div>
+    <textarea id="code" spellcheck="false"></textarea>
+  </section>
+
+  <section>
+    <div class="row"><h2 style="margin:0">Result</h2><span id="status" class="status">Nothing sent yet</span></div>
+    <div class="out-label">Result</div>
+    <pre id="result">Click a button above.</pre>
+    <div id="console-wrap" hidden>
+      <div class="out-label">Console output</div>
+      <pre id="console"></pre>
+    </div>
+    <details><summary>Raw JSON-RPC exchange</summary><pre id="raw"></pre></details>
+  </section>
+</main>
+<script>
+const LEDGER = "ryjl3-tyaaa-aaaaa-aaaba-cai";
+const EXAMPLES = [
+  { name: "Ledger overview (JS)", lang: "javascript", code:
+`// Four calls sent concurrently in one round.
+const L = "${LEDGER}";
+const [symbol, decimals, supply, meta] = await Promise.all([
+  icp.call(L, "icrc1_symbol", null),
+  icp.call(L, "icrc1_decimals", null),
+  icp.call(L, "icrc1_total_supply", null),
+  icp.call(L, "icrc1_metadata", null),
+]);
+console.log("metadata keys:", meta.map(([k]) => k).join(", "));
+return { symbol, decimals, total_supply: supply,
+         total_supply_whole: (BigInt(supply) / 10n ** BigInt(decimals)).toString() };` },
+  { name: "Balance (Python)", lang: "python", code:
+`L = "${LEDGER}"
+me = icp.principal()
+bal = icp.call(L, "icrc1_balance_of", {"owner": me, "subaccount": None})
+print("checked balance of", me)
+{"canister": me, "balance_e8s": bal}` },
+  { name: "Batch with gather (Python)", lang: "python", code:
+`import asyncio
+L = "${LEDGER}"
+sym, dec = await asyncio.gather(icp.call_async(L, "icrc1_symbol"), icp.call_async(L, "icrc1_decimals"))
+meta = icp.call(L, "icrc1_metadata")
+{"symbol": sym, "decimals": dec, "metadata": {k: v for k, v in meta}}` },
+  { name: "Interface (Rhai)", lang: "rhai", code:
+`let L = "${LEDGER}";
+let did = icp::candid(L);
+let sym = icp::call_canister(L, "icrc1_symbol");
+print("interface is " + did.len() + " bytes");
+#{ symbol: sym, me: icp::principal() }` },
+  { name: "Blocked by policy (JS)", lang: "javascript", code:
+`// icrc1_transfer is not on the allowlist: refused before any message is sent.
+return await icp.call("${LEDGER}", "icrc1_transfer",
+  { to: { owner: "aaaaa-aa", subaccount: null }, amount: 1,
+    fee: null, memo: null, from_subaccount: null, created_at_time: null });` },
+];
+
+const $ = (id) => document.getElementById(id);
+const store = {
+  get(k) { try { return localStorage.getItem(k) || ""; } catch { return ""; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+};
+$("token").value = store.get("icp-code-mode-token");
+$("token").addEventListener("change", () => store.set("icp-code-mode-token", $("token").value.trim()));
+
+let nextId = 1;
+async function rpc(method, params) {
+  const token = $("token").value.trim();
+  store.set("icp-code-mode-token", token);
+  const body = { jsonrpc: "2.0", id: nextId++, method, ...(params ? { params } : {}) };
+  document.querySelectorAll("button").forEach((b) => (b.disabled = true));
+  setStatus("Waiting for the canister…", "");
+  const t0 = performance.now();
+  try {
+    const res = await fetch("/mcp", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Accept": "application/json, text/event-stream",
+                 "Authorization": "Bearer " + token },
+      body: JSON.stringify(body),
+    });
+    const ms = Math.round(performance.now() - t0);
+    const text = await res.text();
+    let json = null;
+    try { json = JSON.parse(text); } catch {}
+    $("raw").textContent = "→ " + JSON.stringify(body, null, 2) + "\n\n← HTTP " + res.status + "\n" + (json ? JSON.stringify(json, null, 2) : text);
+    return { res, json, text, ms };
+  } catch (e) {
+    setStatus("Network error: " + e.message, "err");
+    $("result").textContent = String(e);
+    return null;
+  } finally {
+    document.querySelectorAll("button").forEach((b) => (b.disabled = false));
+  }
+}
+
+function setStatus(text, cls) { $("status").textContent = text; $("status").className = "status " + cls; }
+function pretty(s) { try { return JSON.stringify(JSON.parse(s), null, 2); } catch { return s; } }
+
+function show(r, label) {
+  if (!r) return;
+  const { res, json, text, ms } = r;
+  $("console-wrap").hidden = true;
+  if (res.status === 401) { setStatus("401: missing or wrong token", "err"); $("result").textContent = text; return; }
+  if (!json) { setStatus("HTTP " + res.status, res.ok ? "ok" : "err"); $("result").textContent = text || "(empty body)"; return; }
+  if (json.error) { setStatus(label + ": JSON-RPC error " + json.error.code + " · " + ms + " ms", "err"); $("result").textContent = json.error.message; return; }
+  const result = json.result;
+  if (result && Array.isArray(result.content)) {
+    const [main, ...rest] = result.content;
+    $("result").textContent = pretty(main ? main.text : "");
+    const logs = rest.map((c) => c.text.replace(/^\[console output\]\n/, "")).join("\n");
+    if (logs) { $("console").textContent = logs; $("console-wrap").hidden = false; }
+    setStatus(label + (result.isError ? ": tool error" : ": ok") + " · " + ms + " ms", result.isError ? "err" : "ok");
+  } else {
+    $("result").textContent = JSON.stringify(result, null, 2);
+    setStatus(label + ": ok · " + ms + " ms", "ok");
+  }
+}
+
+$("btn-init").onclick = async () => show(await rpc("initialize", {
+  protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "demo-page", version: "1" } }), "initialize");
+$("btn-list").onclick = async () => {
+  const r = await rpc("tools/list");
+  if (r && r.json && r.json.result) {
+    r.json.result = r.json.result.tools.map((t) => ({ name: t.name, inputSchema: t.inputSchema }));
+  }
+  show(r, "tools/list");
+};
+$("btn-search").onclick = async () => {
+  const q = $("q").value.trim();
+  show(await rpc("tools/call", { name: "search_icp_canisters", arguments: q ? { query: q } : {} }), "search");
+};
+$("btn-run").onclick = async () => show(await rpc("tools/call", {
+  name: "execute_icp_script", arguments: { language: $("lang").value, code: $("code").value } }), "execute");
+
+EXAMPLES.forEach((ex, i) => {
+  const b = document.createElement("button");
+  b.textContent = ex.name;
+  b.onclick = () => { $("lang").value = ex.lang; $("code").value = ex.code; };
+  $("examples").appendChild(b);
+  if (i === 0) b.onclick();
+});
+</script>
+</body>
+</html>
