@@ -4,6 +4,7 @@
 # select the embedded runtimes. Default: all-in-one router (js + python + rhai).
 # For a dedicated worker, copy the entry, rename it, and build with e.g.
 #   cargo build ... --no-default-features --features rhai --target-dir target/rhai
+# and copy target/rhai/wasm32-unknown-unknown/release/icp_code_mode.wasm.
 canisters:
   - name: icp_code_mode
     build:
@@ -11,11 +12,13 @@ canisters:
         - type: script
           commands:
             - "command -v ic-wasm >/dev/null 2>&1 || { echo >&2 'ic-wasm not found, see https://github.com/dfinity/ic-wasm'; exit 1; }"
-            - cargo build --package icp_code_mode --target wasm32-unknown-unknown --release --locked
+            # --target-dir pins where the wasm lands, whatever CARGO_TARGET_DIR says.
+            - cargo build --package icp_code_mode --target wasm32-unknown-unknown --release --locked --target-dir target
             - cp target/wasm32-unknown-unknown/release/icp_code_mode.wasm "$ICP_WASM_OUTPUT_PATH"
             - ic-wasm "$ICP_WASM_OUTPUT_PATH" -o "$ICP_WASM_OUTPUT_PATH" metadata candid:service -f icp_code_mode.did -v public
             - ic-wasm "$ICP_WASM_OUTPUT_PATH" -o "$ICP_WASM_OUTPUT_PATH" shrink
-    # `opt InitArgs`; tokens and allowlist can also be managed after deploy (see README).
+    # `opt InitArgs`, applied at install only (an upgrade ignores it, so it cannot bring
+    # back revoked tokens); tokens and allowlist are managed after deploy (see README).
     init_args: "(null)"
 
   # Demo target: a small store with 10 methods and seeded data (see demo_store/).
@@ -25,7 +28,7 @@ canisters:
       steps:
         - type: script
           commands:
-            - cargo build --package demo_store --target wasm32-unknown-unknown --release --locked
+            - cargo build --package demo_store --target wasm32-unknown-unknown --release --locked --target-dir target
             - cp target/wasm32-unknown-unknown/release/demo_store.wasm "$ICP_WASM_OUTPUT_PATH"
             - ic-wasm "$ICP_WASM_OUTPUT_PATH" -o "$ICP_WASM_OUTPUT_PATH" metadata candid:service -f demo_store/demo_store.did -v public
             - ic-wasm "$ICP_WASM_OUTPUT_PATH" -o "$ICP_WASM_OUTPUT_PATH" shrink

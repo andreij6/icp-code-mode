@@ -18,6 +18,10 @@ type Mem = VirtualMemory<DefaultMemoryImpl>;
 pub const DEFAULT_MAX_CALLS: u32 = 25;
 /// Default instruction budget per script (IC hard limit for an update is 40B).
 pub const DEFAULT_MAX_INSTRUCTIONS: u64 = 20_000_000_000;
+/// Call timeout when `Limits::call_timeout_seconds` is `null`.
+pub const DEFAULT_CALL_TIMEOUT_SECONDS: u32 = 300;
+/// Default for `Limits::tool_calls_per_minute`.
+pub const DEFAULT_TOOL_CALLS_PER_MINUTE: u32 = 120;
 /// Hard cap on entries returned by one `get_audit_logs` page.
 pub const MAX_AUDIT_PAGE: u64 = 100;
 
@@ -25,17 +29,22 @@ pub const MAX_AUDIT_PAGE: u64 = 100;
 pub struct Limits {
     pub max_calls_per_script: u32,
     /// Checked against `call_context_instruction_counter()` before every call and after the run.
+    /// At most 30B (larger values are stored as 30B).
     pub max_instructions: u64,
-    /// `null` (default): calls wait for the reply however long it takes (guaranteed
-    /// response), so a target that never answers keeps this canister from stopping and
-    /// upgrading. A number: calls time out after that many seconds (the IC caps it at
-    /// 300); a timed-out call may or may not have executed on the target.
+    /// Seconds a call waits for its reply (1-300, the IC's range; other values are stored
+    /// clamped). `null` (default): 300. A timed-out call may or may not have executed on
+    /// the target; the error says so.
     pub call_timeout_seconds: Option<u32>,
     /// `true`: every MCP request goes through an update call, so responses are certified
     /// by consensus (about 1-2 s each) and the uncertified demo page is disabled.
     /// `null`/`false` (default): initialize, tools/list and cached searches are answered
     /// by fast query calls, which a single malicious node could alter.
     pub certified_reads: Option<bool>,
+    /// Tool calls each bearer token may make per minute (on the update path). `null`
+    /// (default): 120. Over the limit, requests are refused before they run, so nothing is
+    /// spent and nothing is logged. This bounds how fast one token can spend cycles and
+    /// grow the audit log.
+    pub tool_calls_per_minute: Option<u32>,
 }
 
 impl Default for Limits {
@@ -45,6 +54,7 @@ impl Default for Limits {
             max_instructions: DEFAULT_MAX_INSTRUCTIONS,
             call_timeout_seconds: None,
             certified_reads: None,
+            tool_calls_per_minute: None,
         }
     }
 }
@@ -91,8 +101,8 @@ pub struct AuditEntry {
     /// runs of the same script (one finished, one not), and runs interleave across awaits.
     /// `None` only on entries written before this field existed.
     pub run_id: Option<u64>,
-    /// Outbound messages as `canister.method` (`canister.<candid interface>` for an
-    /// interface fetch), in order. On a `Started`/`Call` entry: the one message about to
+    /// Outbound messages as `canister.method`, in order. Interface fetches appear as
+    /// `aaaaa-aa.canister_metadata(<target>)` and `<target>.__get_candid_interface_tmp_hack`. On a `Started`/`Call` entry: the one message about to
     /// be sent. On a final entry: all of them. `None` on entries from before this field.
     pub methods: Option<Vec<String>>,
 }
@@ -146,7 +156,18 @@ pub fn limits() -> Limits {
     LIMITS.with(|c| c.borrow().get().clone())
 }
 
-pub fn set_limits(l: Limits) {
+/// Highest `max_instructions` accepted. Budgets are checked between steps, not on every
+/// instruction, and one step can be large; this leaves 10B of headroom under the IC's 40B
+/// per-message limit, so the budget error fires before the IC traps. It is also the
+/// Python VM's per-turn limit, so no single turn can run past it.
+pub const MAX_INSTRUCTIONS_CAP: u64 = 30_000_000_000;
+
+/// Stores `l` with out-of-range values clamped: `max_instructions` to
+/// `MAX_INSTRUCTIONS_CAP`, `call_timeout_seconds` to 1..=300 (the IC's range).
+/// `get_policy` shows the values in effect.
+pub fn set_limits(mut l: Limits) {
+    l.max_instructions = l.max_instructions.min(MAX_INSTRUCTIONS_CAP);
+    l.call_timeout_seconds = l.call_timeout_seconds.map(|s| s.clamp(1, 300));
     LIMITS.with(|c| c.borrow_mut().set(l));
 }
 
@@ -175,8 +196,10 @@ pub fn authorize(
     limits: &Limits,
 ) -> Result<(), String> {
     let methods = allowed.ok_or_else(|| format!("policy: canister {canister} is not allowlisted"))?;
+    // Method names come from scripts: escaped, so one cannot read as another sentence.
+    let shown = method.escape_debug();
     if !methods.0.iter().any(|m| m == "*" || m == method) {
-        return Err(format!("policy: method `{method}` on {canister} is not allowlisted"));
+        return Err(format!("policy: method `{shown}` on {canister} is not allowlisted"));
     }
     if calls_made >= limits.max_calls_per_script {
         return Err(format!("policy: call limit of {} per script reached", limits.max_calls_per_script));
@@ -209,6 +232,9 @@ pub fn add_token_hash(sha256_hex: &str, label: String) -> Result<(), String> {
     let h = sha256_hex.trim().to_ascii_lowercase();
     if h.len() != 64 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err("token hash must be 64 hex characters (SHA-256)".into());
+    }
+    if h == self::sha256_hex(b"") {
+        return Err("that is the hash of an empty token".into());
     }
     TOKENS.with(|t| t.borrow_mut().insert(h, label));
     Ok(())
@@ -258,13 +284,29 @@ pub fn audit_len() -> u64 {
 }
 
 /// Newest first: `offset` 0 is the most recent entry.
+/// Bytes of entries one page may return; the IC refuses replies over 2 MiB.
+const MAX_AUDIT_PAGE_BYTES: usize = 1_500_000;
+/// Text kept per field when reading an oversized entry (written before fields were capped).
+const MAX_READ_FIELD_BYTES: usize = 4096;
+
 pub fn audit_page(offset: u64, limit: u64) -> Vec<AuditEntry> {
     AUDIT.with(|l| {
         let l = l.borrow();
         let len = l.len();
+        let mut bytes = 0;
         (0..limit.min(MAX_AUDIT_PAGE))
             .map_while(|i| len.checked_sub(offset.checked_add(i)?.checked_add(1)?))
             .filter_map(|idx| l.get(idx))
+            .map(|mut e| {
+                let cut = |s: &mut String| crate::bridge::truncate(s, MAX_READ_FIELD_BYTES);
+                e.error.as_mut().map(cut);
+                e.violations.iter_mut().for_each(cut);
+                e
+            })
+            .take_while(|e| {
+                bytes += Encode!(e).map_or(0, |b| b.len());
+                bytes <= MAX_AUDIT_PAGE_BYTES
+            })
             .collect()
     })
 }
@@ -382,13 +424,32 @@ mod tests {
         assert_eq!((decoded.id, decoded.run_id, decoded.language.as_str()), (7, None, "rhai"));
         assert_eq!(decoded.methods, None);
 
-        // Same for the stored limits record, which gained two optional settings.
+        // Same for the stored limits record, which gained optional settings.
         #[derive(CandidType)]
         struct OldLimits {
             max_calls_per_script: u32,
             max_instructions: u64,
         }
         let l = <Limits as Storable>::from_bytes(Cow::Owned(Encode!(&OldLimits { max_calls_per_script: 7, max_instructions: 9 }).unwrap()));
-        assert_eq!(l, Limits { max_calls_per_script: 7, max_instructions: 9, call_timeout_seconds: None, certified_reads: None });
+        assert_eq!(l, Limits { max_calls_per_script: 7, max_instructions: 9, ..Limits::default() });
+    }
+
+    #[test]
+    fn interface_fetch_and_overrides_and_token_edge_cases() {
+        let p = Principal::from_text(LEDGER).unwrap();
+        set_limits(Limits::default());
+        assert!(check_interface_fetch(&p, 0, 0).is_err());
+        set_allowed(p, vec![]);
+        assert!(check_interface_fetch(&p, 0, 0).is_ok());
+
+        set_candid_override(p, Some("service : { ping : () -> () }".into()));
+        assert_eq!(candid_override(&p.to_text()).as_deref(), Some("service : { ping : () -> () }"));
+        set_candid_override(p, None);
+        assert!(candid_override(&p.to_text()).is_none());
+
+        assert!(add_token_hash(&"0".repeat(63), "short".into()).is_err());
+        assert!(add_token_hash(&"g".repeat(64), "badhex".into()).is_err());
+        assert!(!revoke_token_hash(&"f".repeat(64)));
+        remove_allowed(p);
     }
 }

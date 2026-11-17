@@ -55,25 +55,28 @@ fn type_text(t: &Type) -> String {
     candid::pretty::candid::pp_ty(t).pretty(usize::MAX).to_string()
 }
 
-/// Named types referenced (transitively) by `ty`.
+/// Named types referenced (transitively) by `ty`. A worklist, not recursion: a chain of
+/// thousands of named types (`type A1 = opt A2; ...`) would overflow the stack.
 fn collect_vars(env: &TypeEnv, ty: &Type, out: &mut BTreeSet<String>) {
-    match ty.as_ref() {
-        TypeInner::Var(name) => {
-            if out.insert(name.clone()) {
-                if let Ok(t) = env.find_type(name) {
-                    collect_vars(env, t, out);
-                }
+    let mut todo = vec![ty.clone()];
+    while let Some(t) = todo.pop() {
+        match t.as_ref() {
+            TypeInner::Var(name) => {
+                if out.insert(name.clone())
+                    && let Ok(t) = env.find_type(name) {
+                        todo.push(t.clone());
+                    }
             }
+            TypeInner::Opt(t) | TypeInner::Vec(t) => todo.push(t.clone()),
+            TypeInner::Record(fs) | TypeInner::Variant(fs) => todo.extend(fs.iter().map(|f| f.ty.clone())),
+            TypeInner::Func(f) => todo.extend(f.args.iter().chain(&f.rets).cloned()),
+            TypeInner::Service(ms) => todo.extend(ms.iter().map(|(_, t)| t.clone())),
+            TypeInner::Class(args, t) => {
+                todo.extend(args.iter().cloned());
+                todo.push(t.clone());
+            }
+            _ => {}
         }
-        TypeInner::Opt(t) | TypeInner::Vec(t) => collect_vars(env, t, out),
-        TypeInner::Record(fs) | TypeInner::Variant(fs) => fs.iter().for_each(|f| collect_vars(env, &f.ty, out)),
-        TypeInner::Func(f) => f.args.iter().chain(&f.rets).for_each(|t| collect_vars(env, t, out)),
-        TypeInner::Service(ms) => ms.iter().for_each(|(_, t)| collect_vars(env, t, out)),
-        TypeInner::Class(args, t) => {
-            args.iter().for_each(|a| collect_vars(env, a, out));
-            collect_vars(env, t, out);
-        }
-        _ => {}
     }
 }
 
@@ -251,4 +254,37 @@ mod tests {
         let out = render(&SearchArgs { query: Some("icrc1".into()), canister_id: None }, &many);
         assert_eq!(out["canisters"].as_array().unwrap().len(), 20);
     }
+
+    #[test]
+    fn collect_vars_covers_func_service_class_and_cycles() {
+        let did = r#"
+            type Node = opt Node;
+            type Pair = record { Node; nat };
+            type Cb = func (Pair) -> (Node);
+            type Svc = service { ping : () -> () };
+            service : (nat) -> {
+              step : (Cb, Svc) -> (Node);
+            }
+        "#;
+        let svc = Service::parse(did).unwrap();
+        let entry = Entry {
+            canister: Principal::from_text(LEDGER).unwrap(),
+            allowed: vec!["*".into()],
+            service: Ok(Some(Rc::new(svc))),
+        };
+        let out = render(&SearchArgs { query: Some("  \t\n ".into()), canister_id: Some(format!("  {LEDGER}  ")) }, &[entry]);
+        let types = out["canisters"][0]["types"].as_object().unwrap();
+        assert!(types.contains_key("Cb"));
+        assert!(types.contains_key("Pair"));
+        assert!(types.contains_key("Node"));
+        assert!(types.contains_key("Svc"));
+
+        // Exercise TypeInner::Class in collect_vars directly.
+        let class_ty = TypeInner::Class(vec![TypeInner::Var("Pair".into()).into()], TypeInner::Var("Svc".into()).into()).into();
+        let mut vars = BTreeSet::new();
+        let raw_svc = Service::parse(did).unwrap();
+        collect_vars(&raw_svc.env, &class_ty, &mut vars);
+        assert!(vars.contains("Pair") && vars.contains("Svc"));
+    }
 }
+

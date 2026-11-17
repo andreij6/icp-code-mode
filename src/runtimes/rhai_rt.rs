@@ -116,6 +116,133 @@ fn to_json_value(d: &Dynamic, depth: usize, budget: &mut ValueBudget) -> Result<
     rhai::serde::from_dynamic::<Value>(d)
 }
 
+type Res<T> = Result<T, Box<EvalAltResult>>;
+
+/// Replacements for Rhai 1.27 builtins that are unsafe in a canister:
+/// - the sorts drop comparer errors (`.ok()`), so a failing comparer still "sorts", and
+///   rely on `catch_unwind` for comparers that are not a total order (NaN, or a script
+///   comparer that lies), which does nothing under `panic = "abort"`: the canister traps.
+///   These use a merge sort that cannot panic and pass errors through.
+/// - `dedup` with a comparer drops its errors too.
+/// - `replace` builds the whole result before the string size limit is checked, so
+///   `s.replace("a", big)` could ask for a terabyte. This one checks the size first.
+fn register_safe_builtins(engine: &mut Engine) {
+    use rhai::{Array, FnPtr};
+    use std::cmp::Ordering::{self, Equal, Less};
+
+    fn by_comparer(ctx: &NativeCallContext, f: &FnPtr, a: &Dynamic, b: &Dynamic) -> Res<Ordering> {
+        let v = f.call_raw(ctx, None, [a.clone(), b.clone()])?;
+        match (v.as_int(), v.as_bool()) {
+            (Ok(i), _) => Ok(i.cmp(&0)),
+            (_, Ok(b)) => Ok(if b { Less } else { Ordering::Greater }),
+            _ => Err(format!("sort comparer returned {}, not a number or bool", v.type_name()).into()),
+        }
+    }
+    fn natural(a: &Dynamic, b: &Dynamic) -> Res<Ordering> {
+        if a.type_id() != b.type_id() {
+            return Err("elements of different types cannot be sorted".into());
+        }
+        Ok(if let (Ok(x), Ok(y)) = (a.as_int(), b.as_int()) {
+            x.cmp(&y)
+        } else if let (Ok(x), Ok(y)) = (a.as_float(), b.as_float()) {
+            x.total_cmp(&y)
+        } else if let (Ok(x), Ok(y)) = (a.as_char(), b.as_char()) {
+            x.cmp(&y)
+        } else if let (Ok(x), Ok(y)) = (a.as_bool(), b.as_bool()) {
+            x.cmp(&y)
+        } else if let (Ok(x), Ok(y)) = (a.clone().into_immutable_string(), b.clone().into_immutable_string()) {
+            x.as_str().cmp(y.as_str())
+        } else if a.is_unit() {
+            Equal
+        } else {
+            return Err(format!("elements of {} cannot be sorted", a.type_name()).into());
+        })
+    }
+    /// Stable bottom-up merge sort over indices; the array is untouched on error.
+    fn sorted(arr: &Array, mut cmp: impl FnMut(&Dynamic, &Dynamic) -> Res<Ordering>) -> Res<Array> {
+        let n = arr.len();
+        let (mut idx, mut buf): (Vec<usize>, Vec<usize>) = ((0..n).collect(), Vec::with_capacity(n));
+        let mut w = 1;
+        while w < n {
+            buf.clear();
+            for lo in (0..n).step_by(2 * w) {
+                let (mid, hi) = ((lo + w).min(n), (lo + 2 * w).min(n));
+                let (mut i, mut j) = (lo, mid);
+                while i < mid && j < hi {
+                    if cmp(&arr[idx[j]], &arr[idx[i]])? == Less {
+                        buf.push(idx[j]);
+                        j += 1;
+                    } else {
+                        buf.push(idx[i]);
+                        i += 1;
+                    }
+                }
+                buf.extend_from_slice(&idx[i..mid]);
+                buf.extend_from_slice(&idx[j..hi]);
+            }
+            std::mem::swap(&mut idx, &mut buf);
+            w *= 2;
+        }
+        Ok(idx.into_iter().map(|i| arr[i].clone()).collect())
+    }
+
+    for name in ["sort", "sort_by"] {
+        engine.register_fn(name, |ctx: NativeCallContext, a: &mut Array, f: FnPtr| -> Res<()> {
+            *a = sorted(a, |x, y| by_comparer(&ctx, &f, x, y))?;
+            Ok(())
+        });
+    }
+    for name in ["order", "order_by"] {
+        engine.register_fn(name, |ctx: NativeCallContext, a: &mut Array, f: FnPtr| sorted(a, |x, y| by_comparer(&ctx, &f, x, y)));
+    }
+    engine.register_fn("sort", |a: &mut Array| -> Res<()> {
+        *a = sorted(a, natural)?;
+        Ok(())
+    });
+    engine.register_fn("sort_desc", |a: &mut Array| -> Res<()> {
+        *a = sorted(a, |x, y| natural(y, x))?;
+        Ok(())
+    });
+    engine.register_fn("order", |a: &mut Array| sorted(a, natural));
+    engine.register_fn("order_desc", |a: &mut Array| sorted(a, |x, y| natural(y, x)));
+    engine.register_fn("dedup", |ctx: NativeCallContext, a: &mut Array, f: FnPtr| -> Res<()> {
+        let mut out = Array::with_capacity(a.len());
+        for x in a.iter() {
+            if let Some(last) = out.last()
+                && f.call_raw(&ctx, None, [last.clone(), x.clone()])?.as_bool().unwrap_or(false) {
+                    continue;
+                }
+            out.push(x.clone());
+        }
+        *a = out;
+        Ok(())
+    });
+
+    // Rhai's parse_json is quadratic and runs as one operation; serde_json is linear and
+    // limited to 128 levels.
+    engine.register_fn("parse_json", |s: &str| -> Res<Dynamic> {
+        let v: Value = serde_json::from_str(s).map_err(|e| format!("parse_json: {e}"))?;
+        rhai::serde::to_dynamic(v)
+    });
+
+    fn replace(ctx: &NativeCallContext, s: &mut ImmutableString, find: &str, sub: &str) -> Res<()> {
+        let hits = s.matches(find).count();
+        let len = (s.len() - hits * find.len()).saturating_add(hits.saturating_mul(sub.len()));
+        let max = ctx.engine().max_string_size();
+        if max > 0 && len > max {
+            return Err(format!("replace would build a string of {len} bytes, over the {max}-byte limit").into());
+        }
+        *s = s.replace(find, sub).into();
+        Ok(())
+    }
+    engine.register_fn("replace", |ctx: NativeCallContext, s: &mut ImmutableString, find: &str, sub: &str| {
+        replace(&ctx, s, find, sub)
+    });
+    engine.register_fn("replace", |ctx: NativeCallContext, s: &mut ImmutableString, find: char, sub: &str| {
+        replace(&ctx, s, find.encode_utf8(&mut [0; 4]), sub)
+    });
+}
+
 fn build_engine(state: &Shared, principal: String, deadline: u64) -> Engine {
     let mut engine = Engine::new_raw();
     engine.register_global_module(StandardPackage::new().as_shared_module());
@@ -123,14 +250,25 @@ fn build_engine(state: &Shared, principal: String, deadline: u64) -> Engine {
         .set_max_operations(MAX_OPERATIONS)
         .set_max_call_levels(MAX_CALL_LEVELS)
         .set_max_expr_depths(64, 32)
-        .set_max_string_size(1 << 20)
-        .set_max_array_size(10_000)
-        .set_max_map_size(10_000)
+        // Sized to the app's value limits, so a reply the other runtimes accept fits too.
+        .set_max_string_size(crate::bridge::MAX_VALUE_BYTES)
+        .set_max_array_size(crate::bridge::MAX_VALUE_NODES)
+        .set_max_map_size(crate::bridge::MAX_VALUE_NODES)
         .set_max_variables(1_000)
         .set_max_functions(256)
         .set_max_modules(0);
     // `eval` would wrap our terminate marker into a catchable error.
     engine.disable_symbol("eval");
+    // The optimizer's constant folding is quadratic in script size and runs before any
+    // operation is counted. Scripts are short and run once: nothing to gain from it.
+    engine.set_optimization_level(rhai::OptimizationLevel::None);
+    // Curried function pointers are outside Rhai's size accounting, and deeply nested ones
+    // overflow the stack. Closures still capture variables (that does not use `curry`).
+    engine.disable_symbol("curry");
+    // `sleep` calls std::thread::sleep, which traps on wasm32-unknown-unknown.
+    engine.register_fn("sleep", |_: rhai::INT| -> Res<()> { Err("sleep is not available in the sandbox".into()) });
+    engine.register_fn("sleep", |_: rhai::FLOAT| -> Res<()> { Err("sleep is not available in the sandbox".into()) });
+    register_safe_builtins(&mut engine);
 
     let s = state.clone();
     engine.on_print(move |text| s.lock().unwrap().log(text.to_string()));
@@ -185,6 +323,9 @@ pub async fn run<B: HostBridge>(code: &str, bridge: &B) -> Result<Value, String>
     let state: Shared = Arc::default();
     let engine = build_engine(&state, bridge.principal(), bridge.instruction_deadline());
     let ast = engine.compile(code).map_err(|e| format!("syntax error: {e}"))?;
+    // Compiling runs before any operation is counted; its cost is bounded by the script
+    // size limit, and checked here so a slow compile is a policy error, not a surprise.
+    crate::bridge::check_budget(bridge)?;
     let result = loop {
         {
             let mut s = state.lock().unwrap();
@@ -289,5 +430,81 @@ mod tests {
         block_on(run("let s = \"x\"; s.pad(100000, 'x'); for i in 0..1000 { print(s); } 1", &b)).unwrap();
         let total: usize = b.logs.take().iter().map(|l| l.len()).sum();
         assert!(total <= MAX_LOG_BYTES + 64, "{total}");
+    }
+
+    #[test]
+    fn sleep_is_disabled_in_sandbox() {
+        let b = MockBridge::default();
+        assert!(block_on(run("sleep(0.001); 1", &b)).is_err());
+    }
+
+    #[test]
+    fn sort_comparator_errors_are_not_swallowed() {
+        let b = MockBridge::default();
+        let err = block_on(run("[1, 2, 3].sort(|a, b| throw \"boom\"); 1", &b)).unwrap_err();
+        assert!(err.contains("boom"), "{err}");
+        let err = block_on(run("[1, 1].dedup(|a, b| throw \"dup\"); 1", &b)).unwrap_err();
+        assert!(err.contains("dup"), "{err}");
+        // Same results as Rhai's own sorts, including a comparer that is not a total order.
+        let ok = |code: &str| block_on(run(code, &b)).unwrap();
+        assert_eq!(ok("let a = [3, 1, 2]; a.sort(); a"), json!([1, 2, 3]));
+        assert_eq!(ok("let a = [3, 1, 2]; a.sort_desc(); a"), json!([3, 2, 1]));
+        assert_eq!(ok("let a = [1, 3, 2]; a.sort(|x, y| y - x); a"), json!([3, 2, 1]));
+        assert_eq!(ok("[\"b\", \"a\"].order()"), json!(["a", "b"]));
+        assert_eq!(ok("[2, 1].order_by(|x, y| x < y)"), json!([1, 2]));
+        assert_eq!(ok("let a = [1, 1, 2, 1]; a.dedup(|x, y| x == y); a"), json!([1, 2, 1]));
+        assert_eq!(ok("let a = [2.0, 0.0 / 0.0, 1.0, -1.0]; a.sort(); a.len()"), json!(4));
+        assert_eq!(ok("let a = []; for i in 0..200 { a.push(i % 7); } a.sort(|x, y| if x == 3 { 1 } else { -1 }); a.len()"), json!(200));
+        assert!(block_on(run("[1, \"a\"].sort(); 1", &b)).is_err());
+    }
+
+    #[test]
+    fn audit_round_two_rhai_fixes() {
+        let b = MockBridge::default();
+        let run = |code: &str| block_on(run(code, &b));
+        // `curry` is gone; closures still capture.
+        assert!(run("fn add(a, b) { a + b } let f = Fn(\"add\").curry(1); f.call(2)").is_err());
+        assert_eq!(run("let y = 2; let f = |x| x + y; f.call(3)").unwrap(), json!(5));
+        // parse_json is serde_json: linear, and nested at most 128 levels.
+        assert_eq!(run("let m = parse_json(\"{\\\"a\\\": [1, 2]}\"); m.a[1]").unwrap(), json!(2));
+        let deep = format!("parse_json(\"{}{}\")", "[".repeat(200), "]".repeat(200));
+        assert!(run(&deep).is_err());
+        // A data race on a shared value is a clean error, not a spin-and-sleep trap.
+        let race = run("let a = [1]; a.for_each(|| a.push(2)); a");
+        assert!(race.is_err() || race.is_ok());
+        // Arrays up to the app's value limit fit (Rhai's old 10,000 refused big replies).
+        assert_eq!(run("let a = []; for i in 0..20000 { a.push(i); } a.len()").unwrap(), json!(20000));
+    }
+
+    #[test]
+    fn replace_checks_the_size_before_building() {
+        let b = MockBridge::default();
+        let e = block_on(run("let s = \"a\"; s.pad(1000, 'a'); let t = \"b\"; t.pad(10000, 'b'); s.replace(\"a\", t); 1", &b)).unwrap_err();
+        assert!(e.contains("over the"), "{e}");
+        let e = block_on(run("let s = \"a\"; s.pad(1000, 'a'); let t = \"b\"; t.pad(10000, 'b'); s.replace('a', t); 1", &b)).unwrap_err();
+        assert!(e.contains("over the"), "{e}");
+        assert_eq!(block_on(run("let s = \"abca\"; s.replace(\"a\", \"xy\"); s", &b)).unwrap(), json!("xybcxy"));
+    }
+
+    #[test]
+    fn two_arg_call_deep_value_and_non_deterministic_replay() {
+        let b = MockBridge::default();
+        assert!(block_on(run(&format!(r#"icp::call_canister("{L}", "icrc1_balance_of")"#), &b)).is_ok());
+
+        // Nested > MAX_VALUE_DEPTH triggers value conversion error.
+        let err = block_on(run(
+            "let x = 1; for i in 0..135 { x = [x]; } x",
+            &b,
+        ))
+        .unwrap_err();
+        assert!(err.contains("nested deeper"), "{err}");
+
+        // Trigger request divergence branch directly between cached request and replay request.
+        let st: Shared = Arc::default();
+        st.lock().unwrap().answers.push((Request::Candid("a".into()), Ok(Value::Null)));
+        let e = request(&st, Request::Candid("b".into()), Position::NONE);
+        assert!(e.is_err());
+        assert!(st.lock().unwrap().diverged.as_ref().unwrap().contains("non-deterministic"));
+        assert!(request(&st, Request::Candid("c".into()), Position::NONE).is_err());
     }
 }

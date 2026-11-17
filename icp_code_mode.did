@@ -2,8 +2,8 @@ type AuditEntry = record {
   id : nat64;
   status : AuditStatus;
   timestamp_ns : nat64;
-  // Outbound messages as `canister.method` (`canister.<candid interface>` for an
-  // interface fetch), in order. On a `Started`/`Call` entry: the one message about to
+  // Outbound messages as `canister.method`, in order. Interface fetches appear as
+  // `aaaaa-aa.canister_metadata(<target>)` and `<target>.__get_candid_interface_tmp_hack`. On a `Started`/`Call` entry: the one message about to
   // be sent. On a final entry: all of them. `None` on entries from before this field.
   methods : opt vec text;
   // Links all entries of one run: the id of the run's `Started` entry, or the entry's
@@ -64,13 +64,18 @@ type InitArgs = record {
   limits : opt Limits;
 };
 type Limits = record {
-  // `null` (default): calls wait for the reply however long it takes (guaranteed
-  // response), so a target that never answers keeps this canister from stopping and
-  // upgrading. A number: calls time out after that many seconds (the IC caps it at
-  // 300); a timed-out call may or may not have executed on the target.
+  // Seconds a call waits for its reply (1-300, the IC's range; other values are stored
+  // clamped). `null` (default): 300. A timed-out call may or may not have executed on
+  // the target; the error says so.
   call_timeout_seconds : opt nat32;
+  // Tool calls each bearer token may make per minute (on the update path). `null`
+  // (default): 120. Over the limit, requests are refused before they run, so nothing is
+  // spent and nothing is logged. This bounds how fast one token can spend cycles and
+  // grow the audit log.
+  tool_calls_per_minute : opt nat32;
   max_calls_per_script : nat32;
   // Checked against `call_context_instruction_counter()` before every call and after the run.
+  // At most 30B (larger values are stored as 30B).
   max_instructions : nat64;
   // `true`: every MCP request goes through an update call, so responses are certified
   // by consensus (about 1-2 s each) and the uncertified demo page is disabled.
@@ -100,8 +105,11 @@ service : (opt InitArgs) -> {
   remove_allowlist : (principal) -> (bool);
   revoke_api_token_hash : (text) -> (bool);
   set_allowlist : (principal, vec text) -> ();
-  // Register (or clear, with `null`) a `.did` for a target that does not expose
-  // `__get_candid_interface_tmp_hack`.
+  // Register (or clear, with `null`) a `.did` for a target. While set it takes precedence:
+  // the target's own interface is not fetched or refreshed. `remove_allowlist` does not
+  // clear it.
   set_candid_override : (principal, opt text) -> (Result);
-  set_limits : (Limits) -> ();
+  // Replaces every field (an omitted `opt` field is `null`, which means its default) and
+  // returns the previous limits.
+  set_limits : (Limits) -> (Limits);
 }

@@ -11,7 +11,9 @@ with two tools:
 
 - **`search_icp_canisters`** — read-only discovery. It lists the allowlisted canisters, their
   allowed methods with Candid signatures, and the types those signatures use, filtered by
-  keywords. It is answered by the query call, so it is fast and free.
+  keywords. Once interfaces are cached it is answered by a query call, fast and free. A search
+  that must first fetch an interface runs as an update call: audited, and limited like a
+  script's calls.
 - **`execute_icp_script`** — instead of dozens of granular tools, the LLM sends one short
   script in **JavaScript**, **Python** or **Rhai**.
 
@@ -157,8 +159,9 @@ icp canister call icp_code_mode set_allowlist '(principal "ryjl3-tyaaa-aaaaa-aaa
 ```
 
 Use `vec {"*"}` to allow every method of a canister. The other admin endpoints are controller-only:
-- `set_limits(record { max_calls_per_script; max_instructions; call_timeout_seconds; certified_reads })`
-  (the last two are optional; see "Options" below)
+- `set_limits(record { max_calls_per_script; max_instructions; call_timeout_seconds; certified_reads; tool_calls_per_minute })`
+  replaces all of them (an omitted optional field means its default) and returns the previous
+  values; see "Options" below
 - `remove_allowlist`
 - `revoke_api_token_hash`
 - `set_candid_override(principal, opt text)`
@@ -237,7 +240,7 @@ Paste the bearer token, then use the buttons:
 
 Each button sends a real JSON-RPC request to `POST /mcp` and shows the result, the console
 output and the raw request/response pair. The page contains no secrets. The token stays in
-your browser's localStorage and is sent only as the `Authorization` header.
+your browser tab's sessionStorage (gone when the tab closes) and is sent only as the `Authorization` header.
 The page is `src/demo.html`, compiled into the Wasm with `include_str!`.
 
 ## curl examples (local)
@@ -364,15 +367,19 @@ How values are encoded:
 |---|---|
 | Allowlist | `Principal → ["method" \| "*"]`, deny by default. Checked before any message is sent, including the interface fetch |
 | Calls per script | 25 (`set_limits`). Counts every `icp.call` attempt that passes policy and every interface fetch that misses the cache. Reserved before the await, so concurrent batches count |
-| Instruction budget | 20B per script, measured from the script's own start. Checked before each host request, between JS rounds, and on every Rhai operation; Python has its own 10B VM budget |
-| Requests | At most 50 messages per JSON-RPC batch. One `execute_icp_script` and five searches per HTTP request (further ones get `-32600`). At most 8 scripts run at once across all requests; more get a "busy" error. JS: at most 64 concurrent requests per round and 64 rounds. Rhai: at most 64 requests |
+| Instruction budget | 20B per script (at most 30B; `set_limits` clamps larger values), measured from the script's own start. Checked before each host request, every 16 JS promise jobs, between JS rounds, and on every Rhai operation; the Python VM stops when it is spent |
+| Rate | 120 tool calls per minute per token (one comparison on the demo page uses up to 17) (`tool_calls_per_minute`). Over the limit, requests are refused before they run: by the query (HTTP 429), by `inspect_message`, and by the update itself |
+| Requests | At most 50 messages per JSON-RPC batch. One `tools/call` per HTTP request, on both routes (further ones get `-32600`). At most 8 scripts run at once across all requests; more get a "busy" error. JS: at most 64 concurrent requests per round and 64 rounds. Rhai: at most 64 requests |
 | Values | Any value leaving a script (result, call arguments, printed values) is limited to 128 levels, 200k elements and 4 MiB of text, in all three languages |
-| JS (Boa) | 1M loop iterations, recursion 256, 100k promise jobs. `Math.random`, `eval`/`Function`, `Atomics`, `SharedArrayBuffer` and `WeakRef` removed. Fixed clock = block time, UTC. `JSON.stringify` is held to the value limits too, replacer included |
-| Python (Monty) | Recursion 200, 64 MiB memory, 256 suspensions. The VM stops when the policy's instruction budget is spent. Fixed `datetime`, zero sleep, seeded `random`, no OS access |
-| Rhai | 1M operations per run, 32 call levels, size limits on strings/arrays/maps. `eval` and modules disabled |
-| Output | Script source ≤ 100 KiB. Captured logs ≤ 64 KiB, enforced while running. Result ≤ 1 MB of *escaped* JSON. Any reply that would exceed 1.9 MB, whatever it contains, is replaced by a small error, so replying can never trap |
+| JS (Boa) | 30M VM steps per run (across all functions, callbacks and promise jobs), 1M loop iterations per loop, recursion 256, 100k promise jobs. `Math.random`, `eval`/`Function`, `Atomics`, `SharedArrayBuffer`, `WeakRef` and `Symbol.for`/`keyFor` removed. A request started and never awaited is an error, not silently dropped. Fixed clock = block time, UTC. `JSON.stringify` is held to the value limits too, replacer included |
+| Python (Monty) | Recursion 200, 64 MiB memory (replies count too), 256 suspensions. The VM stops when the policy's instruction budget is spent, checked between steps and at every suspension. `eval` and `exec` refused. `print` past 64 KiB is cut, as in the other languages. Ints over 100,000 bits are not exported. Fixed `datetime`, zero sleep, seeded `random` (the same sequence every run), no OS access |
+| Rhai | 1M operations per run, 32 call levels, size limits on strings/arrays/maps (`replace` checks the size before building). `eval`, `sleep` and modules disabled. The sorts and `dedup` are replaced by versions that pass comparer errors through and cannot panic |
+| Interfaces | ≤ 512 KiB, type nesting ≤ 256 levels per definition and ≤ 2,000 summed over all definitions, checked before parsing (deeper nesting overflowed the stack). A reply whose types differ from the cached interface in a way Candid would silently turn into `null` is an error, and the cached interface is dropped |
+| Heap | 1 GiB for the whole canister. Python's 64 MiB limit is checked between steps and JavaScript has none, so this ceiling bounds what one built-in call can allocate; past it the message traps and the growth is rolled back |
+| Output | Script source ≤ 16 KiB (compiling is superlinear in size and cannot be interrupted); request body ≤ 128 KiB. Captured logs ≤ 64 KiB, enforced while running. Result ≤ 1 MB of *escaped* JSON; a bigger one is an error (recorded as `Error`), never cut short. Any reply that would exceed 1.9 MB, whatever it contains, is replaced by a small error, so replying can never trap |
 | Audit | Append-only `StableLog`: time, token-hash prefix, language, script SHA-256, canisters, methods, calls, instructions, status, violations (≤ 16, each ≤ 512 B), error (≤ 4 KiB). One entry per outbound message, written as the system accepts it, plus one closing entry per run (`Trapped` if the run was cut short) |
-| Unpaid-call filter | `inspect_message` rejects update calls that carry no registered token (or, for admin methods, don't come from a controller) before the canister is charged for them |
+| Unpaid-call filter | `inspect_message` admits an update call only if it carries a registered token within its rate limit, is well-formed and contains a `tools/call` (with `certified_reads`, any request), or is an admin call from a controller. Everything else is rejected before the canister is charged for it |
+| Browsers | A request with an `Origin` header must come from the canister's own origin (MCP's DNS-rebinding rule); others get 403. Non-browser clients send no `Origin` |
 | Stack | 8 MiB wasm stack (`.cargo/config.toml`), up from Rust's 1 MiB default |
 
 Policy, tokens and the audit log live in `ic-stable-structures`, so they survive upgrades
@@ -425,11 +432,11 @@ cached interfaces, and a script refused as "busy" when 8 are already running.
 So a missing closing entry is "pending or unknown", never proof of a trap. A trap is
 recorded as `Trapped`.
 
-**Options** (both off by default, set with `set_limits`):
+**Options** (set with `set_limits`):
 
-- `call_timeout_seconds`: by default calls wait for a guaranteed reply, so an allowlisted
-  canister that never answers can keep this canister from stopping and upgrading. With a
-  timeout (the IC caps it at 300 s) that can't happen, but a timed-out call may still have
+- `call_timeout_seconds`: how long a call waits for its reply, 1-300 s (other values are
+  clamped); `null` means 300. Every call has a timeout, so a canister that never answers holds
+  a run slot, and this canister's stop, for at most that long. A timed-out call may still have
   executed on the target; the error says so.
 - `certified_reads`: by default `initialize`, `tools/list` and cached searches are answered by
   query calls. Those are fast and free but not certified, so a single malicious node could
@@ -437,25 +444,42 @@ recorded as `Trapped`.
   `certified_reads = opt true` every request goes through an update call (about 0.2 s locally,
   1-2 s on mainnet) and the demo page, which is uncertified HTML that asks for the token, is
   switched off. Read the audit log with an update call for the same reason.
+- `tool_calls_per_minute`: tool calls each token may make per minute; `null` means 120.
 
 Fetched interfaces are cached for one hour, then fetched again, so a target's interface
 change is picked up without upgrading this canister. A failed fetch is remembered for five
 minutes, so searches and scripts don't repeat the same calls to a target that exposes no
-interface. Interfaces over 512 KiB are refused.
+interface; a fetch that never reached the target (refused by policy or on the spot by the
+system) is not remembered. `set_allowlist` and `remove_allowlist` drop both. Interfaces over
+512 KiB are refused.
 
 Canister ids are canonicalised (`RYJL3-…` and `ryjl3-…` are the same principal) before the
 allowlist check, the interface cache and the override lookup.
 
 ## Known limitations
 
-- **JavaScript has no memory cap.** Python is limited to 64 MiB and Rhai by its size
-  limits, but Boa offers no memory limit, so a script that hoards memory ends in a trap
-  (a 503 for the client). The cap of 8 concurrent scripts limits how far this can spread.
-- **One built-in call can still hit the IC's 40B-instruction trap.** Boa cannot be
-  interrupted inside a single native operation, such as `new Array(2e8).fill(0)`. Every other
-  path stops with a clean error. If this happens before any outbound message, nothing changed,
-  nothing is logged, and the client gets a 503 with no result. If it happens after one, the
-  entries for every message already sent remain and the run is closed with a `Trapped` entry.
+- **JavaScript has no memory cap of its own.** Python is limited to 64 MiB and Rhai by its
+  size limits, but Boa offers no memory limit. The canister-wide 1 GiB heap ceiling stops a
+  script that hoards memory with a trap (a 503 for the client), which rolls back the growth.
+  `padStart`, `padEnd` and `repeat` refuse results over 16M characters with a `RangeError`
+  instead. Boa still pre-allocates for array-likes (`Array.prototype.sort.call({length: 2**32 - 1})`),
+  which ends in the same trap.
+- **One native operation can still hit the IC's 40B-instruction trap.** The engines check
+  budgets between steps, not inside one built-in call: in JavaScript `new Array(2e8).fill(0)`,
+  in Python big-integer arithmetic (`**`, `*`, `//`, `math.gcd`, `math.isqrt`), regular
+  expressions with backtracking, `decimal` at very high precision, or a dict whose keys all
+  collide. The script size limit, value limits, and caps on integer text (1,000 digits in,
+  100,000 bits out) bound the common cases; the rest needs patched engines. Such a trap is
+  rolled back: nothing changed. If it happens before any outbound message, nothing is logged
+  and the client gets a 503. If it happens after one, the entries for every message already
+  sent remain and the run is closed with a `Trapped` entry, whose `instructions` leaves out
+  the trapped execution. The per-token rate limit bounds how often anyone can cause this.
+- **Concurrent cold fetches are not merged.** `Promise.all` over several calls to a canister
+  whose interface is not cached yet sends one fetch per call, each counted against the call
+  cap. Fetch once (`icp.candid`) before the batch, or run any search first.
+- **A hostile allowlisted target can make replies expensive to decode.** Candid's decoder has
+  work quotas, but some shapes (many `opt` values against a large interface) still cost far
+  more than their size. Allowlist only canisters you trust to answer sanely.
 - **Bearer tokens are visible to the subnet's node operators and the HTTP gateway**, because
   request contents are replicated to the nodes that run the canister. That is how HTTP
   requests work on ICP. Treat tokens as revocable credentials: one per client, rotated, and
@@ -470,6 +494,12 @@ allowlist check, the interface cache and the override lookup.
   yet, so the code falls back to `__get_candid_interface_tmp_hack`.
 - **Adding the `Started`, `Call` and `Trapped` audit statuses were Candid-breaking changes** for
   `get_audit_logs` clients compiled against an older `.did`. Upgrading needed `icp deploy --yes`.
+- **The audit log is append-only and never pruned.** The rate limit bounds how fast it grows:
+  one token's runs can write at most 120 × (calls per script + 2) entries a minute.
+- **A busy canister is found out in the update call.** The query sees the number of running
+  scripts as of the last committed state, which can change before the update runs, so the
+  check stays in the update. A request that gets a "busy" error has still cost one update
+  call.
 
 ## Where this differs from the original spec, and why
 
@@ -490,10 +520,12 @@ allowlist check, the interface cache and the override lookup.
   an answer it does not have, the run is stopped (uncatchably) and the call is made. The answer
   is cached, and the script re-runs from the top. Cost grows quadratically with the number of
   calls, bounded by the call cap.
-- **Interface discovery tries three sources, in order:**
+- **Interface discovery:** an admin-supplied `set_candid_override` wins when set (nothing is
+  fetched or refreshed for that canister, and `remove_allowlist` keeps it). Otherwise:
   1. the management canister's `canister_metadata` (the public `candid:service` section; not available on every replica yet),
-  2. the target's `__get_candid_interface_tmp_hack`,
-  3. an admin-supplied `set_candid_override`.
-- **Skip-certification.** Query responses (`initialize`, `tools/list`) carry skip-certification
-  headers, so they work on the certified gateway domain, not just `raw`. Script results always
-  come from the update call, which consensus certifies.
+  2. the target's `__get_candid_interface_tmp_hack`.
+- **Skip-certification.** With `certified_reads` off, query responses (`initialize`,
+  `tools/list`, cached searches) carry skip-certification headers, so they work on the certified
+  gateway domain, not just `raw`. With it on, the canister certifies nothing, so the gateway
+  rejects any query response except an upgrade, and a single node cannot answer in the
+  canister's name. Script results always come from the update call, which consensus certifies.

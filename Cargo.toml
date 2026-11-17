@@ -13,12 +13,16 @@ members = [".", "demo_store"]
 [features]
 default = ["js", "python", "rhai"]
 js = ["dep:boa_engine", "dep:boa_gc", "dep:futures"]
-python = ["dep:monty", "dep:monty-types", "dep:futures"]
+python = ["dep:unicode-normalization", "dep:monty", "dep:monty-types", "dep:futures"]
 rhai = ["dep:rhai"]
 
 [dependencies]
 ic-cdk = "0.20.3"
 candid = "0.10.40"
+# Already a dependency of candid; used to read a reply's type table (see decode_reply).
+binrw = "0.15"
+# Already a dependency of monty; folds Python identifiers for the eval/exec check.
+unicode-normalization = { version = "0.1", optional = true }
 candid_parser = "0.4.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -29,11 +33,15 @@ hex = "0.4"
 base64 = "0.22"
 getrandom = "0.3"
 futures = { version = "0.3", default-features = false, features = ["alloc"], optional = true }
-boa_engine = { version = "0.22.0", default-features = false, optional = true }
+# `fuzz` adds a VM step counter (`ContextBuilder::instructions_remaining`): the only way to
+# stop synchronous JS that spreads its work over many function calls (see runtimes/js.rs).
+boa_engine = { version = "0.22.0", default-features = false, features = ["fuzz"], optional = true }
 boa_gc = { version = "0.22.0", optional = true }
 monty = { version = "=1.6.0", optional = true }
 monty-types = { version = "=1.6.0", optional = true }
-rhai = { version = "1.27.0", features = ["sync", "no_time", "serde"], optional = true }
+# No `sync`: its shared-value locks spin with std::thread::sleep, which traps on wasm32;
+# without it a conflicting borrow is a clean Rhai error.
+rhai = { version = "1.27.0", features = ["no_time", "serde"], optional = true }
 
 # Both patches exist only to keep wasm-bindgen out of the canister (ICP rejects any
 # import outside `ic0`); see the header comment in each.

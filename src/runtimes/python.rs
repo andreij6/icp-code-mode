@@ -6,7 +6,7 @@
 //! * `icp.call_async(...)` is awaitable, so `await asyncio.gather(...)` puts several
 //!   calls in flight; the host dispatches them together when the VM blocks.
 
-use crate::bridge::{HostBridge, ValueBudget, instruction_counter, now_ms};
+use crate::bridge::{HostBridge, ValueBudget, check_budget, instruction_counter, now_ms};
 use monty::{MontyRun, RunProgress};
 use monty_types::{
     CompileOptions, DateTimeSource, ExcType, ExtFunctionResult, MontyException, MontyObject, MontyUuid,
@@ -21,14 +21,35 @@ pub const MAX_RECURSION_DEPTH: usize = 200;
 pub const MAX_SUSPENSIONS: usize = 256;
 pub const MAX_MEMORY_BYTES: usize = 64 << 20;
 const MAX_PRINT_BYTES: usize = crate::bridge::MAX_LOG_BYTES;
-/// Total VM budget per script. On-chain the web-time shim makes Monty's clock an
-/// instruction counter (1 ns == 1 instruction), so this is 10B instructions —
-/// a clean `TimeoutError` well before the IC's 40B per-message trap. Natively it
-/// is wall time.
-pub const EXECUTION_BUDGET: Duration = Duration::from_secs(if cfg!(target_arch = "wasm32") { 10 } else { 2 });
+
+/// Collects `print` output up to `MAX_PRINT_BYTES` and drops the rest, as the other
+/// runtimes do (Monty's own capped collector raises `MemoryError` instead).
+struct Printed<'a>(&'a mut String);
+
+impl monty_types::PrintWriterCallback for Printed<'_> {
+    fn stdout_write(&mut self, output: std::borrow::Cow<'_, str>) -> Result<(), MontyException> {
+        let room = MAX_PRINT_BYTES.saturating_sub(self.0.len());
+        let mut end = output.len().min(room);
+        while !output.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.0.push_str(&output[..end]);
+        Ok(())
+    }
+    fn stdout_push(&mut self, end: char) -> Result<(), MontyException> {
+        if self.0.len() + end.len_utf8() <= MAX_PRINT_BYTES {
+            self.0.push(end);
+        }
+        Ok(())
+    }
+}
+
+/// Wall-time VM budget for native tests. On-chain the budget is what is left of the
+/// policy's instruction budget (see `vm_budget`).
+pub const EXECUTION_BUDGET: Duration = Duration::from_secs(2);
 /// Longest single stretch between suspensions, in instructions: below the IC's 40B limit
 /// per message, whatever the policy budget is.
-const MAX_TURN_INSTRUCTIONS: u64 = 30_000_000_000;
+const MAX_TURN_INSTRUCTIONS: u64 = crate::policy::MAX_INSTRUCTIONS_CAP;
 const MAX_VALUE_DEPTH: usize = crate::candid_bridge::MAX_DEPTH;
 
 /// The VM budget for this run. On-chain it is what is left of the policy's instruction
@@ -68,7 +89,21 @@ fn to_json(o: ObjectRef<'_>, depth: usize, budget: &mut ValueBudget) -> Result<V
         "NoneType" => Value::Null,
         "bool" => Value::Bool(o.as_bool().unwrap_or_default()),
         // Beyond i64: exact decimal string (matches how nat/int come back from candid).
-        "int" => o.as_int().map_or_else(|| Value::String(o.py_repr()), Value::from),
+        "int" => match monty_types::unstable::node(o) {
+            monty_types::unstable::MontyNode::Int(i) => Value::from(*i),
+            // Decimal text costs time quadratic in the size: refuse huge ints before it.
+            monty_types::unstable::MontyNode::BigInt(b) if b.bits() > MAX_INT_BITS => {
+                return Err(format!("int of {} bits is too large to export (limit {MAX_INT_BITS} bits)", b.bits()));
+            }
+            _ => repr(o, budget)?,
+        },
+        // Monty's markers for data it cut while exporting (too deep, or a cycle): an error,
+        // never a string standing in for the data. Other `repr` nodes are objects with no
+        // JSON form (slice, range, ...), exported as their repr text below.
+        "cycle" => return Err("value contains a reference cycle".into()),
+        "repr" if matches!(monty_types::unstable::node(o), monty_types::unstable::MontyNode::Repr(t) if t.is_empty() || t == "<deeply nested>") => {
+            return Err(format!("value nested deeper than {MAX_VALUE_DEPTH} levels"));
+        }
         "float" => o.as_float().and_then(Number::from_f64).map_or(Value::Null, Value::Number),
         "str" => {
             let s = o.as_str().unwrap_or_default();
@@ -81,7 +116,7 @@ fn to_json(o: ObjectRef<'_>, depth: usize, budget: &mut ValueBudget) -> Result<V
                 budget.bytes(b.len())?;
                 Value::Array(b.iter().map(|x| Value::from(*x)).collect())
             }
-            _ => Value::String(o.py_repr()),
+            _ => repr(o, budget)?,
         },
         "list" | "tuple" | "set" | "frozenset" => Value::Array(
             o.items().unwrap_or_default().into_iter().map(|x| to_json(x, depth + 1, budget)).collect::<Result<_, _>>()?,
@@ -95,8 +130,19 @@ fn to_json(o: ObjectRef<'_>, depth: usize, budget: &mut ValueBudget) -> Result<V
             }
             Value::Object(out)
         }
-        _ => Value::String(o.py_repr()),
+        _ => repr(o, budget)?,
     })
+}
+
+/// Largest int exported (about 30,000 decimal digits).
+const MAX_INT_BITS: u64 = 100_000;
+
+/// `repr(o)` as a JSON string, counted against the text budget (`1 << 500_000` alone is
+/// 150 KB of digits).
+fn repr(o: ObjectRef<'_>, budget: &mut ValueBudget) -> Result<Value, String> {
+    let s = o.py_repr();
+    budget.bytes(s.len())?;
+    Ok(Value::String(s))
 }
 
 // Input here is always JSON decoded from a Candid reply, which `candid_bridge` already
@@ -148,12 +194,43 @@ fn ext(r: Result<Value, MontyException>) -> ExtFunctionResult {
 
 /// Await `f` without letting other requests' allocations (made while we are
 /// suspended) count against this script's memory limit, or ours against theirs.
+///
+/// Re-based at the start of every poll: each poll after a suspension runs in a new message
+/// execution, where nothing else runs until it returns. So what other runs allocated while
+/// this one waited is excluded, and the reply that arrives (and its conversion into Python
+/// values afterwards) is charged to this run.
 async fn rebased<T>(f: impl std::future::Future<Output = T>) -> T {
     use monty_types::{BASELINE_MEMORY, LIVE_MEMORY};
     let own = LIVE_MEMORY.load(Ordering::Relaxed).saturating_sub(BASELINE_MEMORY.load(Ordering::Relaxed));
-    let out = f.await;
-    BASELINE_MEMORY.store(LIVE_MEMORY.load(Ordering::Relaxed).saturating_sub(own), Ordering::Relaxed);
-    out
+    let mut f = std::pin::pin!(f);
+    std::future::poll_fn(|cx| {
+        BASELINE_MEMORY.store(LIVE_MEMORY.load(Ordering::Relaxed).saturating_sub(own), Ordering::Relaxed);
+        f.as_mut().poll(cx)
+    })
+    .await
+}
+
+/// `eval` and `exec` compile source built at run time, in one step the budget cannot
+/// interrupt and outside the size limit on scripts. There is no `builtins` module or
+/// `compile` in Monty, so the names are the only way to reach them.
+///
+/// Python folds identifiers with NFKC (`ｅval` is `eval`), so the check runs on the folded text.
+fn uses_dynamic_code(code: &str) -> Option<&'static str> {
+    use unicode_normalization::UnicodeNormalization;
+    let folded: String;
+    let code = if code.is_ascii() {
+        code
+    } else {
+        folded = code.nfkc().collect();
+        &folded
+    };
+    let ident = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+    ["eval", "exec"].into_iter().find(|w| {
+        code.match_indices(w).any(|(i, _)| {
+            let before = code[..i].chars().next_back();
+            !ident(before) && before != Some('.') && !ident(code[i + w.len()..].chars().next())
+        })
+    })
 }
 
 /// Monty's memory counter is one process-wide number. The canister has a single thread,
@@ -192,13 +269,26 @@ mod test_serial {
             });
         }
     }
+
+    /// Counts this thread's allocations for the run, then restores the previous setting.
+    pub struct CountThisThread(bool);
+    impl CountThisThread {
+        pub fn on() -> Self {
+            CountThisThread(crate::counting_alloc::COUNT_THIS_THREAD.with(|c| c.replace(true)))
+        }
+    }
+    impl Drop for CountThisThread {
+        fn drop(&mut self) {
+            crate::counting_alloc::COUNT_THIS_THREAD.with(|c| c.set(self.0));
+        }
+    }
 }
 
 pub async fn run<B: HostBridge>(code: &str, bridge: &B) -> Result<Value, String> {
     #[cfg(test)]
     let _turn = test_serial::Turn::take();
     #[cfg(test)]
-    crate::counting_alloc::COUNT_THIS_THREAD.with(|c| c.set(true));
+    let _count = test_serial::CountThisThread::on();
     let mut out = String::new();
     let result = drive(code, bridge, &mut out).await;
     for line in out.lines() {
@@ -216,6 +306,9 @@ async fn drive<B: HostBridge>(code: &str, bridge: &B, out: &mut String) -> Resul
         random_start: RandomStart::Seed(RandomSeed::Int(0x1C9.into())),
         ..OsPolicy::default()
     };
+    if let Some(w) = uses_dynamic_code(code) {
+        return Err(format!("`{w}` is not available in the sandbox (dynamic code evaluation is disabled)"));
+    }
     let budget = vm_budget(bridge);
     let limits = ResourceLimits::default()
         .max_recursion_depth(MAX_RECURSION_DEPTH)
@@ -231,26 +324,35 @@ async fn drive<B: HostBridge>(code: &str, bridge: &B, out: &mut String) -> Resul
     let mut progress = MontyRun::new(code.to_owned(), "main.py", vec!["icp".to_owned()], CompileOptions::default())
         .map_err(err)?
         .with_os_policy(policy)
-        .start(vec![icp_module()], ResourceTracker::new(limits), PrintWriter::CollectString(out, Some(MAX_PRINT_BYTES)))
+        .start(vec![icp_module()], ResourceTracker::new(limits), PrintWriter::Callback(&mut Printed(out)))
         .map_err(err)?;
 
     // In-flight `icp.call_async` requests: (call_id, function, args).
     let mut queued: Vec<(u32, String, Vec<Value>)> = vec![];
-    for _ in 0..MAX_SUSPENSIONS {
+    for i in 0..=MAX_SUSPENSIONS {
+        // Host work between suspensions (conversions, policy checks) is outside the VM's
+        // clock, so the policy budget is also checked here, uncatchably.
+        check_budget(bridge)?;
         let next = match progress {
+            RunProgress::Complete(_) if !queued.is_empty() => {
+                return Err(format!("{} icp request(s) were started but never awaited, so they were not sent", queued.len()));
+            }
             RunProgress::Complete(v) => return to_json(v.as_ref(), 0, &mut ValueBudget::default()),
+            // Refuse before the request that would pass the limit, so this error never
+            // follows messages that went out.
+            _ if i == MAX_SUSPENSIONS => break,
             RunProgress::FunctionCall(c) => {
                 let mut vb = ValueBudget::default();
                 let args: Vec<Value> = c.args.args().map(|a| to_json(a, 0, &mut vb)).collect::<Result<_, _>>()?;
                 if c.args.kwargs().next().is_some() {
                     let e = exc(ExcType::TypeError, "icp functions take positional arguments only");
-                    c.resume(ExtFunctionResult::Error(e), PrintWriter::CollectString(out, Some(MAX_PRINT_BYTES)))
+                    c.resume(ExtFunctionResult::Error(e), PrintWriter::Callback(&mut Printed(out)))
                 } else if c.function_name == "icp.call_async" && !c.allow_eager_await {
                     queued.push((c.call_id, c.function_name.clone(), args));
-                    c.resume_pending(PrintWriter::CollectString(out, Some(MAX_PRINT_BYTES)))
+                    c.resume_pending(PrintWriter::Callback(&mut Printed(out)))
                 } else {
                     let r = rebased(host(bridge, &c.function_name, &args)).await;
-                    let pw = PrintWriter::CollectString(out, Some(MAX_PRINT_BYTES));
+                    let pw = PrintWriter::Callback(&mut Printed(out));
                     if c.allow_eager_await { c.resume_eager(r.map(|v| from_json(&v)), pw) } else { c.resume(ext(r), pw) }
                 }
             }
@@ -261,15 +363,15 @@ async fn drive<B: HostBridge>(code: &str, bridge: &B, out: &mut String) -> Resul
                 }
                 let replies = rebased(futures::future::join_all(batch.iter().map(|(_, n, a)| host(bridge, n, a)))).await;
                 let results = batch.iter().zip(replies).map(|((id, ..), r)| (*id, ext(r))).collect();
-                rf.resume(results, PrintWriter::CollectString(out, Some(MAX_PRINT_BYTES)))
+                rf.resume(results, PrintWriter::Callback(&mut Printed(out)))
             }
-            RunProgress::NameLookup(l) => l.resume(NameLookupResult::Undefined, PrintWriter::CollectString(out, Some(MAX_PRINT_BYTES))),
+            RunProgress::NameLookup(l) => l.resume(NameLookupResult::Undefined, PrintWriter::Callback(&mut Printed(out))),
             RunProgress::OsCall(c) => {
                 let r = match &c.function_call {
                     OsFunctionCall::Import(a) if a.module == "icp" => ExtFunctionResult::Return(icp_module()),
                     other => other.no_handler_result(),
                 };
-                c.resume(r, PrintWriter::CollectString(out, Some(MAX_PRINT_BYTES)))
+                c.resume(r, PrintWriter::Callback(&mut Printed(out)))
             }
         };
         progress = next.map_err(err)?;
@@ -354,5 +456,74 @@ mod tests {
         let r = py("x = []\nwhile True:\n    x.append('y' * 100000)").0;
         let e = r.unwrap_err();
         assert!(e.contains("MemoryError") || e.contains("TimeoutError"), "{e}");
+    }
+
+    #[test]
+    fn bigint_result_counts_against_value_byte_budget() {
+        let e = py("[1 << 90000] * 200").0.unwrap_err();
+        assert!(e.contains("bytes of text"), "{e}");
+    }
+
+    #[test]
+    fn heap_ceiling_bounds_single_builtin_allocations() {
+        // Monty checks its memory limit between steps, so one builtin call can overshoot
+        // it (here by 70 MB). On-chain, the global heap ceiling bounds that overshoot.
+        use crate::counting_alloc::{HEAP_CEILING, over_ceiling};
+        assert!(py("import json\nlen(json.dumps({'a': 1}, indent=70_000_000))").0.is_ok());
+        assert!(!over_ceiling(HEAP_CEILING - 100, 100));
+        assert!(over_ceiling(HEAP_CEILING - 100, 101));
+        assert!(over_ceiling(usize::MAX, 1));
+    }
+
+    #[test]
+    fn audit_round_two_python_fixes() {
+        // eval/exec are refused; names that only contain the words are fine.
+        assert!(py("exec('x = 1')").0.unwrap_err().contains("not available"));
+        assert!(py("eval ('1')").0.unwrap_err().contains("not available"));
+        assert_eq!(py("evaluate = 2\nexecutor = 3\nevaluate + executor").0.unwrap(), json!(5));
+        // Monty does not fold a fullwidth "eval" into the builtin.
+        assert!(py("\u{ff45}val('1')").0.is_err());
+        // Output past the cap is cut, not a MemoryError, as in JS and Rhai.
+        let (r, logs) = py("for i in range(3000):\n    print('x' * 40)\n1");
+        assert_eq!(r.unwrap(), json!(1));
+        assert!(logs.logs.take().iter().map(String::len).sum::<usize>() <= crate::bridge::MAX_LOG_BYTES + 64);
+        // Huge ints are refused before their decimal text is built.
+        assert!(py("1 << 200000").0.unwrap_err().contains("too large"));
+        assert_eq!(py("1 << 100").0.unwrap(), json!("1267650600228229401496703205376"));
+        // A call started with call_async and never awaited was not sent: an error.
+        let e = py(&format!("import asyncio\nicp.call_async('{L}', 'icrc1_decimals')\n1")).0.unwrap_err();
+        assert!(e.contains("never awaited") || e.contains("never"), "{e}");
+    }
+
+    #[test]
+    fn python_run_resets_test_thread_allocation_flag() {
+        crate::counting_alloc::COUNT_THIS_THREAD.with(|c| c.set(false));
+        assert_eq!(py("1").0.unwrap(), json!(1));
+        assert!(!crate::counting_alloc::COUNT_THIS_THREAD.with(|c| c.get()));
+    }
+
+    #[test]
+    fn arity_suspension_limit_and_json_conversion_edge_cases() {
+        assert!(py("icp.candid()").0.unwrap_err().contains("TypeError"));
+        assert!(py("icp.principal(1)").0.unwrap_err().contains("no arguments"));
+        assert!(py(&format!("icp.call('{L}', 'icrc1_balance_of')")).0.is_ok());
+
+        // Unresolvable async gather / non-object repr fallback.
+        assert!(py("slice(1, 2)").0.unwrap().as_str().unwrap().contains("slice"));
+        let too_many = format!(
+            "for _ in range(257):\n    icp.call('{L}', 'icrc1_balance_of', {{'owner': 'aaaaa-aa'}})"
+        );
+        assert!(py(&too_many).0.unwrap_err().contains("suspensions"));
+
+        // Exercise `from_json` with booleans, null, large u64, floats, arrays.
+        assert_eq!(
+            from_json(&json!([null, true, u64::MAX, 1.25])),
+            MontyObject::list([
+                MontyObject::none(),
+                MontyObject::bool(true),
+                MontyObject::bigint(u64::MAX.into()),
+                MontyObject::float(1.25),
+            ])
+        );
     }
 }

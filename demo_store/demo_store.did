@@ -29,6 +29,7 @@ type OrderError = variant {
   UnknownProduct : nat64;
   OutOfStock : record { product_id : nat64; available : nat32 };
   UnknownCustomer;
+  ZeroQuantity : nat64;
   EmptyOrder;
 };
 type OrderItem = record { product_id : nat64; quantity : nat32 };

@@ -32,6 +32,14 @@ pub const MAX_PENDING: usize = 64;
 pub const MAX_VALUE_DEPTH: usize = crate::candid_bridge::MAX_DEPTH;
 pub const MAX_VALUE_NODES: usize = crate::bridge::MAX_VALUE_NODES;
 pub const MAX_VALUE_BYTES: usize = crate::bridge::MAX_VALUE_BYTES;
+/// Boa VM steps (bytecode instructions) per run, across every function, callback and
+/// promise job. The loop and recursion limits count per call frame, so `f` calling `g`
+/// in a loop, or a recursion tree, would otherwise run until the IC's 40B-instruction
+/// trap. Measured on a local replica at about 330 instructions per step, so 30M steps
+/// is about 10B, leaving room under 40B for steps several times heavier.
+pub const MAX_VM_STEPS: usize = 30_000_000;
+/// Longest string `padStart`/`padEnd`/`repeat` may build (Boa allocates it up front).
+pub const MAX_STRING_LEN: usize = 1 << 24;
 /// Promise jobs (microtasks) per script. A chain like `f = () => Promise.resolve().then(f)`
 /// has no loop and no call depth, so the loop and recursion limits never see it.
 pub const MAX_PROMISE_JOBS: u64 = 100_000;
@@ -45,6 +53,8 @@ pub const MAX_PROMISE_JOBS: u64 = 100_000;
 const SNAPSHOT_JS: &str = r#"(() => {
   const keys = Object.keys, isArray = Array.isArray, def = Object.defineProperty, str = JSON.stringify, apply = Reflect.apply;
   const MAXD = __MAXD__, MAXN = __MAXN__, MAXB = __MAXB__;
+  // Pristine valueOf methods: each throws unless `this` really is that kind of box.
+  const UNBOX = [Number.prototype.valueOf, String.prototype.valueOf, Boolean.prototype.valueOf, BigInt.prototype.valueOf];
   // `replacer`: optional JSON.stringify replacer function, applied here (inside the bounds)
   // in the order the spec gives: toJSON, then the replacer, then the type rules.
   const snapshot = (root, replacer) => {
@@ -57,6 +67,12 @@ const SNAPSHOT_JS: &str = r#"(() => {
         if (typeof tj === "function") { x = apply(tj, x, [key]); t = typeof x; }
       }
       if (replacer) { x = apply(replacer, holder, [key, x]); t = typeof x; }
+      if (t === "object" && x !== null) {
+        // Boxed primitives (new Number(1), Object("s"), ...) serialise as their value.
+        for (let j = 0; j < UNBOX.length; j++) {
+          try { x = apply(UNBOX[j], x, []); t = typeof x; break; } catch (_) {}
+        }
+      }
       if (++nodes > MAXN) throw new RangeError("value has more than " + MAXN + " elements");
       if (t === "bigint") throw new TypeError("BigInt values cannot cross into the host; convert to string");
       if (t === "function" || t === "symbol") return undefined;
@@ -76,6 +92,7 @@ const SNAPSHOT_JS: &str = r#"(() => {
       for (let i = 0; i < ks.length; i++) {
         const k = ks[i];
         bytes += k.length;
+        if (bytes > MAXB) throw new RangeError("value holds more than " + MAXB + " bytes of text");
         const v = walk(x[k], d + 1, x, k);
         if (v !== undefined) put(out, k, v);
       }
@@ -90,6 +107,27 @@ const SNAPSHOT_JS: &str = r#"(() => {
     const fn = typeof r === "function" ? r : undefined;
     return str(snapshot(v, fn), fn ? undefined : r, s);
   }, writable: true, configurable: true });
+  // Boa 0.22 panics (a trap on the IC) on `"x".at(-1e19)`, and pads/repeats by allocating
+  // the full length up front, up to 8 GB. Replace `at` and bound the length arguments.
+  const SP = String.prototype, trunc = Math.trunc, Str = String, MAXLEN = __MAXLEN__;
+  def(SP, "at", { value: function at(index) {
+    if (this == null) throw new TypeError("String.prototype.at called on null or undefined");
+    const s = Str(this), n = s.length;
+    let k = trunc(+index) || 0;
+    if (k < 0) k += n;
+    return k < 0 || k >= n ? undefined : s[k];
+  }, writable: true, configurable: true });
+  const bounded = (name, length) => {
+    const f = SP[name];
+    def(SP, name, { value: { [name](a, b) {
+      const n = +a;
+      if (length(Str(this), n) > MAXLEN) throw new RangeError(name + ": result longer than " + MAXLEN + " characters");
+      return apply(f, this, [n, b]);
+    } }[name], writable: true, configurable: true });
+  };
+  bounded("padStart", (s, n) => n);
+  bounded("padEnd", (s, n) => n);
+  bounded("repeat", (s, n) => s.length * n);
   return snapshot;
 })()"#;
 
@@ -111,7 +149,7 @@ impl BoundedJobs {
         if n > MAX_PROMISE_JOBS {
             return Err(JsNativeError::range().with_message(format!("script ran more than {MAX_PROMISE_JOBS} promise jobs")).into());
         }
-        if n % 256 == 0 {
+        if n.is_multiple_of(16) {
             budget_error(self.deadline).map_err(|e| JsNativeError::range().with_message(e))?;
         }
         Ok(())
@@ -175,7 +213,10 @@ struct Pending {
     /// `None` = icp.candid, `Some(method)` = icp.call
     method: Option<String>,
     canister: String,
-    args_json: String,
+    /// Plain data, no GC references. Kept as a `Value`: a round trip through text would
+    /// meet serde_json's 128-level parse limit and turn deep arguments into `null`.
+    #[unsafe_ignore_trace]
+    args: Value,
     resolvers: ResolvingFunctions,
 }
 
@@ -192,10 +233,17 @@ struct State {
 
 type Shared = Gc<GcRefCell<State>>;
 
-fn arg_string(args: &[JsValue], i: usize, ctx: &mut Context) -> JsResult<String> {
-    match args.get(i) {
-        Some(v) if v.is_string() => Ok(v.to_string(ctx)?.to_std_string_escaped()),
-        _ => Err(JsNativeError::typ().with_message(format!("argument {} must be a string", i + 1)).into()),
+/// Longest canister id text accepted (a principal's text form is at most 63 characters).
+const MAX_ID_CHARS: usize = 64;
+
+/// String argument `i`, refused before it is copied out of the engine if longer than `max`.
+fn arg_string(args: &[JsValue], i: usize, max: usize, _: &mut Context) -> JsResult<String> {
+    match args.get(i).and_then(JsValue::as_string) {
+        Some(s) if s.len() > max => {
+            Err(JsNativeError::range().with_message(format!("argument {} is longer than {max} characters", i + 1)).into())
+        }
+        Some(s) => Ok(s.to_std_string_escaped()),
+        None => Err(JsNativeError::typ().with_message(format!("argument {} must be a string", i + 1)).into()),
     }
 }
 
@@ -211,7 +259,14 @@ fn to_json_safe(v: &JsValue, st: &Shared, ctx: &mut Context) -> JsResult<Value> 
         Some(f) => f.call(&JsValue::undefined(), std::slice::from_ref(v), ctx)?,
         None => return Err(JsNativeError::error().with_message("engine not initialised").into()),
     };
-    Ok(normalize_numbers(plain.to_json(ctx)?.unwrap_or(Value::Null)))
+    let v = normalize_numbers(plain.to_json(ctx)?.unwrap_or(Value::Null));
+    // The snapshot counts UTF-16 code units; the limit is in UTF-8 bytes, as elsewhere.
+    match crate::bridge::text_bytes(&v) {
+        n if n > MAX_VALUE_BYTES => {
+            Err(JsNativeError::range().with_message(format!("value holds more than {MAX_VALUE_BYTES} bytes of text ({n})")).into())
+        }
+        _ => Ok(v),
+    }
 }
 
 fn display(v: &JsValue, st: &Shared, ctx: &mut Context) -> String {
@@ -231,8 +286,17 @@ fn console_fn(level: &'static str, state: &Shared) -> NativeFunction {
             if st.borrow().log_bytes >= MAX_LOG_BYTES {
                 return Ok(JsValue::undefined()); // cap reached: don't even format
             }
-            let line = args.iter().map(|a| display(a, st, ctx)).collect::<Vec<_>>().join(" ");
-            let mut line = if level == "log" { line } else { format!("[{level}] {line}") };
+            let room = MAX_LOG_BYTES - st.borrow().log_bytes;
+            let mut line = if level == "log" { String::new() } else { format!("[{level}] ") };
+            for (i, a) in args.iter().enumerate() {
+                if line.len() > room {
+                    break; // the rest would be cut anyway: don't format it
+                }
+                if i > 0 {
+                    line.push(' ');
+                }
+                line.push_str(&display(a, st, ctx));
+            }
             let mut s = st.borrow_mut();
             if s.log_bytes + line.len() > MAX_LOG_BYTES {
                 truncate(&mut line, MAX_LOG_BYTES - s.log_bytes);
@@ -256,16 +320,16 @@ fn request_fn(is_call: bool, state: &Shared) -> NativeFunction {
                     .with_message(format!("more than {MAX_PENDING} concurrent icp requests"))
                     .into());
             }
-            let canister = arg_string(args, 0, ctx)?;
-            let (method, args_json) = if is_call {
-                let method = arg_string(args, 1, ctx)?;
+            let canister = arg_string(args, 0, MAX_ID_CHARS, ctx)?;
+            let (method, args) = if is_call {
+                let method = arg_string(args, 1, crate::bridge::MAX_METHOD_LEN, ctx)?;
                 let a = to_json_safe(&args.get(2).cloned().unwrap_or_default(), st, ctx)?;
-                (Some(method), a.to_string())
+                (Some(method), a)
             } else {
-                (None, String::new())
+                (None, Value::Null)
             };
             let (promise, resolvers) = JsPromise::new_pending(ctx);
-            st.borrow_mut().pending.push(Pending { method, canister, args_json, resolvers });
+            st.borrow_mut().pending.push(Pending { method, canister, args, resolvers });
             Ok(promise.into())
         },
         state.clone(),
@@ -279,6 +343,7 @@ fn new_context(state: &Shared) -> JsResult<Context> {
         .host_hooks(Rc::new(Hooks))
         .module_loader(Rc::new(IdleModuleLoader))
         .job_executor(Rc::new(BoundedJobs { deadline: state.borrow().deadline, ..BoundedJobs::default() }))
+        .instructions_remaining(MAX_VM_STEPS)
         .build()?;
     let limits = ctx.runtime_limits_mut();
     limits.set_loop_iteration_limit(LOOP_ITERATION_LIMIT);
@@ -314,9 +379,16 @@ fn new_context(state: &Shared) -> JsResult<Context> {
     for name in ["Atomics", "SharedArrayBuffer", "WeakRef", "FinalizationRegistry"] {
         global.delete_property_or_throw(JsString::from(name), &mut ctx)?;
     }
+    // Boa's `Symbol.for` registry is process-wide and never shrinks: each run could add
+    // keys that outlive it.
+    let symbol = global.get(js_string!("Symbol"), &mut ctx)?;
+    if let Some(sym) = symbol.as_object() {
+        sym.delete_property_or_throw(js_string!("for"), &mut ctx)?;
+        sym.delete_property_or_throw(js_string!("keyFor"), &mut ctx)?;
+    }
 
     let src = SNAPSHOT_JS.replace("__MAXD__", &MAX_VALUE_DEPTH.to_string()).replace("__MAXN__", &MAX_VALUE_NODES.to_string())
-        .replace("__MAXB__", &MAX_VALUE_BYTES.to_string());
+        .replace("__MAXB__", &MAX_VALUE_BYTES.to_string()).replace("__MAXLEN__", &MAX_STRING_LEN.to_string());
     let snapshot = ctx.eval(Source::from_bytes(src.as_bytes()))?;
     state.borrow_mut().snapshot = snapshot.as_object().and_then(JsFunction::from_object);
     Ok(ctx)
@@ -331,6 +403,9 @@ fn error_string(err: JsError, st: &Shared, ctx: &mut Context) -> String {
             Some(i) if msg.ends_with(')') => msg[..i].to_string(),
             _ => msg,
         };
+    }
+    if err.to_string().contains("NoInstructionsRemain") {
+        return format!("policy: script ran more than {MAX_VM_STEPS} VM steps");
     }
     match err.as_opaque().map(|v| to_json_safe(v, st, ctx)) {
         Some(Ok(j)) => format!("Uncaught {j}"),
@@ -371,13 +446,22 @@ async fn drive<B: HostBridge>(code: &str, bridge: &B, st: &Shared, ctx: &mut Con
         .and_then(|o| JsPromise::from_object(o).ok())
         .ok_or("script must not escape its async wrapper")?;
 
-    for _ in 0..MAX_ROUNDS {
+    for round in 0..=MAX_ROUNDS {
         ctx.run_jobs().map_err(|e| error_string(e, st, ctx))?;
         check_budget(bridge)?;
         match promise.state() {
+            PromiseState::Fulfilled(_) if !st.borrow().pending.is_empty() => {
+                // Not sent: the script finished first. Say so instead of reporting success.
+                let n = st.borrow().pending.len();
+                return Err(format!("{n} icp request(s) were started but never awaited, so they were not sent"));
+            }
             PromiseState::Fulfilled(v) => return to_json_safe(&v, st, ctx).map_err(|e| error_string(e, st, ctx)),
             PromiseState::Rejected(e) => return Err(error_string(JsError::from_opaque(e), st, ctx)),
             PromiseState::Pending => {}
+        }
+        if round == MAX_ROUNDS {
+            // Refuse before sending, so this error never follows messages that went out.
+            return Err(format!("script exceeded {MAX_ROUNDS} host round-trips; batch calls with Promise.all"));
         }
         // Never hold the state borrow while JS runs: resolvers re-enter native fns.
         let batch = std::mem::take(&mut st.borrow_mut().pending);
@@ -391,10 +475,7 @@ async fn drive<B: HostBridge>(code: &str, bridge: &B, st: &Shared, ctx: &mut Con
         let replies = futures::future::join_all(batch.iter().map(|p| async move {
             match &p.method {
                 None => bridge.candid(&p.canister).await.map(Value::String),
-                Some(m) => {
-                    let args: Value = serde_json::from_str(&p.args_json).unwrap_or(Value::Null);
-                    bridge.call(&p.canister, m, args).await
-                }
+                Some(m) => bridge.call(&p.canister, m, p.args.clone()).await,
             }
         }))
         .await;
@@ -406,7 +487,7 @@ async fn drive<B: HostBridge>(code: &str, bridge: &B, st: &Shared, ctx: &mut Con
             f.call(&JsValue::undefined(), &[arg], ctx).map_err(|e| error_string(e, st, ctx))?;
         }
     }
-    Err(format!("script exceeded {MAX_ROUNDS} host round-trips; batch calls with Promise.all"))
+    unreachable!("the loop returns on its last round")
 }
 
 #[cfg(test)]
@@ -506,5 +587,75 @@ mod tests {
         block_on(run("const s = 'x'.repeat(100000); for (let i = 0; i < 1000; i++) console.log(s); return 1", &b)).unwrap();
         let total: usize = b.logs.take().iter().map(|l| l.len()).sum();
         assert!(total <= MAX_LOG_BYTES + 64, "{total}");
+    }
+
+    #[test]
+    fn snapshot_counts_object_key_bytes_against_limit() {
+        let err = js(
+            "const o = {}; const k = 'k'.repeat(60000); \
+             for (let i = 0; i < 100; i++) o[i + k] = 1; \
+             return o;",
+        )
+        .unwrap_err();
+        assert!(err.contains("bytes of text"), "{err}");
+    }
+
+    #[test]
+    fn audit_round_two_js_fixes() {
+        const L: &str = "ryjl3-tyaaa-aaaaa-aaaba-cai";
+        // A request the script never awaited was never sent: say so instead of "ok".
+        let e = js(&format!("icp.call('{L}', 'icrc1_decimals', null); return 1")).unwrap_err();
+        assert!(e.contains("never awaited"), "{e}");
+        // Work spread over many calls is stopped by the VM step cap, uncatchably.
+        let e = js("function f() { for (let i = 0; i < 900000; i++) {} } \
+                    try { for (let j = 0; j < 1000; j++) f(); } catch (_) {} return 1")
+            .unwrap_err();
+        assert!(e.contains("VM steps"), "{e}");
+        // Boxed primitives serialise as their values.
+        assert_eq!(js("return [new Number(1), Object('s'), new Boolean(false)]").unwrap(), json!([1, "s", false]));
+        // The process-wide Symbol registry is gone.
+        assert_eq!(js("return [typeof Symbol.for, typeof Symbol.keyFor]").unwrap(), json!(["undefined", "undefined"]));
+        // Over-long ids and method names are refused before they are copied out.
+        let e = js("return await icp.call('x'.repeat(100000), 'm', null)").unwrap_err();
+        assert!(e.contains("longer than"), "{e}");
+        // Text is measured in UTF-8 bytes, like the other runtimes: 1.5M three-byte chars.
+        let e = js("const r = '\\u20ac'.repeat(750000); return r + r").unwrap_err();
+        assert!(e.contains("bytes of text"), "{e}");
+        // Arguments 127 levels deep are sent as they are, not replaced by null.
+        let b = MockBridge::default();
+        let deep = "let a = 1; for (let i = 0; i < 126; i++) a = [a]; return await icp.call('ryjl3-tyaaa-aaaaa-aaaba-cai', 'echo', a)";
+        assert!(block_on(run(deep, &b)).is_ok());
+        assert!(b.calls.borrow().iter().all(|c| !c.2.is_null()), "{:?}", b.calls.borrow().len());
+    }
+
+    #[test]
+    fn string_at_negative_overflow_returns_undefined_without_panicking() {
+        assert_eq!(js("return 'x'.at(-1e19) ?? null").unwrap(), json!(null));
+        assert_eq!(js("return ['abc'.at(-1), 'abc'.at(0), 'abc'.at(1.7), 'abc'.at(NaN), 'abc'.at(3) ?? null]").unwrap(), json!(["c", "a", "b", "a", null]));
+        assert_eq!(js("return ['ab'.padStart(4, '-'), 'ab'.padEnd(3), 'ab'.repeat(2)]").unwrap(), json!(["--ab", "ab ", "abab"]));
+        for code in ["'x'.padStart(2 ** 31)", "'x'.padEnd(1e300)", "'xy'.repeat(2 ** 30)"] {
+            let e = js(&format!("return {code}")).unwrap_err();
+            assert!(e.contains("RangeError"), "{code}: {e}");
+        }
+    }
+
+    #[test]
+    fn pending_and_round_limits_are_enforced() {
+        let e = js(
+            "const a = []; for (let i = 0; i < 65; i++) a.push(icp.call('ryjl3-tyaaa-aaaaa-aaaba-cai', 'm', null)); \
+             return await Promise.all(a);",
+        )
+        .unwrap_err();
+        assert!(e.contains("concurrent icp requests"), "{e}");
+
+        let rounds = js(
+            "let x = 0; for (let i = 0; i < 65; i++) x = (await icp.call('ryjl3-tyaaa-aaaaa-aaaba-cai', 'm', null)).balance; \
+             return x;",
+        )
+        .unwrap_err();
+        assert!(rounds.contains("host round-trips"), "{rounds}");
+
+        let err = js("throw new Error('plain');").unwrap_err();
+        assert!(err.contains("Error: plain"), "{err}");
     }
 }

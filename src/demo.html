@@ -78,7 +78,7 @@
       <button id="btn-init" class="primary">Initialize</button>
       <button id="btn-list">List tools</button>
     </div>
-    <div class="hint">The token stays in this browser (localStorage). Only its SHA-256 hash is stored on-chain.</div>
+    <div class="hint">The token stays in this browser tab (sessionStorage) and is gone when you close it. Only its SHA-256 hash is stored on-chain.</div>
   </section>
 
   <section>
@@ -160,6 +160,8 @@
   </section>
 </main>
 <script>
+// Languages compiled into this canister (filled in when the page is served).
+const LANGS = __LANGUAGES__;
 const LEDGER = "ryjl3-tyaaa-aaaaa-aaaba-cai";
 const EXAMPLES = [
   { name: "Ledger overview (JS)", lang: "javascript", code:
@@ -201,8 +203,10 @@ return await icp.call("${LEDGER}", "icrc1_transfer",
 
 const $ = (id) => document.getElementById(id);
 const store = {
-  get(k) { try { return localStorage.getItem(k) || ""; } catch { return ""; } },
-  set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+  // sessionStorage: the token is gone when the tab closes. Also drop any copy an older
+  // version of this page left in localStorage.
+  get(k) { try { localStorage.removeItem(k); return sessionStorage.getItem(k) || ""; } catch { return ""; } },
+  set(k, v) { try { sessionStorage.setItem(k, v); } catch {} },
 };
 $("token").value = store.get("icp-code-mode-token");
 $("token").addEventListener("change", () => store.set("icp-code-mode-token", $("token").value.trim()));
@@ -276,7 +280,8 @@ $("btn-search").onclick = async () => {
 $("btn-run").onclick = async () => show(await rpc("tools/call", {
   name: "execute_icp_script", arguments: { language: $("lang").value, code: $("code").value } }), "execute");
 
-EXAMPLES.forEach((ex, i) => {
+[...$("lang").options].forEach((o) => { if (!LANGS.includes(o.value)) o.remove(); });
+EXAMPLES.filter((ex) => LANGS.includes(ex.lang)).forEach((ex, i) => {
   const b = document.createElement("button");
   b.textContent = ex.name;
   b.onclick = () => { $("lang").value = ex.lang; $("code").value = ex.code; };
@@ -434,6 +439,11 @@ function li(html) { const e = document.createElement("li"); e.innerHTML = html; 
 const esc = (t) => String(t).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]);
 
 async function runComparison() {
+  if (!LANGS.includes("javascript")) {
+    $("cmp-status").className = "status err";
+    $("cmp-status").textContent = "The comparison runs JavaScript, which this build does not include.";
+    return;
+  }
   const sc = SCENARIOS[scenario];
   const btns = document.querySelectorAll("button");
   btns.forEach((b) => (b.disabled = true));

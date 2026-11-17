@@ -18,6 +18,52 @@ const DECODING_QUOTA: usize = 20_000_000;
 /// at least this deep (see `runtimes::js::MAX_VALUE_DEPTH`).
 pub const MAX_DEPTH: usize = 128;
 
+/// Deepest type nesting accepted in one definition. The parser and type checker recurse
+/// once per level, and about 5,000 levels overflow the 8 MiB Wasm stack: a trap on every
+/// fetch of a hostile interface.
+pub const MAX_DID_NESTING: usize = 256;
+/// Bound on the nesting summed over all definitions. Candid's encoder recurses through
+/// named types (`type A1 = opt A2; type A2 = ...`), once per name, and a chain of 20,000
+/// overflows the stack. A path visits each name once, so this sum bounds its depth.
+pub const MAX_DID_NESTING_SUM: usize = 2_000;
+
+/// (deepest definition, sum over definitions) of the type nesting in `did`, from its
+/// tokens: each `vec`/`opt` prefix and each open bracket is a level. Lexical errors stop
+/// the count; the parser reports them.
+fn nesting(did: &str) -> (usize, usize) {
+    use candid_parser::token::{Token, Tokenizer};
+    let (mut open, mut run, mut max, mut stmt, mut sum) = (vec![0usize], 0usize, 0usize, 0usize, 0usize);
+    for tok in Tokenizer::new(did) {
+        let Ok((_, tok, _)) = tok else { break };
+        let base = *open.last().unwrap_or(&0);
+        match tok {
+            // A top-level `;` or `type` ends a definition.
+            Token::Semi | Token::Type if open.len() == 1 => {
+                sum += stmt;
+                stmt = 0;
+                run = 0;
+            }
+            Token::Vec | Token::Opt => run += 1,
+            // keywords that come before the bracket they open
+            Token::Record | Token::Variant | Token::Func | Token::Service | Token::Arrow => {}
+            Token::LParen | Token::LBrace => {
+                open.push(base + run + 1);
+                run = 0;
+            }
+            Token::RParen | Token::RBrace => {
+                if open.len() > 1 {
+                    open.pop();
+                }
+                run = 0;
+            }
+            _ => run = 0,
+        }
+        stmt = stmt.max(open.last().unwrap_or(&0) + run);
+        max = max.max(stmt);
+    }
+    (max, sum + stmt)
+}
+
 /// A parsed `.did` service.
 pub struct Service {
     pub env: TypeEnv,
@@ -32,6 +78,17 @@ pub struct EncodedCall {
 
 impl Service {
     pub fn parse(did: &str) -> Result<Self, String> {
+        match nesting(did) {
+            (n, _) if n > MAX_DID_NESTING => {
+                return Err(format!("invalid candid interface: types nested {n} levels deep (limit {MAX_DID_NESTING})"));
+            }
+            (_, n) if n > MAX_DID_NESTING_SUM => {
+                return Err(format!(
+                    "invalid candid interface: type definitions nested {n} levels in total (limit {MAX_DID_NESTING_SUM})"
+                ));
+            }
+            _ => {}
+        }
         let invalid = |e: candid_parser::Error| format!("invalid candid interface: {e}");
         let prog: candid_parser::IDLProg = did.parse().map_err(invalid)?;
         let mut env = TypeEnv::new();
@@ -68,7 +125,13 @@ impl Service {
             // Single-arg method: `[x]` is a positional wrapper unless the argument type is
             // itself array-shaped (vec/tuple) and `x` is not an array.
             Value::Array(a) if a.len() == 1 && (a[0].is_array() || !is_array_like(&self.env, &func.args[0])) => {
-                vec![&a[0]]
+                // `[[1, 2]]` for a `vec vec nat` argument is the bare value, not a wrapper:
+                // when the wrapped reading does not fit the type, fall back to the bare one.
+                if is_array_like(&self.env, &func.args[0]) && json_to_idl(&self.env, &func.args[0], &a[0], 0).is_err() {
+                    vec![args]
+                } else {
+                    vec![&a[0]]
+                }
             }
             v if n == 1 => vec![v],
             _ => return Err(format!("method `{method}` takes {n} arguments; pass them as a JSON array")),
@@ -102,6 +165,7 @@ impl Service {
             .set_full_error_message(false); // otherwise errors embed the whole reply in hex
         let args = IDLArgs::from_bytes_with_types_with_config(bytes, &self.env, &func.rets, &cfg)
             .map_err(|e| format!("candid decoding failed: {e}"))?;
+        self.check_reply_types(func, bytes)?;
         let mut out: Vec<Value> = args.args.iter().map(|v| idl_to_json(v, 0)).collect::<Result<_, _>>()?;
         Ok(match out.len() {
             0 => Value::Null,
@@ -111,15 +175,45 @@ impl Service {
     }
 }
 
+impl Service {
+    /// Candid's "special opt rule" decodes an `opt` value whose type does not match ours
+    /// as `null`, silently. That happens when the target was upgraded and our copy of its
+    /// interface is stale, so a mismatch is an error here instead. Called after a
+    /// successful decode, so the type table already passed the decoder's size limits.
+    fn check_reply_types(&self, func: &Function, bytes: &[u8]) -> Result<(), String> {
+        use binrw::BinRead;
+        use candid::types::subtype::{Gamma, OptReport, subtype_with_config};
+        let header = candid::binary_parser::Header::read_le_args(&mut std::io::Cursor::new(bytes), (None,))
+            .map_err(|e| format!("candid decoding failed: {e}"))?;
+        let (wire_env, wire) = header.to_types().map_err(|e| format!("candid decoding failed: {e}"))?;
+        let tuple = |ts: Vec<Type>| -> Type {
+            let fields = ts.into_iter().enumerate().map(|(i, ty)| Field { id: Label::Unnamed(i as u32).into(), ty });
+            TypeInner::Record(fields.collect()).into()
+        };
+        let mut env = self.env.clone();
+        let wire = env.merge_type(wire_env, tuple(wire));
+        subtype_with_config(OptReport::Error, &mut Gamma::default(), &env, &wire, &tuple(func.rets.clone())).map_err(|_| {
+            "reply types do not match the interface (an optional value would have been dropped); \
+             the target's interface has probably changed"
+                .to_string()
+        })
+    }
+}
+
 /// `true` when the type is itself encoded as a JSON array (vec / tuple record),
 /// which makes `[x]` ambiguous for single-argument methods.
 fn is_array_like(env: &TypeEnv, ty: &Type) -> bool {
-    match env.trace_type(ty).as_deref() {
-        Ok(TypeInner::Vec(_)) => true,
-        Ok(TypeInner::Record(fs)) => is_tuple(fs),
-        Ok(TypeInner::Opt(inner)) => is_array_like(env, inner),
-        _ => false,
+    // A loop with a bound, not recursion: `type A = opt A` is a legal type.
+    let mut ty = ty.clone();
+    for _ in 0..MAX_DEPTH {
+        match env.trace_type(&ty).as_deref() {
+            Ok(TypeInner::Vec(_)) => return true,
+            Ok(TypeInner::Record(fs)) => return is_tuple(fs),
+            Ok(TypeInner::Opt(inner)) => ty = inner.clone(),
+            _ => return false,
+        }
     }
+    false
 }
 
 fn is_tuple(fields: &[Field]) -> bool {
@@ -152,8 +246,11 @@ fn num_text(v: &Value) -> Option<String> {
     match v {
         // Integral floats (JS numbers) are accepted as integers: 3e9 -> "3000000000".
         Value::Number(n) if n.is_f64() => match n.as_f64() {
+            // Beyond 2^53 a float is already rounded: refuse it rather than send a nearby
+            // number. Exact big values come as decimal strings.
+            Some(f) if f.abs() > MAX_SAFE_INT as f64 => Some(format!("{f} (beyond 2^53, so rounded; pass it as a decimal string)")),
             // `+ 0.0` turns JS's -0 into 0, which would otherwise print as "-0".
-            Some(f) if f.fract() == 0.0 && f.abs() < 1e19 => Some(format!("{:.0}", f + 0.0)),
+            Some(f) if f.fract() == 0.0 => Some(format!("{:.0}", f + 0.0)),
             _ => Some(n.to_string()),
         },
         Value::Number(n) => Some(n.to_string()),
@@ -162,8 +259,17 @@ fn num_text(v: &Value) -> Option<String> {
     }
 }
 
+/// Largest integer in a reply converted to text (about 30,000 digits).
+const MAX_INT_BITS: u64 = 100_000;
+/// Longest decimal text accepted for an integer. Parsing big integers is quadratic, and
+/// one parse cannot be interrupted; 1,000 digits is far beyond any amount.
+const MAX_INT_DIGITS: usize = 1_000;
+
 fn int<T: std::str::FromStr>(v: &Value, what: &str) -> Result<T, String> {
     let s = num_text(v).ok_or_else(|| format!("expected {what}, got {}", kind(v)))?;
+    if s.len() > MAX_INT_DIGITS {
+        return Err(format!("{what} has more than {MAX_INT_DIGITS} digits"));
+    }
     s.parse::<T>().map_err(|_| format!("`{s}` is not a valid {what}"))
 }
 
@@ -230,7 +336,8 @@ pub fn json_to_idl(env: &TypeEnv, ty: &Type, v: &Value, depth: usize) -> Result<
         }
         TypeInner::Opt(inner) => match v {
             Value::Null => IDLValue::None,
-            _ => IDLValue::Opt(Box::new(json_to_idl(env, inner, v, d)?)),
+            // `opt` adds no JSON level, so it does not count toward the depth.
+            _ => IDLValue::Opt(Box::new(json_to_idl(env, inner, v, depth)?)),
         },
         TypeInner::Vec(inner) => {
             let is_blob = matches!(env.trace_type(inner).as_deref(), Ok(TypeInner::Nat8));
@@ -245,7 +352,8 @@ pub fn json_to_idl(env: &TypeEnv, ty: &Type, v: &Value, depth: usize) -> Result<
                 ),
                 // Hex string for blobs: "0x0a0b..." or plain hex.
                 Value::String(s) if is_blob => IDLValue::Blob(
-                    hex::decode(s.trim_start_matches("0x")).map_err(|e| format!("blob hex: {e}"))?,
+                    hex::decode(s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s))
+                        .map_err(|e| format!("blob hex: {e}"))?,
                 ),
                 _ => return Err(format!("expected array, got {}", kind(v))),
             }
@@ -333,7 +441,7 @@ pub fn idl_to_json(v: &IDLValue, depth: usize) -> Result<Value, String> {
         IDLValue::Number(s) => big(s.replace('_', "")),
         IDLValue::Float64(f) => f64_json(*f),
         IDLValue::Float32(f) => f64_json(*f as f64),
-        IDLValue::Opt(inner) => idl_to_json(inner, d)?,
+        IDLValue::Opt(inner) => idl_to_json(inner, depth)?,
         IDLValue::Vec(items) => Value::Array(all(&mut items.iter())?),
         IDLValue::Blob(bytes) => Value::Array(bytes.iter().map(|b| Value::from(*b)).collect()),
         IDLValue::Record(fields) => {
@@ -352,6 +460,9 @@ pub fn idl_to_json(v: &IDLValue, depth: usize) -> Result<Value, String> {
         IDLValue::Variant(VariantValue(f, _)) => Value::Object(Map::from_iter([(label_name(&f.id), idl_to_json(&f.val, d)?)])),
         IDLValue::Principal(p) | IDLValue::Service(p) => Value::String(p.to_text()),
         IDLValue::Func(p, m) => serde_json::json!({ "principal": p.to_text(), "method": m }),
+        // Decimal text of a huge number costs time quadratic in its size.
+        IDLValue::Nat(n) if n.0.bits() > MAX_INT_BITS => return Err(format!("reply has a nat of {} bits", n.0.bits())),
+        IDLValue::Int(n) if n.0.bits() > MAX_INT_BITS => return Err(format!("reply has an int of {} bits", n.0.bits())),
         IDLValue::Nat(n) => big(n.0.to_str_radix(10)),
         IDLValue::Int(n) => big(n.0.to_str_radix(10)),
         IDLValue::Nat8(n) => Value::from(*n),
@@ -464,8 +575,200 @@ mod tests {
     fn deep_replies_error_instead_of_truncating() {
         let mut v = IDLValue::Null;
         for _ in 0..=MAX_DEPTH + 1 {
-            v = IDLValue::Opt(Box::new(v));
+            v = IDLValue::Vec(vec![v]);
         }
         assert!(idl_to_json(&v, 0).unwrap_err().contains("nested deeper"));
+        // `opt` adds no JSON level, so it does not use up the depth (both directions).
+        let mut v = IDLValue::Null;
+        for _ in 0..200 {
+            v = IDLValue::Opt(Box::new(v));
+        }
+        assert_eq!(idl_to_json(&v, 0).unwrap(), Value::Null);
+        let s = Service::parse("type L = opt record { nat; L }; service : { f : (L) -> () }").unwrap();
+        let mut list = json!(null);
+        for i in 0..60 {
+            list = json!([i, list]);
+        }
+        assert!(s.encode_args("f", &json!([list])).is_ok(), "60 nodes, 60 JSON levels");
+        // Numbers: rounded floats and over-long decimal text are refused.
+        let n = Service::parse("service : { f : (nat) -> (); g : (nat64) -> () }").unwrap();
+        assert!(n.encode_args("f", &json!(9_007_199_254_740_993.0)).err().unwrap().contains("decimal string"));
+        assert!(n.encode_args("g", &json!(1e18)).is_err());
+        assert!(n.encode_args("f", &json!("18446744073709551616")).is_ok());
+        assert!(n.encode_args("f", &json!("9".repeat(MAX_INT_DIGITS + 1))).err().unwrap().contains("digits"));
+        let huge = IDLValue::Nat(candid::Nat(candid::Nat::from(1u8).0 << 200_000u32));
+        assert!(idl_to_json(&huge, 0).unwrap_err().contains("bits"));
+    }
+
+    #[test]
+    fn decode_reply_rejects_mismatched_opt_type() {
+        let target = Service::parse("service : { f : (record { val : opt nat }) -> () }").unwrap();
+        let stale = Service::parse("service : { f : () -> (record { val : opt text }) }").unwrap();
+        let bytes = target.encode_args("f", &json!({ "val": 42 })).unwrap().bytes;
+        let stale_func = stale.method("f").unwrap();
+        assert!(stale.decode_reply(stale_func, &bytes).is_err());
+        // Ordinary upgrades still decode: a new field we don't know, a missing optional one.
+        let newer = Service::parse("service : { f : (record { val : opt nat; extra : text }) -> () }").unwrap();
+        let bytes = newer.encode_args("f", &json!({ "val": 42, "extra": "x" })).unwrap().bytes;
+        let older = Service::parse("service : { f : () -> (record { val : opt nat; gone : opt text }) }").unwrap();
+        let v = older.decode_reply(older.method("f").unwrap(), &bytes).unwrap();
+        assert_eq!(v, json!({ "val": 42, "gone": null }));
+    }
+
+    #[test]
+    fn deep_and_recursive_interfaces_are_safe() {
+        // Rejected before the parser recurses (5,000 levels overflowed an 8 MiB stack).
+        let deep = format!("service : {{ f : ({}nat) -> () }}", "vec ".repeat(100_000));
+        assert!(Service::parse(&deep).err().unwrap().contains("nested"));
+        let deep = format!("service : {{ f : ({}nat{}) -> () }}", "record { a : ".repeat(5_000), " }".repeat(5_000));
+        assert!(Service::parse(&deep).err().unwrap().contains("nested"));
+        // Comments and ordinary interfaces don't count as nesting.
+        assert!(Service::parse(&format!("// {}\n{DID}", "{ ( ".repeat(1000))).is_ok());
+        assert!(nesting(DID).0 < 10);
+        // A long chain of named types: refused before candid's encoder recurses through it.
+        let chain = |n: usize| -> String {
+            let mut c: String = (0..n).map(|i| format!("type A{i} = opt A{};\n", i + 1)).collect();
+            c.push_str(&format!("type A{n} = nat;\ntype R = opt R;\nservice : {{ f : (A0) -> (); g : (R) -> () }}"));
+            c
+        };
+        assert!(Service::parse(&chain(20_000)).err().unwrap().contains("in total"));
+        // Within the limits, everything that walks the types is safe on an 8 MiB stack (the
+        // canister's), including at the limit.
+        std::thread::Builder::new()
+            .stack_size(8 << 20)
+            .spawn(move || {
+                assert!(Service::parse(&chain(500)).unwrap().encode_args("f", &json!([null])).is_ok());
+                let s = Service::parse(&chain(MAX_DID_NESTING_SUM - 10)).unwrap();
+                // At the limit candid's own recursion guard answers with an error, not a crash.
+                let _ = s.encode_args("f", &json!([null]));
+                // `type R = opt R` used to recurse forever deciding whether `[x]` wraps an argument.
+                assert!(s.encode_args("g", &json!([null])).is_ok());
+                assert!(s.encode_args("g", &json!([1])).is_err());
+                let entry = crate::search::Entry {
+                    canister: Principal::anonymous(),
+                    allowed: vec!["*".into()],
+                    service: Ok(Some(std::rc::Rc::new(s))),
+                };
+                let out = crate::search::render(&Default::default(), &[entry]);
+                assert_eq!(out["canisters"][0]["types"].as_object().unwrap().len(), MAX_DID_NESTING_SUM - 10 + 2); // A0..=A1990 and R
+                let deep = format!("service : {{ f : ({}nat) -> () }}", "vec ".repeat(MAX_DID_NESTING - 2)); // + the two brackets
+                let s = Service::parse(&deep).unwrap();
+                assert!(s.encode_args("f", &json!(null)).is_err());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn single_arg_nested_vec_does_not_unwrap_outer_array() {
+        let s = Service::parse("service : { f : (vec vec nat) -> () }").unwrap();
+        let enc = s.encode_args("f", &json!([[1, 2]])).unwrap();
+        let as_reply = Function { modes: vec![], args: vec![], rets: enc.func.args.clone() };
+        assert_eq!(s.decode_reply(&as_reply, &enc.bytes).unwrap(), json!([[1, 2]]));
+    }
+
+    #[test]
+    fn blob_hex_accepts_uppercase_prefix_and_rejects_repeated_prefix() {
+        let s = Service::parse(DID).unwrap();
+        assert!(s.encode_args("balance_of", &json!({ "owner": "aaaaa-aa", "subaccount": "0X0aff" })).is_ok());
+        assert!(s.encode_args("balance_of", &json!({ "owner": "aaaaa-aa", "subaccount": "0x0x0aff" })).is_err());
+    }
+
+    #[test]
+    fn all_candid_types_and_error_edge_cases() {
+        let rich = r#"
+            type Sparse = record { 0 : text; 5 : nat16 };
+            type EmptyRec = record {};
+            type F = func (nat) -> (text);
+            type S = service { p : () -> () };
+            service : (nat) -> {
+              scalars : (null, reserved, bool, nat16, nat32, int8, int16, int32, int64, float32, float64, S, F)
+                     -> (null, reserved, bool, nat16, nat32, int8, int16, int32, int64, float32, float64, S, F);
+              sparse : (Sparse) -> (Sparse);
+              empty_rec : (EmptyRec) -> (EmptyRec);
+              unit : () -> ();
+              dead : (empty) -> ();
+              vec_text : (vec text) -> (vec text);
+              opt_vec : (opt vec nat) -> (opt vec nat);
+              big_nat : (nat) -> ();
+            }
+        "#;
+        let s = Service::parse(rich).unwrap();
+        let in_vals = json!([
+            null,
+            "anything",
+            true,
+            65535,
+            4294967295u64,
+            -128,
+            -32768,
+            -2147483648i64,
+            "-9223372036854775808",
+            1.5,
+            -2.25,
+            "aaaaa-aa",
+            { "principal": "aaaaa-aa", "method": "p" }
+        ]);
+        let enc = s.encode_args("scalars", &in_vals).unwrap();
+        let as_reply = Function { modes: vec![], args: vec![], rets: enc.func.rets.clone() };
+        let dec = s.decode_reply(&as_reply, &enc.bytes).unwrap();
+        assert_eq!(dec[2], json!(true));
+        assert_eq!(dec[8], json!("-9223372036854775808"));
+        assert_eq!(dec[12], json!({ "principal": "aaaaa-aa", "method": "p" }));
+
+        // Func array form and float non-finite / -inf decoding.
+        let mut arr_vals = in_vals.clone();
+        arr_vals[12] = json!(["aaaaa-aa", "p"]);
+        arr_vals[10] = json!("-inf");
+        let enc2 = s.encode_args("scalars", &arr_vals).unwrap();
+        let dec2 = s.decode_reply(&as_reply, &enc2.bytes).unwrap();
+        assert_eq!(dec2[10], json!("-inf"));
+        assert_eq!(dec2[12], json!({ "principal": "aaaaa-aa", "method": "p" }));
+
+        // Sparse numeric record + `_5_` field name form.
+        let sp = s.encode_args("sparse", &json!({ "0": "hi", "_5_": 9 })).unwrap();
+        let sp_reply = Function { modes: vec![], args: vec![], rets: sp.func.rets.clone() };
+        assert_eq!(s.decode_reply(&sp_reply, &sp.bytes).unwrap(), json!({ "0": "hi", "5": 9 }));
+
+        // Zero-arg/zero-ret roundtrip & decoding errors.
+        let unit = s.encode_args("unit", &json!(null)).unwrap();
+        let unit_reply = Function { modes: vec![], args: vec![], rets: unit.func.rets.clone() };
+        assert_eq!(s.decode_reply(&unit_reply, &unit.bytes).unwrap(), Value::Null);
+        assert!(s.decode_reply(&unit_reply, b"not-didl").is_err());
+
+        // opt (vec nat) array-like handling & empty record from null & >=1e19 float & IDLValue::Number.
+        assert!(s.encode_args("opt_vec", &json!([[1, 2]])).is_ok());
+        assert!(s.encode_args("opt_vec", &json!([1, 2])).is_ok());
+        assert!(s.encode_args("opt_vec", &json!(null)).is_ok());
+        assert!(s.encode_args("empty_rec", &json!(null)).is_ok());
+        assert!(s.encode_args("big_nat", &json!(1e25)).is_err());
+        assert_eq!(idl_to_json(&IDLValue::Number("1_000".into()), 0).unwrap(), json!(1000));
+
+        // Error branches across kind(), int(), float(), vec, record, variant, func, empty, depth.
+        assert!(s.encode_args("scalars", &json!({})).is_err());
+        assert!(s.encode_args("dead", &json!(null)).is_err());
+        assert!(s.encode_args("vec_text", &json!("not-array")).is_err());
+        assert!(s.encode_args("vec_text", &json!([123])).err().unwrap().contains("[0]:"));
+        assert!(s.encode_args("sparse", &json!("not-obj")).is_err());
+        assert!(s.encode_args("unit", &json!([])).is_ok());
+
+        let base = Service::parse(DID).unwrap();
+        assert!(base.encode_args("pair", &json!([[1]])).err().unwrap().contains("tuple of 2"));
+        assert!(base.encode_args("set_status", &json!(["aaaaa-aa", {}])).is_err());
+        assert!(base.encode_args("balance_of", &json!({ "owner": null })).err().unwrap().contains("null"));
+        assert!(base.encode_args("many", &json!([true, null])).err().unwrap().contains("bool"));
+        assert!(base.encode_args("many", &json!([[], null])).err().unwrap().contains("array"));
+        assert!(base.encode_args("many", &json!([{}, null])).err().unwrap().contains("object"));
+        assert!(s.encode_args("scalars", &json!([null, null, false, 0, 0, 0, 0, 0, 0, "badf", 0.0, "aaaaa-aa", ["aaaaa-aa", "p"]])).is_err());
+        assert!(s.encode_args("scalars", &json!([null, null, false, 0, 0, 0, 0, 0, 0, true, 0.0, "aaaaa-aa", ["aaaaa-aa", "p"]])).is_err());
+        assert!(s.encode_args("scalars", &json!([null, null, false, 0, 0, 0, 0, 0, 0, 1.0, 1.0, "aaaaa-aa", 42])).is_err());
+        assert!(s.encode_args("scalars", &json!([null, null, false, 0, 0, 0, 0, 0, 0, 3e25, 0.0, "aaaaa-aa", ["aaaaa-aa", "p"]])).is_ok());
+
+        let mut deep = json!(1);
+        for _ in 0..=MAX_DEPTH + 1 {
+            deep = json!([deep]);
+        }
+        assert!(json_to_idl(&s.env, &candid::types::TypeInner::Nat.into(), &deep, MAX_DEPTH + 1).is_err());
     }
 }

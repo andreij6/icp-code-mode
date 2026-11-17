@@ -84,6 +84,7 @@ pub enum OrderError {
     EmptyOrder,
     UnknownProduct(u64),
     OutOfStock { product_id: u64, available: u32 },
+    ZeroQuantity(u64),
 }
 
 struct Store {
@@ -216,7 +217,7 @@ fn search_products(text: String) -> Vec<Product> {
     with(|s| {
         s.products
             .iter()
-            .filter(|(p, _)| p.name.to_lowercase().contains(&q) || p.category.contains(&q))
+            .filter(|(p, _)| p.name.to_lowercase().contains(&q) || p.category.to_lowercase().contains(&q))
             .map(|(p, _)| p.clone())
             .collect()
     })
@@ -242,14 +243,14 @@ fn list_orders(customer: Option<Principal>) -> Vec<Order> {
 #[ic_cdk::query]
 fn sales_summary() -> SalesSummary {
     with(|s| {
-        let mut by: Vec<(String, u64, u64)> = vec![];
-        let mut revenue = 0u64;
+        let mut by: Vec<(String, u64, u128)> = vec![];
+        let mut revenue = 0u128;
         let mut count = 0u64;
         for o in s.orders.iter().filter(|o| o.status != OrderStatus::Cancelled) {
             count += 1;
             for it in &o.items {
                 let (p, cents) = &s.products[(it.product_id - 1) as usize];
-                let line = cents * it.quantity as u64;
+                let line = *cents as u128 * it.quantity as u128;
                 revenue += line;
                 match by.iter_mut().find(|(c, ..)| *c == p.category) {
                     Some(e) => {
@@ -283,15 +284,30 @@ fn create_order(customer: Principal, items: Vec<OrderItem>) -> Result<Order, Ord
         if !s.customers.iter().any(|c| c.id == customer) {
             return Err(OrderError::UnknownCustomer);
         }
-        let mut total = 0u64;
+        let mut total = 0u128;
+        // Quantity per product across all lines, so repeating a product can't oversell it.
+        let mut wanted: Vec<(u64, u64)> = vec![];
         for it in &items {
             let (_, cents) = s.products.iter().find(|(p, _)| p.id == it.product_id).ok_or(OrderError::UnknownProduct(it.product_id))?;
+            if it.quantity == 0 {
+                return Err(OrderError::ZeroQuantity(it.product_id));
+            }
+            let n = match wanted.iter_mut().find(|(id, _)| *id == it.product_id) {
+                Some(w) => {
+                    w.1 += it.quantity as u64;
+                    w.1
+                }
+                None => {
+                    wanted.push((it.product_id, it.quantity as u64));
+                    it.quantity as u64
+                }
+            };
             let inv = &s.inventory[(it.product_id - 1) as usize];
             let available = inv.on_hand.saturating_sub(inv.reserved);
-            if it.quantity > available {
+            if n > available as u64 {
                 return Err(OrderError::OutOfStock { product_id: it.product_id, available });
             }
-            total += cents * it.quantity as u64;
+            total += *cents as u128 * it.quantity as u128;
         }
         for it in &items {
             s.inventory[(it.product_id - 1) as usize].reserved += it.quantity;
@@ -365,5 +381,50 @@ mod tests {
         assert_eq!(list_products(Some("TEA".into())).len(), 4);
         assert_eq!(search_products("mug".into()).len(), 1);
         assert_eq!(sales_summary().by_category.len(), 3);
+    }
+
+    #[test]
+    fn create_order_rejects_duplicate_product_oversell_and_zero_quantity() {
+        let customer = customer_principal(0);
+        let inv = get_inventory(1).unwrap();
+        let avail = inv.on_hand - inv.reserved;
+        assert!(avail > 0);
+        let dup = vec![OrderItem { product_id: 1, quantity: avail }, OrderItem { product_id: 1, quantity: avail }];
+        assert!(create_order(customer, dup).is_err());
+        assert!(create_order(customer, vec![OrderItem { product_id: 1, quantity: 0 }]).is_err());
+    }
+
+    #[test]
+    fn read_error_and_write_edge_cases() {
+        let cust = customer_principal(0);
+        let stranger = Principal::from_text("aaaaa-aa").unwrap();
+
+        assert!(get_product(1).is_some() && get_product(999).is_none());
+        assert!(get_inventory(1).is_some() && get_inventory(999).is_none());
+        assert!(get_customer(cust).is_some() && get_customer(stranger).is_none());
+        assert_eq!(list_products(None).len(), 12);
+        assert!(list_products(Some("unknown".into())).is_empty());
+        assert_eq!(list_orders(None).len(), 60);
+        assert!(!list_orders(Some(cust)).is_empty());
+        assert!(list_orders(Some(stranger)).is_empty());
+        assert!(!search_products("BEANS".into()).is_empty());
+        assert!(search_products("nonexistent".into()).is_empty());
+
+        // Order error branches (none touch ic_cdk::api::time).
+        assert!(matches!(create_order(cust, vec![]), Err(OrderError::EmptyOrder)));
+        assert!(matches!(create_order(stranger, vec![OrderItem { product_id: 1, quantity: 1 }]), Err(OrderError::UnknownCustomer)));
+        assert!(matches!(create_order(cust, vec![OrderItem { product_id: 999, quantity: 1 }]), Err(OrderError::UnknownProduct(999))));
+        assert!(matches!(create_order(cust, vec![OrderItem { product_id: 1, quantity: u32::MAX }]), Err(OrderError::OutOfStock { product_id: 1, .. })));
+
+        // Cancel order edge cases & seeded pending order (#9, since k=8 => 8 % 10 == 8).
+        assert!(cancel_order(9999).is_err());
+        assert!(cancel_order(1).is_err()); // Delivered
+        let cancelled = cancel_order(9).unwrap();
+        assert!(cancelled.status == OrderStatus::Cancelled);
+
+        // Restock hit & miss.
+        assert!(restock(999, 5).is_err());
+        let before = get_inventory(2).unwrap().on_hand;
+        assert_eq!(restock(2, 5).unwrap().on_hand, before + 5);
     }
 }

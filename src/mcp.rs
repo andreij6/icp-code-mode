@@ -24,9 +24,15 @@ pub const MAX_REPLY_BYTES: usize = 1_900_000;
 /// Messages per JSON-RPC batch. Without a cap, thousands of tiny invalid messages
 /// inflate the reply past the limit, and the resulting trap rolls back the audit entry.
 pub const MAX_BATCH: usize = 50;
-/// Searches per HTTP request. Each one may fetch interfaces under its own call cap, so
-/// an uncapped batch would multiply outbound messages and audit entries.
-pub const MAX_SEARCHES: usize = 5;
+/// Only the first `tools/call` in a batch runs; later ones get this error, on both
+/// routes. Each tool call has its own instruction and call budget, so a batch would
+/// multiply them, and a trap in a later call would roll back the audit entry an earlier
+/// call wrote after its last await.
+/// Largest request body: room for the biggest script, JSON-escaped, plus the envelope.
+pub const MAX_BODY_BYTES: usize = 128 * 1024;
+/// Longest search query accepted.
+pub const MAX_QUERY_BYTES: usize = 256;
+const ONE_TOOL_CALL: &str = "only one tools/call per HTTP request";
 
 #[derive(CandidType, Deserialize, Clone, Debug)]
 pub struct HttpRequest {
@@ -61,12 +67,17 @@ impl HttpResponse {
     fn json(status_code: u16, v: &Value) -> Self {
         Self::new(status_code, serde_json::to_vec(v).unwrap_or_default(), Some("application/json"))
     }
+    pub fn too_many_requests(e: &str) -> Self {
+        let mut r = Self::json(429, &json!({ "error": e }));
+        r.headers.push(("retry-after".into(), "60".into()));
+        r
+    }
     fn upgrade() -> Self {
         Self { upgrade: Some(true), ..Self::new(200, vec![], None) }
     }
 }
 
-const SEARCH_DESCRIPTION: &str = r#"Find what execute_icp_script may call: the allowlisted canisters, their allowed methods with Candid signatures, and the definitions of the types those signatures use. Read-only, fast and free (no consensus round, no audit entry, does not count toward the call cap). Call this first, then write the script.
+const SEARCH_DESCRIPTION: &str = r#"Find what execute_icp_script may call: the allowlisted canisters, their allowed methods with Candid signatures, and the definitions of the types those signatures use. Read-only. Usually answered from cache, fast and free; a search that must fetch an interface first runs as an audited update call. Call this first, then write the script.
 
 - No arguments: everything that is allowed (up to 40 methods; a note says how many more matched).
 - query: space-separated keywords, all of which must appear in the method name or signature, e.g. "balance" or "transfer account".
@@ -76,13 +87,15 @@ Candid to JSON when calling: records are objects, variants are {"Tag": value} (o
 
 const TOOL_DESCRIPTION: &str = r#"Run a short script inside the canister's deterministic Wasm sandbox. Use it to batch inter-canister calls, filter/transform data, and return ONE distilled JSON result. Use search_icp_canisters first to find canister ids, allowed methods and signatures. Policy (canister/method allowlist, call cap, instruction budget) is enforced on-chain; every run is audited.
 
+The `language` parameter lists the languages this canister was built with; the first is the default.
+
 Injected `icp` SDK (identical semantics in every language):
 - icp.candid(canister_id) -> string        the target's .did interface text
 - icp.call(canister_id, method, args) -> value   args: JSON-like value; a list for multi-arg methods. nat/int come back as numbers when JS-safe, else decimal strings; principals as text; opt as value|null; variants as {"Tag": value}.
 - icp.principal() -> string                this canister's principal
 - print / console.log output is captured and returned alongside the result.
 
-JavaScript (default): script body runs inside an async function; `return` the result.
+JavaScript: script body runs inside an async function; `return` the result.
   const [a, b] = await Promise.all([
     icp.call("ryjl3-tyaaa-aaaaa-aaaba-cai", "icrc1_balance_of", {owner: "aaaaa-aa"}),
     icp.call("ryjl3-tyaaa-aaaaa-aaaba-cai", "icrc1_decimals", null)]);
@@ -98,7 +111,7 @@ Rhai: module syntax (`call` is a reserved word, so it is icp::call_canister); th
   let bal = icp::call_canister("ryjl3-tyaaa-aaaaa-aaaba-cai", "icrc1_balance_of", #{owner: "aaaaa-aa"});
   #{balance: bal, me: icp::principal()}
 
-No network, filesystem, clock, or randomness (Date/time are fixed to the block time; Math.random is removed)."#;
+No network, filesystem, clock, or randomness (Date/time are fixed to the block time; Math.random is removed; Python's random is a fixed-seed sequence, the same in every run, so never use it for nonces or memos)."#;
 
 pub fn tools_list() -> Value {
     json!({ "tools": [{
@@ -107,7 +120,7 @@ pub fn tools_list() -> Value {
         "inputSchema": {
             "type": "object",
             "properties": {
-                "query": { "type": "string", "description": "Keywords to match against method names and signatures." },
+                "query": { "type": "string", "maxLength": MAX_QUERY_BYTES, "description": "Keywords to match against method names and signatures." },
                 "canister_id": { "type": "string", "description": "Only this canister (principal text)." }
             },
             "additionalProperties": false
@@ -122,8 +135,8 @@ pub fn tools_list() -> Value {
                 "code": { "type": "string", "description": "Source code to run inside the sandbox." },
                 "language": {
                     "type": "string",
-                    "enum": ["javascript", "python", "rhai"],
-                    "default": "javascript",
+                    "enum": Language::ENABLED.iter().map(|l| l.as_str()).collect::<Vec<_>>(),
+                    "default": Language::ENABLED.first().map(|l| l.as_str()),
                     "description": "Runtime language."
                 }
             },
@@ -154,10 +167,9 @@ fn rpc_ok(id: Value, result: Value) -> Value {
 
 /// Build an MCP `CallToolResult` from a script outcome plus captured output.
 pub fn tool_result(outcome: Result<Value, String>, logs: Vec<String>) -> Value {
-    let (mut text, is_error) = match outcome {
-        Ok(Value::String(s)) => (s, false),
-        Ok(v) => (serde_json::to_string(&v).unwrap_or_default(), false),
-        Err(e) => (e, true), // engines already prefix their error type
+    let (mut text, is_error) = match outcome.map(result_text) {
+        Ok(Ok(t)) => (t, false),
+        Ok(Err(e)) | Err(e) => (e, true), // engines already prefix their error type
     };
     truncate_escaped(&mut text, MAX_RESULT_BYTES);
     let mut content = vec![json!({ "type": "text", "text": text })];
@@ -167,6 +179,29 @@ pub fn tool_result(outcome: Result<Value, String>, logs: Vec<String>) -> Value {
         content.push(json!({ "type": "text", "text": format!("[console output]\n{out}") }));
     }
     json!({ "content": content, "isError": is_error })
+}
+
+/// The text a result is sent as, or an error if it is over `MAX_RESULT_BYTES` once escaped:
+/// a result cut in the middle would be invalid JSON reported as success.
+pub fn result_text(v: Value) -> Result<String, String> {
+    let text = match v {
+        Value::String(s) => s,
+        v => serde_json::to_string(&v).unwrap_or_default(),
+    };
+    match escaped_len(&text) {
+        n if n > MAX_RESULT_BYTES => Err(format!("result is {n} bytes, over the {MAX_RESULT_BYTES}-byte limit; return less data")),
+        _ => Ok(text),
+    }
+}
+
+fn escaped_len(s: &str) -> usize {
+    s.chars()
+        .map(|c| match c {
+            '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+            c if (c as u32) < 0x20 => 6,
+            c => c.len_utf8(),
+        })
+        .sum()
 }
 
 /// Truncate so the *JSON-escaped* form fits in `max` bytes (control characters
@@ -209,20 +244,44 @@ fn opt_string(args: &Value, key: &str) -> Result<Option<String>, String> {
 
 fn parse_tool_call(params: &Value) -> Result<ToolRequest, String> {
     let name = params.get("name").and_then(Value::as_str).unwrap_or_default();
-    let args = params.get("arguments").cloned().unwrap_or(Value::Null);
+    let args = match params.get("arguments") {
+        None | Some(Value::Null) => &Value::Object(Default::default()),
+        Some(a @ Value::Object(_)) => a,
+        Some(_) => return Err("`arguments` must be an object".into()),
+    };
+    // The schemas say `additionalProperties: false`; hold clients to it, so a misspelt
+    // argument is an error rather than silently ignored.
+    let known: &[&str] = match name {
+        TOOL_NAME => &["code", "language"],
+        SEARCH_TOOL_NAME => &["query", "canister_id"],
+        _ => &[],
+    };
+    if let Some(k) = args.as_object().into_iter().flatten().map(|(k, _)| k).find(|k| !known.contains(&k.as_str())) {
+        if !known.is_empty() {
+            let mut k = k.clone();
+            crate::bridge::truncate(&mut k, 64);
+            return Err(format!("unknown argument `{k}`"));
+        }
+    }
+    let args = args.clone();
     match name {
         TOOL_NAME => {
             let code = args.get("code").and_then(Value::as_str).ok_or("missing string argument `code`")?;
-            let language = match opt_string(&args, "language")? {
-                None => Language::JavaScript,
-                Some(s) => s.parse()?,
+            let language = match args.get("language") {
+                None => *Language::ENABLED.first().ok_or("no language is compiled into this canister")?,
+                Some(Value::String(s)) => s.parse()?,
+                Some(_) => return Err("`language` must be a string".into()),
             };
             Ok(ToolRequest::Execute(ToolCall { language, code: code.to_string() }))
         }
-        SEARCH_TOOL_NAME => Ok(ToolRequest::Search(SearchArgs {
-            query: opt_string(&args, "query")?,
-            canister_id: opt_string(&args, "canister_id")?,
-        })),
+        SEARCH_TOOL_NAME => {
+            let query = opt_string(&args, "query")?;
+            // Matching costs keywords x methods; keep it far below the query limit.
+            if query.as_ref().is_some_and(|q| q.len() > MAX_QUERY_BYTES) {
+                return Err(format!("`query` is longer than {MAX_QUERY_BYTES} bytes"));
+            }
+            Ok(ToolRequest::Search(SearchArgs { query, canister_id: opt_string(&args, "canister_id")? }))
+        }
         _ => Err(format!("unknown tool `{name}`")),
     }
 }
@@ -273,10 +332,18 @@ pub fn authenticate(method: &str, url: &str, headers: &[(String, String)]) -> Re
         r.headers.push(("allow".into(), "POST".into()));
         return Err(r);
     }
-    let token = headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
-        .and_then(|(_, v)| v.split_once(' '))
+    let header = |name: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.trim());
+    // MCP Streamable HTTP: servers must validate `Origin` (DNS rebinding). Browsers send
+    // it; other clients don't. Only the canister's own pages (the demo) may call.
+    if let Some(origin) = header("origin") {
+        let authority = origin.split_once("://").map(|(_, a)| a);
+        if !authority.zip(header("host")).is_some_and(|(a, h)| a.eq_ignore_ascii_case(h)) {
+            return Err(HttpResponse::json(403, &json!({ "error": "cross-origin requests are not accepted" })));
+        }
+    }
+    let token = header("authorization")
+        .and_then(|v| v.split_once(' '))
+        .filter(|(_, t)| !t.trim().is_empty())
         .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
         .map(|(_, t)| t.trim());
     match token.and_then(policy::verify_token) {
@@ -291,6 +358,13 @@ pub fn authenticate(method: &str, url: &str, headers: &[(String, String)]) -> Re
 
 /// Parse the body into individual messages; `bool` = it was a batch.
 fn parse_body(body: &[u8]) -> Result<(Vec<Value>, bool), HttpResponse> {
+    // A parsed JSON tree takes 100x its text or more: refuse big bodies before parsing.
+    if body.len() > MAX_BODY_BYTES {
+        return Err(HttpResponse::json(
+            413,
+            &rpc_error(Value::Null, -32600, format!("request body is {} bytes, over the {MAX_BODY_BYTES}-byte limit", body.len())),
+        ));
+    }
     match serde_json::from_slice::<Value>(body) {
         Ok(Value::Array(a)) if a.len() > MAX_BATCH => Err(HttpResponse::json(
             400,
@@ -323,7 +397,9 @@ const DEMO_HTML: &str = include_str!("demo.html");
 fn demo_page(method: &str, url: &str) -> Option<HttpResponse> {
     let path = url.split(['?', '#']).next().unwrap_or("");
     (method.eq_ignore_ascii_case("GET") && matches!(path, "/" | "/demo")).then(|| {
-        let mut r = HttpResponse::new(200, DEMO_HTML.as_bytes().to_vec(), Some("text/html; charset=utf-8"));
+        let langs = serde_json::to_string(&Language::ENABLED.iter().map(|l| l.as_str()).collect::<Vec<_>>()).unwrap_or_default();
+        let html = DEMO_HTML.replace("__LANGUAGES__", &langs);
+        let mut r = HttpResponse::new(200, html.into_bytes(), Some("text/html; charset=utf-8"));
         r.headers.push(("cache-control".into(), "no-cache".into()));
         r
     })
@@ -347,26 +423,43 @@ pub fn http_query(req: &HttpRequest, certified: bool, search: impl Fn(&SearchArg
     if let Err(r) = authenticate(&req.method, &req.url, &req.headers) {
         return r;
     }
-    if certified {
-        return HttpResponse::upgrade();
-    }
     let (msgs, batch) = match parse_body(&req.body) {
         Ok(x) => x,
         Err(r) => return r,
     };
+    if certified {
+        return HttpResponse::upgrade();
+    }
     let mut replies = vec![];
+    let mut tool_called = false;
     for m in &msgs {
         match classify(m) {
             Msg::Done(r) => replies.extend(r),
+            Msg::ToolCall(id, _) if tool_called => replies.push(rpc_error(id, -32600, ONE_TOOL_CALL)),
             Msg::ToolCall(id, Err(e)) => replies.push(rpc_error(id, -32602, e)),
             Msg::ToolCall(id, Ok(ToolRequest::Search(a))) => match search(&a) {
-                Some(v) => replies.push(rpc_ok(id, tool_result(Ok(v), vec![]))),
+                Some(v) => {
+                    tool_called = true;
+                    replies.push(rpc_ok(id, tool_result(Ok(v), vec![])))
+                }
                 None => return HttpResponse::upgrade(),
             },
             Msg::ToolCall(_, Ok(ToolRequest::Execute(_))) => return HttpResponse::upgrade(),
         }
     }
     finish(replies, batch)
+}
+
+/// The cost filter in `inspect_message`: an authenticated, well-formed request that the
+/// query path could upgrade (it has a `tools/call`, or `certified` upgrades everything).
+/// Deliberately not "would upgrade right now": the interface cache can change between
+/// the gateway's query and this check.
+/// Returns the caller's token hash when it passes.
+pub fn may_upgrade(req: &HttpUpdateRequest, certified: bool) -> Option<String> {
+    let hash = authenticate(&req.method, &req.url, &req.headers).ok()?;
+    parse_body(&req.body)
+        .is_ok_and(|(msgs, _)| certified || msgs.iter().any(|m| m.get("method").and_then(Value::as_str) == Some("tools/call")))
+        .then_some(hash)
 }
 
 /// Update path: everything, including tool execution via `exec(caller_hash, request)`,
@@ -381,23 +474,14 @@ pub async fn http_update(req: &HttpUpdateRequest, exec: impl AsyncFn(&str, ToolR
         Err(r) => return r,
     };
     let mut replies = vec![];
-    let mut ran_script = false;
-    let mut searches = 0;
+    let mut tool_called = false;
     for m in &msgs {
         match classify(m) {
             Msg::Done(r) => replies.extend(r),
+            Msg::ToolCall(id, _) if tool_called => replies.push(rpc_error(id, -32600, ONE_TOOL_CALL)),
             Msg::ToolCall(id, Err(e)) => replies.push(rpc_error(id, -32602, e)),
-            // One script per request: each gets its own message budget, and the reply
-            // size stays bounded. Searches are cheap and size-capped, so they are exempt.
-            Msg::ToolCall(id, Ok(ToolRequest::Execute(_))) if ran_script => {
-                replies.push(rpc_error(id, -32600, "only one execute_icp_script call per HTTP request"))
-            }
-            Msg::ToolCall(id, Ok(ToolRequest::Search(_))) if searches >= MAX_SEARCHES => {
-                replies.push(rpc_error(id, -32600, format!("at most {MAX_SEARCHES} searches per HTTP request")))
-            }
             Msg::ToolCall(id, Ok(req)) => {
-                ran_script |= matches!(req, ToolRequest::Execute(_));
-                searches += usize::from(matches!(req, ToolRequest::Search(_)));
+                tool_called = true;
                 replies.push(rpc_ok(id, exec(&caller, req).await));
             }
         }
@@ -507,7 +591,10 @@ mod tests {
         assert_eq!(names, [SEARCH_TOOL_NAME, TOOL_NAME]);
         assert_eq!(tools[0]["annotations"]["readOnlyHint"], true);
         assert_eq!(tools[1]["inputSchema"]["required"], json!(["code"]));
-        assert_eq!(tools[1]["inputSchema"]["properties"]["language"]["enum"], json!(["javascript", "python", "rhai"]));
+        let enabled: Vec<_> = Language::ENABLED.iter().map(|l| l.as_str()).collect();
+        assert_eq!(tools[1]["inputSchema"]["properties"]["language"]["enum"], json!(enabled));
+        #[cfg(all(feature = "js", feature = "python", feature = "rhai"))]
+        assert_eq!(enabled, ["javascript", "python", "rhai"]);
 
         let b = body(&query(json!({ "jsonrpc": "2.0", "id": 2, "method": "nope" })));
         assert_eq!(b["error"]["code"], -32601);
@@ -616,13 +703,15 @@ mod tests {
             assert_eq!(r.status_code, 400);
             assert!(body(r)["error"]["message"].as_str().unwrap().contains("exceeds the limit of 50"));
         }
-        // Inside the cap, replies that echo client input still cannot exceed the limit.
+        // Bodies over the cap are refused before parsing, so no echo can be huge.
         let big_id = "i".repeat(MAX_REPLY_BYTES);
         let r = update(json!({ "jsonrpc": "2.0", "id": big_id, "method": "ping" }));
-        assert!(r.body.len() < 1000);
-        assert_eq!(body(&r)["error"]["code"], -32603);
-        let r = update(json!({ "jsonrpc": "2.0", "id": 1, "method": "m".repeat(500_000) }));
+        assert_eq!((r.status_code, body(&r)["error"]["code"].clone()), (413, json!(-32600)));
+        let r = update(json!({ "jsonrpc": "2.0", "id": 1, "method": "m".repeat(100_000) }));
         assert!(r.body.len() < 1000, "error messages do not echo unbounded input");
+        // The last line of defence still holds for whatever reaches `finish`.
+        let r = finish(vec![json!({ "id": "i".repeat(MAX_REPLY_BYTES) })], false);
+        assert_eq!(body(&r)["error"]["code"], -32603);
     }
 
     #[test]
@@ -653,10 +742,15 @@ mod tests {
 
     #[test]
     fn result_size_is_bounded_after_escaping() {
+        // A result over the limit once escaped is an error, not invalid JSON cut short;
+        // console output is truncated with a marker.
         let r = tool_result(Ok(Value::String("\u{1}".repeat(900_000))), vec!["\u{1}".repeat(900_000)]);
         let wire = serde_json::to_vec(&r).unwrap().len();
         assert!(wire < MAX_REPLY_BYTES, "{wire}");
-        assert!(r["content"][0]["text"].as_str().unwrap().ends_with("[truncated]"));
+        assert_eq!(r["isError"], true);
+        assert!(r["content"][0]["text"].as_str().unwrap().contains("over the"));
+        assert!(r["content"][1]["text"].as_str().unwrap().ends_with("[truncated]"));
+        assert_eq!(tool_result(Ok(json!([1, 2])), vec![])["content"][0]["text"], "[1,2]");
     }
 
     #[cfg(feature = "rhai")]
@@ -667,14 +761,121 @@ mod tests {
             "params": { "name": TOOL_NAME, "arguments": { "language": "rhai", "code": "40 + 2" } } });
         let search = |id: u32| json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call",
             "params": { "name": SEARCH_TOOL_NAME, "arguments": {} } });
-        let b = body(&update(json!([search(0), call(1), search(2), call(3)])));
-        assert!(b[0]["result"].is_object(), "search before the script still runs");
-        assert_eq!(b[1]["result"]["content"][0]["text"], "42");
-        assert!(b[2]["result"].is_object(), "search after the script still runs");
-        assert_eq!(b[3]["error"]["code"], -32600);
-        // Searches are capped too: each may fetch interfaces under its own call budget.
-        let b = body(&update(Value::Array((0..7).map(search).collect())));
-        let ok = b.as_array().unwrap().iter().filter(|r| r["result"].is_object()).count();
-        assert_eq!((ok, b[6]["error"]["code"].clone()), (MAX_SEARCHES, json!(-32600)));
+        let b = body(&update(json!([call(0), search(1), call(2)])));
+        assert_eq!(b[0]["result"]["content"][0]["text"], "42");
+        assert_eq!((b[1]["error"]["code"].clone(), b[2]["error"]["code"].clone()), (json!(-32600), json!(-32600)));
+        let b = body(&update(json!([search(0), call(1)])));
+        assert!(b[0]["result"].is_object());
+        assert_eq!(b[1]["error"]["code"], -32600);
+    }
+
+    #[test]
+    fn only_upgradable_requests_pass_the_cost_filter() {
+        setup();
+        let req = |body: &[u8]| HttpUpdateRequest {
+            method: "POST".into(),
+            url: "/mcp".into(),
+            headers: headers(TOKEN),
+            body: ByteBuf::from(body.to_vec()),
+        };
+        let call = serde_json::to_vec(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {} })).unwrap();
+        let ping = serde_json::to_vec(&json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" })).unwrap();
+        assert_eq!(may_upgrade(&req(&call), false), Some(policy::sha256_hex(TOKEN.as_bytes())));
+        assert!(may_upgrade(&req(&ping), false).is_none());
+        assert!(may_upgrade(&req(&ping), true).is_some());
+        assert!(may_upgrade(&req(b"not json"), true).is_none());
+        assert!(may_upgrade(&req(b"[]"), true).is_none());
+        let mut bad = req(&call);
+        bad.headers = headers("wrong");
+        assert!(may_upgrade(&bad, false).is_none());
+    }
+
+    #[test]
+    fn long_search_queries_are_refused() {
+        setup();
+        let q = |n: usize| json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": SEARCH_TOOL_NAME, "arguments": { "query": "a ".repeat(n) } } });
+        assert!(body(&query(q(MAX_QUERY_BYTES / 2)))["result"].is_object());
+        assert_eq!(body(&query(q(MAX_QUERY_BYTES)))["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn query_allows_one_tool_call_like_update() {
+        setup();
+        let search = |id: u32| json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": { "name": SEARCH_TOOL_NAME, "arguments": {} }
+        });
+        let b = body(&query(Value::Array((0..3).map(search).collect())));
+        assert!(b[0]["result"].is_object());
+        assert_eq!((b[1]["error"]["code"].clone(), b[2]["error"]["code"].clone()), (json!(-32600), json!(-32600)));
+    }
+
+    #[test]
+    fn authenticate_rejects_untrusted_origin() {
+        setup();
+        let mut h = headers(TOKEN);
+        h.push(("Origin".into(), "https://evil.example".into()));
+        let err = authenticate("POST", "/mcp", &h).expect_err("cross-origin request must be rejected");
+        assert_eq!(err.status_code, 403);
+        h.push(("Host".into(), "abc.icp0.io".into()));
+        assert_eq!(authenticate("POST", "/mcp", &h).unwrap_err().status_code, 403);
+        let mut same = headers(TOKEN);
+        same.push(("host".into(), "abc.icp0.io".into()));
+        same.push(("origin".into(), "https://ABC.icp0.io".into()));
+        assert!(authenticate("POST", "/mcp", &same).is_ok());
+    }
+
+    #[cfg(not(feature = "js"))]
+    #[test]
+    fn single_language_build_hides_disabled_languages_and_updates_default() {
+        let list = tools_list();
+        let lang_prop = &list["tools"][1]["inputSchema"]["properties"]["language"];
+        let variants = lang_prop["enum"].as_array().unwrap();
+        assert!(!variants.contains(&json!("javascript")));
+        assert_ne!(lang_prop["default"], json!("javascript"));
+        let req = parse_tool_call(&json!({
+            "name": TOOL_NAME,
+            "arguments": { "code": "1 + 1" }
+        }))
+        .unwrap();
+        assert!(!matches!(req, ToolRequest::Execute(c) if c.language == Language::JavaScript));
+    }
+
+    #[cfg(feature = "rhai")]
+    #[test]
+    fn protocol_edge_cases_and_truncate_escaped() {
+        setup();
+        // Client JSON-RPC response (no method) is ignored -> 202.
+        let r = query(json!({ "jsonrpc": "2.0", "id": 1, "result": {} }));
+        assert_eq!((r.status_code, r.body.len()), (202, 0));
+
+        // Empty batch returns -32600 in both query and update.
+        assert_eq!(body(&query(json!([])))["error"]["code"], -32600);
+        assert_eq!(body(&update(json!([])))["error"]["code"], -32600);
+
+        // Unauthenticated request in update path is rejected with 401.
+        let unauth = HttpUpdateRequest {
+            method: "POST".into(),
+            url: "/mcp/".into(),
+            headers: vec![("authorization".into(), "bearer wrong".into())],
+            body: ByteBuf::from(b"{}".to_vec()),
+        };
+        assert_eq!(block_on(http_update(&unauth, async |_, _| json!({}))).status_code, 401);
+
+        // Unknown or malformed arguments are refused (the schemas forbid extra keys).
+        let call = |args: Value| body(&update(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": TOOL_NAME, "arguments": args } })));
+        assert!(call(json!({ "code": "1", "langauge": "rhai" }))["error"]["message"].as_str().unwrap().contains("unknown argument"));
+        assert_eq!(call(json!({ "code": "1", "language": null }))["error"]["code"], -32602);
+        assert_eq!(call(json!(["1"]))["error"]["code"], -32602);
+        assert_eq!(call(json!({ "code": "40 + 2", "language": "rhai" }))["result"]["content"][0]["text"], "42");
+        // An empty bearer token never authenticates.
+        assert_eq!(authenticate("POST", "/mcp", &[("authorization".into(), "Bearer   ".into())]).unwrap_err().status_code, 401);
+
+        // Control characters & UTF-8 boundary escaping.
+        let mut s = "a\n\"\\🦀\u{0001}".to_string();
+        truncate_escaped(&mut s, 6);
+        assert!(s.ends_with("…[truncated]"));
     }
 }

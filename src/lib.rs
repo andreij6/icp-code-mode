@@ -61,14 +61,38 @@ const SKIP_CERT_DATA: [u8; 32] = [
 // post_upgrade accepts the same (optional) args to adjust policy during an upgrade.
 #[ic_cdk::init]
 fn init(args: Option<InitArgs>) {
-    ic_cdk::api::certified_data_set(SKIP_CERT_DATA);
     apply(args);
+    set_certified_data();
 }
 
+/// With `certified_reads` off, tell the gateway to accept uncertified query responses
+/// (initialize, tools/list, cached searches). With it on, certify nothing: every query
+/// response then fails the gateway's check except an upgrade, so a single node cannot
+/// answer in the canister's name.
+fn set_certified_data() {
+    let certified = policy::limits().certified_reads == Some(true);
+    ic_cdk::api::certified_data_set(if certified { [0; 32] } else { SKIP_CERT_DATA });
+}
+
+/// Upgrade arguments are accepted (the same `opt InitArgs` type keeps old deploy scripts
+/// working) and ignored: re-applying them would bring back revoked tokens, re-add removed
+/// allowlist entries and replace the limits. Change state with the admin methods.
 #[ic_cdk::post_upgrade]
-fn post_upgrade(args: Option<InitArgs>) {
-    ic_cdk::api::certified_data_set(SKIP_CERT_DATA); // certified data resets on upgrade
-    apply(args);
+fn post_upgrade(_: Option<InitArgs>) {
+    set_certified_data(); // certified data resets on upgrade
+}
+
+/// A run waiting on a reply would get it in the new module, where its callback traps and
+/// it never gets a closing entry. Stopping the canister first lets those replies arrive.
+#[ic_cdk::pre_upgrade]
+fn pre_upgrade() {
+    let pending = bridge::pending_run_ids();
+    if !pending.is_empty() {
+        ic_cdk::trap(format!(
+            "{} script run(s) are waiting on replies (run ids {pending:?}); stop the canister before upgrading",
+            pending.len()
+        ));
+    }
 }
 
 // ---------- HTTP gateway ----------
@@ -78,8 +102,15 @@ fn http_request(req: HttpRequest) -> HttpResponse {
     use base64::Engine;
     let certified = policy::limits().certified_reads == Some(true);
     let mut r = mcp::http_query(&req, certified, search_cached);
-    // Only available in non-replicated queries.
-    if let (None, Some(cert)) = (r.upgrade, ic_cdk::api::data_certificate()) {
+    // Answer an over-limit token here, instead of letting the gateway upgrade the request
+    // only for `inspect_message` to refuse it with an opaque error.
+    if r.upgrade == Some(true)
+        && let Some(e) = mcp::authenticate(&req.method, &req.url, &req.headers).ok().and_then(|h| rate_limited(&h)) {
+            r = mcp::HttpResponse::too_many_requests(&e);
+        }
+    // Only available in non-replicated queries. With certified_reads the canister
+    // certifies nothing, so these headers would not help: the response fails the check.
+    if let (None, false, Some(cert)) = (r.upgrade, certified, ic_cdk::api::data_certificate()) {
         let cert = base64::engine::general_purpose::STANDARD.encode(cert);
         r.headers.push((
             "IC-Certificate".into(),
@@ -101,6 +132,11 @@ async fn http_request_update(req: HttpUpdateRequest) -> HttpResponse {
 }
 
 async fn run_tool(caller_hash: &str, req: ToolRequest) -> serde_json::Value {
+    let minute = this_minute();
+    if let Some(e) = rate_check(caller_hash, minute) {
+        return mcp::tool_result(Err(e), vec![]);
+    }
+    rate_count(caller_hash, minute);
     match req {
         ToolRequest::Execute(call) => run_script(caller_hash, call).await,
         ToolRequest::Search(args) => run_search(caller_hash, args).await,
@@ -111,7 +147,7 @@ async fn run_tool(caller_hash: &str, req: ToolRequest) -> serde_json::Value {
 fn search_cached(args: &SearchArgs) -> Option<serde_json::Value> {
     let entries = search::scope(args, policy::list_allowed())
         .into_iter()
-        .map(|(canister, allowed)| Some(Entry { service: Ok(Some(bridge::cached_service(&canister)?)), canister, allowed }))
+        .map(|(canister, allowed)| Some(Entry { service: bridge::cached_service(&canister, false)?.map(Some), canister, allowed }))
         .collect::<Option<Vec<_>>>()?;
     Some(search::render(args, &entries))
 }
@@ -127,14 +163,14 @@ async fn run_search(caller_hash: &str, args: SearchArgs) -> serde_json::Value {
     let mut fetch_errors = vec![];
     let mut halted: Option<String> = None;
     for (canister, allowed) in search::scope(&args, policy::list_allowed()) {
-        let service = match (bridge::cached_service(&canister), &halted) {
-            (Some(s), _) => Ok(Some(s)),
+        let service = match (bridge::cached_service(&canister, true), &halted) {
+            (Some(s), _) => s.map(Some),
             // After a policy refusal (call cap, budget) every further fetch would be refused
             // too; don't try, and don't log one violation per remaining canister.
             (None, Some(why)) => Err(format!("not fetched: {why}; search with canister_id")),
             (None, None) => {
                 use bridge::HostBridge;
-                let r = bridge.candid(&canister.to_text()).await.map(|_| bridge::cached_service(&canister));
+                let r = bridge.candid(&canister.to_text()).await.map(|_| bridge::cached_service(&canister, true).and_then(Result::ok));
                 if let Err(e) = &r {
                     if e.starts_with("policy:") {
                         halted = Some(e.clone());
@@ -189,6 +225,33 @@ async fn run_search(caller_hash: &str, args: SearchArgs) -> serde_json::Value {
     mcp::tool_result(result, vec![])
 }
 
+// Tool calls per token in the current minute: (minute, count). Heap only: an upgrade
+// resets it, which is harmless. One entry per token that has called, so it stays small.
+thread_local!(static RATE: std::cell::RefCell<std::collections::BTreeMap<String, (u64, u32)>> = Default::default());
+
+fn this_minute() -> u64 {
+    ic_cdk::api::time() / 60_000_000_000
+}
+
+/// The error for a token that used up `tool_calls_per_minute`, if it has.
+fn rate_limited(token_hash: &str) -> Option<String> {
+    rate_check(token_hash, this_minute())
+}
+
+fn rate_check(token_hash: &str, minute: u64) -> Option<String> {
+    let limit = policy::limits().tool_calls_per_minute.unwrap_or(policy::DEFAULT_TOOL_CALLS_PER_MINUTE);
+    let used = RATE.with(|r| r.borrow().get(token_hash).filter(|(m, _)| *m == minute).map_or(0, |(_, n)| *n));
+    (used >= limit).then(|| format!("rate limited: at most {limit} tool calls per minute per token; retry in a minute"))
+}
+
+fn rate_count(token_hash: &str, minute: u64) {
+    RATE.with(|r| {
+        let mut r = r.borrow_mut();
+        let e = r.entry(token_hash.to_string()).or_insert((minute, 0));
+        *e = if e.0 == minute { (minute, e.1 + 1) } else { (minute, 1) };
+    });
+}
+
 /// Audit `error` cap; the full text already went to the client (truncated there too).
 const MAX_AUDIT_ERROR_BYTES: usize = 4096;
 
@@ -201,28 +264,58 @@ thread_local!(static ACTIVE_RUNS: std::cell::Cell<u32> = const { std::cell::Cell
 
 /// One of the `MAX_CONCURRENT_RUNS` slots, given back on drop. If a run traps after an
 /// await, ic-cdk drops its future in the cleanup callback, so the slot is still returned.
-struct RunSlot;
+struct RunSlot(String);
+
+/// Slots one token may hold, so one client cannot keep every other one "busy".
+pub const MAX_RUNS_PER_TOKEN: u32 = 4;
+
+thread_local!(static RUNS_BY_TOKEN: std::cell::RefCell<std::collections::BTreeMap<String, u32>> = Default::default());
 
 impl RunSlot {
-    fn take() -> Option<Self> {
-        ACTIVE_RUNS.with(|a| (a.get() < MAX_CONCURRENT_RUNS).then(|| a.set(a.get() + 1))).map(|()| RunSlot)
+    fn take(token: &str) -> Result<Self, String> {
+        let mine = RUNS_BY_TOKEN.with(|m| m.borrow().get(token).copied().unwrap_or(0));
+        if mine >= MAX_RUNS_PER_TOKEN {
+            return Err(format!("busy: this token already has {MAX_RUNS_PER_TOKEN} scripts running; retry shortly"));
+        }
+        if ACTIVE_RUNS.with(|a| a.get()) >= MAX_CONCURRENT_RUNS {
+            return Err(format!("busy: {MAX_CONCURRENT_RUNS} scripts are already running; retry shortly"));
+        }
+        ACTIVE_RUNS.with(|a| a.set(a.get() + 1));
+        RUNS_BY_TOKEN.with(|m| *m.borrow_mut().entry(token.to_string()).or_default() += 1);
+        Ok(RunSlot(token.to_string()))
     }
 }
 
 impl Drop for RunSlot {
     fn drop(&mut self) {
         ACTIVE_RUNS.with(|a| a.set(a.get().saturating_sub(1)));
+        RUNS_BY_TOKEN.with(|m| {
+            let mut m = m.borrow_mut();
+            if let Some(n) = m.get_mut(&self.0) {
+                *n -= 1;
+                if *n == 0 {
+                    m.remove(&self.0);
+                }
+            }
+        });
     }
 }
 
 async fn run_script(caller_hash: &str, call: ToolCall) -> serde_json::Value {
-    let Some(_slot) = RunSlot::take() else {
-        return mcp::tool_result(Err(format!("busy: {MAX_CONCURRENT_RUNS} scripts are already running; retry shortly")), vec![]);
+    let _slot = match RunSlot::take(caller_hash) {
+        Ok(s) => s,
+        Err(e) => return mcp::tool_result(Err(e), vec![]),
     };
     let caller = caller_hash.get(..16).unwrap_or(caller_hash).to_string();
     let script_sha256 = policy::sha256_hex(call.code.as_bytes());
     let bridge = IcBridge::new(caller.clone(), call.language.as_str(), script_sha256.clone());
     let mut out = LanguageRouter::execute(call.language, &call.code, &bridge).await;
+    // A result too big to send is an error, and recorded as one.
+    if let Ok(v) = &out {
+        if let Err(e) = mcp::result_text(v.clone()) {
+            out = Err(e);
+        }
+    }
     let instructions = bridge.instructions_used();
     let max = policy::limits().max_instructions;
     if instructions > max {
@@ -265,7 +358,9 @@ async fn run_script(caller_hash: &str, call: ToolCall) -> serde_json::Value {
 /// Runs on one replica before an ingress update call is accepted, at no charge. Without
 /// it, anyone could call `http_request_update` directly (bypassing the gateway's query)
 /// and make the canister pay for receiving and running each call, valid token or not.
-/// Only calls with a registered bearer token, or from a controller, are let in.
+/// Only requests the query path can upgrade (valid token within its rate limit,
+/// well-formed, containing a `tools/call`), and controller calls to other methods, are
+/// let in.
 ///
 /// This is a cost filter, not the security boundary: a dishonest replica can skip it and
 /// calls from other canisters never pass through it (they pay for themselves), so every
@@ -274,7 +369,9 @@ async fn run_script(caller_hash: &str, call: ToolCall) -> serde_json::Value {
 fn inspect_message() {
     let allowed = match ic_cdk::api::msg_method_name().as_str() {
         "http_request_update" => candid::decode_one::<HttpUpdateRequest>(&ic_cdk::api::msg_arg_data())
-            .is_ok_and(|r| mcp::authenticate(&r.method, &r.url, &r.headers).is_ok()),
+            .ok()
+            .and_then(|r| mcp::may_upgrade(&r, policy::limits().certified_reads == Some(true)))
+            .is_some_and(|hash| rate_limited(&hash).is_none()),
         _ => ic_cdk::api::is_controller(&ic_cdk::api::msg_caller()),
     };
     if allowed {
@@ -294,6 +391,9 @@ fn controller() -> Result<(), String> {
 
 #[ic_cdk::update(guard = "controller")]
 fn set_allowlist(canister: Principal, methods: Vec<String>) {
+    // A controller re-allowlisting a canister usually means its interface changed or a
+    // fetch failed: start from a fresh fetch.
+    bridge::evict_interface(&canister);
     policy::set_allowed(canister, methods);
 }
 
@@ -303,9 +403,14 @@ fn remove_allowlist(canister: Principal) -> bool {
     policy::remove_allowed(canister)
 }
 
+/// Replaces every field (an omitted `opt` field is `null`, which means its default) and
+/// returns the previous limits.
 #[ic_cdk::update(guard = "controller")]
-fn set_limits(limits: Limits) {
+fn set_limits(limits: Limits) -> Limits {
+    let old = policy::limits();
     policy::set_limits(limits);
+    set_certified_data();
+    old
 }
 
 #[ic_cdk::update(guard = "controller")]
@@ -318,15 +423,17 @@ fn revoke_api_token_hash(sha256_hex: String) -> bool {
     policy::revoke_token_hash(&sha256_hex)
 }
 
-/// Register (or clear, with `null`) a `.did` for a target that does not expose
-/// `__get_candid_interface_tmp_hack`.
+/// Register (or clear, with `null`) a `.did` for a target. While set it takes precedence:
+/// the target's own interface is not fetched or refreshed. `remove_allowlist` does not
+/// clear it.
 #[ic_cdk::update(guard = "controller")]
 fn set_candid_override(canister: Principal, did: Option<String>) -> Result<(), String> {
     if let Some(d) = &did {
         if d.len() > bridge::MAX_DID_BYTES {
             return Err(format!("interface is {} bytes, over the {}-byte limit", d.len(), bridge::MAX_DID_BYTES));
         }
-        candid_bridge::Service::parse(d)?;
+        // Parsed here, in an update, and kept: the query path never parses an override.
+        bridge::remember_override(&canister, d.clone(), candid_bridge::Service::parse(d)?);
     }
     policy::set_candid_override(canister, did);
     Ok(())
@@ -374,6 +481,23 @@ pub(crate) mod counting_alloc {
         true
     }
 
+    /// Most heap the canister may hold. Python's own limit is checked between steps, and
+    /// JavaScript has none, so one builtin call (`json.dumps(x, indent=10**8)`,
+    /// `"x".repeat(n)`) could otherwise grow the heap toward 4 GiB, and Wasm memory never
+    /// shrinks. Past the ceiling an allocation fails, which traps the message and rolls
+    /// the growth back. Room for `MAX_CONCURRENT_RUNS` Python heaps and then some.
+    // ponytail: one global ceiling, not per run; per-run accounting if runs ever need more.
+    pub const HEAP_CEILING: usize = 1 << 30;
+
+    pub fn over_ceiling(live: usize, extra: usize) -> bool {
+        live.saturating_add(extra) > HEAP_CEILING
+    }
+
+    /// Native tests share the process heap with the test harness: enforce only on-chain.
+    fn refuse(extra: usize) -> bool {
+        cfg!(target_arch = "wasm32") && over_ceiling(LIVE_MEMORY.load(Relaxed), extra)
+    }
+
     fn add(n: usize) {
         if counted() {
             LIVE_MEMORY.fetch_add(n, Relaxed);
@@ -390,6 +514,9 @@ pub(crate) mod counting_alloc {
 
     unsafe impl GlobalAlloc for Counting {
         unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            if refuse(l.size()) {
+                return std::ptr::null_mut();
+            }
             let p = unsafe { System.alloc(l) };
             if !p.is_null() {
                 add(l.size());
@@ -397,6 +524,9 @@ pub(crate) mod counting_alloc {
             p
         }
         unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+            if refuse(l.size()) {
+                return std::ptr::null_mut();
+            }
             let p = unsafe { System.alloc_zeroed(l) };
             if !p.is_null() {
                 add(l.size());
@@ -408,6 +538,9 @@ pub(crate) mod counting_alloc {
             sub(l.size());
         }
         unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
+            if refuse(new.saturating_sub(l.size())) {
+                return std::ptr::null_mut();
+            }
             let q = unsafe { System.realloc(p, l, new) };
             if !q.is_null() {
                 // Apply the net change, so the counter never shows old + new at once.
@@ -452,12 +585,35 @@ unsafe extern "Rust" fn __getrandom_v03_custom(dest: *mut u8, len: usize) -> Res
 mod tests {
     #[test]
     fn run_slots_are_capped_and_returned() {
-        use super::{MAX_CONCURRENT_RUNS, RunSlot};
-        let mut held: Vec<RunSlot> = (0..MAX_CONCURRENT_RUNS).map(|_| RunSlot::take().expect("free slot")).collect();
-        assert!(RunSlot::take().is_none(), "no slot beyond the cap");
+        use super::{MAX_CONCURRENT_RUNS, MAX_RUNS_PER_TOKEN, RunSlot};
+        // Per token first: a fifth run of one token is refused while others still get slots.
+        let mut held: Vec<RunSlot> = (0..MAX_RUNS_PER_TOKEN).map(|_| RunSlot::take("a").expect("free slot")).collect();
+        assert!(RunSlot::take("a").err().unwrap().contains("this token"));
+        held.extend((0..MAX_CONCURRENT_RUNS - MAX_RUNS_PER_TOKEN).map(|i| RunSlot::take(&format!("t{i}")).unwrap()));
+        assert!(RunSlot::take("z").is_err(), "no slot beyond the cap");
         held.pop(); // a run that ended (normally, or by a cleaned-up trap) gives its slot back
-        let again = RunSlot::take();
-        assert!(again.is_some() && RunSlot::take().is_none());
+        let again = RunSlot::take("z");
+        assert!(again.is_ok() && RunSlot::take("y").is_err());
+        drop(held);
+        drop(again);
+        assert!(RunSlot::take("a").is_ok(), "per-token counts are returned too");
+    }
+
+    #[test]
+    fn tool_calls_are_rate_limited_per_token_and_minute() {
+        use super::{rate_check, rate_count};
+        crate::policy::set_limits(super::Limits { tool_calls_per_minute: Some(2), ..Default::default() });
+        for _ in 0..2 {
+            assert!(rate_check("a", 5).is_none());
+            rate_count("a", 5);
+        }
+        assert!(rate_check("a", 5).unwrap().contains("rate limited"));
+        assert!(rate_check("b", 5).is_none(), "per token");
+        assert!(rate_check("a", 6).is_none(), "per minute");
+        rate_count("a", 6);
+        assert!(rate_check("a", 6).is_none());
+        crate::policy::set_limits(super::Limits::default());
+        assert!(rate_check("a", 5).is_none(), "default is 120");
     }
 
     #[test]
@@ -465,5 +621,50 @@ mod tests {
         let expected = super::__export_service();
         let actual = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/icp_code_mode.did")).unwrap();
         assert_eq!(actual.trim(), expected.trim(), "regenerate icp_code_mode.did (see README)");
+    }
+
+    #[test]
+    fn set_limits_rejects_unsafe_instruction_and_timeout_bounds() {
+        crate::policy::set_limits(super::Limits {
+            max_calls_per_script: 1,
+            max_instructions: 40_000_000_000,
+            call_timeout_seconds: Some(999),
+            ..Default::default()
+        });
+        let stored = crate::policy::limits();
+        assert!(stored.max_instructions < 40_000_000_000);
+        assert!(stored.call_timeout_seconds.is_none_or(|s| (1..=300).contains(&s)));
+    }
+
+    #[test]
+    fn admin_helpers_and_search_cached_edge_cases() {
+        let p = candid::Principal::from_text("ryjl3-tyaaa-aaaaa-aaaba-cai").unwrap();
+        let h = crate::policy::sha256_hex(b"init-token");
+        super::apply(None);
+        super::apply(Some(super::InitArgs {
+            token_sha256: vec![h.clone()],
+            allowlist: vec![(p, vec!["ping".into()])],
+            limits: Some(super::Limits::default()),
+        }));
+        assert!(crate::policy::verify_token("init-token").is_some());
+
+        // search_cached returns Some once an override is registered (without touching `ic0::time`).
+        assert!(super::set_candid_override(p, Some("service : { ping : () -> () }".into())).is_ok());
+        assert!(super::search_cached(&crate::search::SearchArgs::default()).is_some());
+
+        // Override validation rejects oversized and malformed interfaces.
+        let big = "a".repeat(crate::bridge::MAX_DID_BYTES + 1);
+        assert!(super::set_candid_override(p, Some(big)).is_err());
+        assert!(super::set_candid_override(p, Some("broken".into())).is_err());
+        assert!(super::set_candid_override(p, None).is_ok());
+
+        // Token & allowlist helpers + counting_alloc fallback.
+        let h2 = crate::policy::sha256_hex(b"other-token");
+        assert!(super::add_api_token_hash(h2.clone(), "t2".into()).is_ok());
+        assert!(super::revoke_api_token_hash(h2));
+        assert!(super::revoke_api_token_hash(h));
+        super::set_allowlist(p, vec!["*".into()]);
+        assert!(super::remove_allowlist(p));
+        assert_eq!(super::get_audit_log_len(), crate::policy::audit_len());
     }
 }

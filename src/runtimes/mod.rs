@@ -12,7 +12,7 @@ pub mod python;
 pub mod rhai_rt;
 
 /// Upper bound on script source size.
-pub const MAX_CODE_BYTES: usize = 100 * 1024;
+pub const MAX_CODE_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Language {
@@ -22,6 +22,16 @@ pub enum Language {
 }
 
 impl Language {
+    /// The languages compiled into this build; the first is the default.
+    pub const ENABLED: &[Language] = &[
+        #[cfg(feature = "js")]
+        Language::JavaScript,
+        #[cfg(feature = "python")]
+        Language::Python,
+        #[cfg(feature = "rhai")]
+        Language::Rhai,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Language::JavaScript => "javascript",
@@ -199,5 +209,13 @@ print("me", icp.principal())
         assert!("cobol".parse::<Language>().is_err());
         let big = "1;".repeat(MAX_CODE_BYTES);
         assert!(run(Language::Rhai, &big).0.unwrap_err().contains("exceeds"));
+    }
+
+    #[test]
+    fn language_parsing_aliases_and_names() {
+        assert_eq!("js".parse::<Language>().unwrap().as_str(), "javascript");
+        assert_eq!("PY".parse::<Language>().unwrap().as_str(), "python");
+        assert_eq!("python".parse::<Language>().unwrap().as_str(), "python");
+        assert_eq!("RHAI".parse::<Language>().unwrap().as_str(), "rhai");
     }
 }
