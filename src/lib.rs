@@ -36,6 +36,8 @@ pub struct PolicyView {
     /// Interfaces set with `set_candid_override` (canister, bytes, SHA-256). Each one is
     /// used instead of fetching that canister's own interface.
     pub candid_overrides: Vec<(String, u64, String)>,
+    /// Audit entries that could not be written (stable memory full) since the last upgrade.
+    pub lost_audit_entries: u64,
 }
 
 fn apply(args: Option<InitArgs>) {
@@ -43,8 +45,12 @@ fn apply(args: Option<InitArgs>) {
     for h in a.token_sha256 {
         policy::add_token_hash(&h, "init".into()).unwrap_or_else(|e| ic_cdk::trap(e));
     }
+    let mut seen = std::collections::BTreeSet::new();
     for (c, m) in a.allowlist {
-        policy::set_allowed(c, m);
+        if !seen.insert(c) {
+            ic_cdk::trap(format!("canister {c} appears twice in the allowlist"));
+        }
+        policy::set_allowed(c, m).unwrap_or_else(|e| ic_cdk::trap(e));
     }
     if let Some(l) = a.limits {
         policy::set_limits(l);
@@ -136,7 +142,7 @@ async fn http_request_update(req: HttpUpdateRequest) -> HttpResponse {
 
 async fn run_tool(caller_hash: &str, req: ToolRequest) -> serde_json::Value {
     let minute = this_minute();
-    if let Some(e) = rate_check(caller_hash, minute) {
+    if let Some(e) = rate_check(caller_hash, minute).or_else(|| cycles_check(ic_cdk::api::canister_liquid_cycle_balance())) {
         return mcp::tool_result(Err(e), vec![]);
     }
     rate_count(caller_hash, minute);
@@ -220,6 +226,7 @@ async fn run_search(caller_hash: &str, args: SearchArgs) -> serde_json::Value {
             error,
             run_id: bridge.run_id(),
             methods: Some(bridge.messages()),
+            args: None,
         });
     }
     bridge.finish();
@@ -243,6 +250,15 @@ fn rate_check(token_hash: &str, minute: u64) -> Option<String> {
     let limit = policy::limits().tool_calls_per_minute.unwrap_or(policy::DEFAULT_TOOL_CALLS_PER_MINUTE);
     let used = RATE.with(|r| r.borrow().get(token_hash).filter(|(m, _)| *m == minute).map_or(0, |(_, n)| *n));
     (used >= limit).then(|| format!("rate limited: at most {limit} tool calls per minute per token; retry in a minute"))
+}
+
+/// Liquid cycles (above the freezing threshold) below which no run is started. A run
+/// grows the audit log; on the IC, growing stable memory without the cycles to reserve
+/// storage traps rather than failing, which would lose the run's closing entry.
+const MIN_LIQUID_CYCLES: u128 = 100_000_000_000;
+
+fn cycles_check(liquid: u128) -> Option<String> {
+    (liquid < MIN_LIQUID_CYCLES).then(|| "canister is low on cycles: no new runs until a controller tops it up".into())
 }
 
 fn rate_count(token_hash: &str, minute: u64) {
@@ -353,7 +369,8 @@ async fn run_script(caller_hash: &str, call: ToolCall) -> serde_json::Value {
         (Ok(_), true) => AuditStatus::Ok,
     };
     let error = out.as_ref().err().map(|e| {
-        let mut e = e.clone();
+        // Script-authored: escaped so it cannot forge lines or hide text in the log.
+        let mut e = policy::escape_invisible(e);
         bridge::truncate(&mut e, MAX_AUDIT_ERROR_BYTES);
         e
     });
@@ -371,6 +388,7 @@ async fn run_script(caller_hash: &str, call: ToolCall) -> serde_json::Value {
         error,
         run_id: bridge.run_id(),
         methods: Some(bridge.messages()),
+        args: None,
     });
     bridge.finish();
     mcp::tool_result(out, bridge.logs.take())
@@ -410,12 +428,15 @@ fn controller() -> Result<(), String> {
     }
 }
 
+/// Refused (the call traps) for the management canister, this canister, or past the caps
+/// on methods per canister, method name length and allowlist size. `"*"` allows every
+/// method except delegating ones such as `icrc2_approve`, which must be listed by name.
 #[ic_cdk::update(guard = "controller")]
 fn set_allowlist(canister: Principal, methods: Vec<String>) {
     // A controller re-allowlisting a canister usually means its interface changed or a
     // fetch failed: start from a fresh fetch.
     bridge::evict_interface(&canister);
-    policy::set_allowed(canister, methods);
+    policy::set_allowed(canister, methods).unwrap_or_else(|e| ic_cdk::trap(e));
 }
 
 #[ic_cdk::update(guard = "controller")]
@@ -439,6 +460,8 @@ fn add_api_token_hash(sha256_hex: String, label: String) -> Result<(), String> {
     policy::add_token_hash(&sha256_hex, label)
 }
 
+/// Takes the full hash or the 16-character id `get_policy` shows (any unique prefix of at
+/// least 16 hex characters). `false`: no token, or the prefix matches more than one.
 #[ic_cdk::update(guard = "controller")]
 fn revoke_api_token_hash(sha256_hex: String) -> bool {
     policy::revoke_token_hash(&sha256_hex)
@@ -454,10 +477,12 @@ fn set_candid_override(canister: Principal, did: Option<String>) -> Result<(), S
             return Err(format!("interface is {} bytes, over the {}-byte limit", d.len(), bridge::MAX_DID_BYTES));
         }
         // Parsed here, in an update, and kept: the query path never parses an override.
-        bridge::remember_override(&canister, d.clone(), candid_bridge::Service::parse(d)?);
+        let svc = candid_bridge::Service::parse(d)?;
+        policy::set_candid_override(canister, did.clone())?;
+        bridge::remember_override(&canister, d.clone(), svc);
+        return Ok(());
     }
-    policy::set_candid_override(canister, did);
-    Ok(())
+    policy::set_candid_override(canister, None)
 }
 
 #[ic_cdk::query(guard = "controller")]
@@ -469,6 +494,7 @@ fn get_policy() -> PolicyView {
         active_runs: ACTIVE_RUNS.with(|a| a.get()),
         pending_run_ids: bridge::pending_run_ids(),
         candid_overrides: policy::list_candid_overrides(),
+        lost_audit_entries: policy::lost_audit_entries(),
     }
 }
 
@@ -476,6 +502,23 @@ fn get_policy() -> PolicyView {
 #[ic_cdk::query(guard = "controller")]
 fn get_audit_logs(offset: u64, limit: u64) -> Vec<AuditEntry> {
     policy::audit_page(offset, limit)
+}
+
+/// Newest first, below id `before` (`null`: from the newest); `limit` is capped at 100.
+/// Pass the last id of a page to get the next one: unlike offsets, ids do not shift as
+/// entries are appended.
+#[ic_cdk::query(guard = "controller")]
+fn get_audit_logs_before(before: Option<u64>, limit: u64) -> Vec<AuditEntry> {
+    policy::audit_page_before(before, limit)
+}
+
+/// The entries of one run (`run_id`), oldest first, from id `from` (`null`: the run's
+/// start). Looks at 5,000 ids per call at most: pass the last id returned plus one, or
+/// `from` + 5,000 after an empty page, to continue. The run is complete once an entry with
+/// a status other than `Started`/`Call` is returned.
+#[ic_cdk::query(guard = "controller")]
+fn get_audit_run(run_id: u64, from: Option<u64>) -> Vec<AuditEntry> {
+    policy::audit_run(run_id, from)
 }
 
 #[ic_cdk::query(guard = "controller")]
@@ -686,6 +729,13 @@ mod tests {
         assert!(RunSlot::take("a").is_ok(), "per-token counts are returned too");
     }
 
+    /// #180: runs are refused before the canister is too low on cycles to grow the log.
+    #[test]
+    fn runs_need_a_cycles_margin() {
+        assert!(super::cycles_check(super::MIN_LIQUID_CYCLES - 1).unwrap().contains("low on cycles"));
+        assert!(super::cycles_check(super::MIN_LIQUID_CYCLES).is_none());
+    }
+
     #[test]
     fn tool_calls_are_rate_limited_per_token_and_minute() {
         use super::{rate_check, rate_count};
@@ -701,6 +751,18 @@ mod tests {
         assert!(rate_check("a", 6).is_none());
         crate::policy::set_limits(super::Limits::default());
         assert!(rate_check("a", 5).is_none(), "default is 120");
+    }
+
+    /// #170: a principal listed twice in the init allowlist is refused, not silently merged.
+    #[test]
+    #[should_panic]
+    fn duplicate_allowlist_principal_is_refused() {
+        let p = candid::Principal::from_text("ryjl3-tyaaa-aaaaa-aaaba-cai").unwrap();
+        super::apply(Some(super::InitArgs {
+            token_sha256: vec![],
+            allowlist: vec![(p, vec!["a".into()]), (p, vec!["b".into()])],
+            limits: None,
+        }));
     }
 
     #[test]

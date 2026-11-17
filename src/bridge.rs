@@ -437,21 +437,24 @@ mod ic {
             if self.finished.get() || !ic_cdk::futures::is_recovering_from_trap() {
                 return;
             }
-            let (caller, language, sha) = self.audit_key.clone();
-            policy::append_audit(AuditEntry {
+            // Must not trap: that would also undo the slot and pending-id release above.
+            let (caller, language, script_sha256) = std::mem::take(&mut self.audit_key);
+            let calls = self.calls();
+            policy::try_append_audit(AuditEntry {
                 id: 0,
                 timestamp_ns: now_ns(),
                 caller,
                 language,
-                script_sha256: sha,
-                canisters: self.touched.borrow().iter().cloned().collect(),
-                calls: self.calls(),
+                script_sha256,
+                canisters: self.touched.take().into_iter().collect(),
+                calls,
                 instructions: self.instructions_used(),
                 status: AuditStatus::Trapped,
                 violations: self.closing_violations(),
-                error: Some("the canister trapped while handling a reply (instruction or memory limit, or a bug); the script's result was discarded".into()),
+                error: Some("the canister trapped while handling a reply (instruction or memory limit, or a bug); the script's result was discarded; `instructions` excludes the trapped execution".into()),
                 run_id: Some(id),
-                methods: Some(self.messages()),
+                methods: Some(self.messages.take()),
+                args: None,
             });
         }
     }
@@ -536,7 +539,10 @@ mod ic {
     /// about the target is remembered; otherwise (a refusal here, a transient reject, a
     /// timeout) an expired copy is served if there is one.
     fn fetch_failed(key: &str, e: String, remember: bool) -> Result<String, String> {
-        let msg = format!("could not fetch candid for {key} ({e}); a controller can register it with set_candid_override");
+        // `e` may be a target's reject message: quoted and escaped.
+        let mut shown_e = e.clone();
+        truncate(&mut shown_e, 300);
+        let msg = format!("could not fetch candid for {key} ({}); a controller can register it with set_candid_override", policy::shown(&shown_e));
         if remember {
             DID_FAILED.with(|c| c.borrow_mut().insert(key.to_string(), (msg.clone(), now_ns())));
             return Err(msg);
@@ -750,13 +756,14 @@ mod ic {
         /// `about` is the canister the message concerns (the target, or for a management
         /// request the canister it is about); `label` names the message; `fetch_of` is the
         /// interface it fetches, if it does (see `Held`).
-        async fn sent(&self, about: &Principal, mut label: String, fetch_of: Option<&str>, msg: Msg<'_>) -> Result<Vec<u8>, CallFailed> {
+        /// `args`: the encoded arguments of a call, whose digest goes in the audit entry.
+        async fn sent(&self, about: &Principal, mut label: String, fetch_of: Option<&str>, args: Option<&[u8]>, msg: Msg<'_>) -> Result<Vec<u8>, CallFailed> {
             let mut held = Held { msg, token: &self.token, fetch_of, sent: false };
             std::future::poll_fn(|cx| {
                 let r = held.msg.as_mut().poll(cx);
                 match (r.is_pending(), held.sent) {
                     (true, false) => {
-                        self.record_message(about, std::mem::take(&mut label));
+                        self.record_message(about, std::mem::take(&mut label), args);
                         in_flight(&self.token, true);
                         held.sent = true;
                     }
@@ -775,7 +782,7 @@ mod ic {
         /// each later one. It is appended in the same message execution that hands the
         /// message to the system, so the two are committed together when that execution
         /// ends, or discarded together if it traps first. Later traps cannot remove it.
-        fn record_message(&self, p: &Principal, label: String) {
+        fn record_message(&self, p: &Principal, label: String, args: Option<&[u8]>) {
             let (caller, language, sha) = self.audit_key.clone();
             let run = self.started.get();
             self.touched.borrow_mut().insert(p.to_text());
@@ -794,6 +801,7 @@ mod ic {
                 error: None,
                 run_id: run, // None: a Started entry opens its own run
                 methods: Some(vec![label]),
+                args: args.map(|a| vec![policy::arg_digest(a)]),
             });
             if run.is_none() {
                 self.started.set(Some(id));
@@ -819,8 +827,7 @@ mod ic {
             let refused = |e: String| (e, false);
             let secs = self.recheck(&p, None).map_err(refused)?;
             let args = candid::encode_one(InfoArgs { canister_id: p, num_requested_changes: Some(0) }).map_err(|e| (e.to_string(), false))?;
-            let info = self
-                .sent(&p, format!("{mgmt}.canister_info({p})"), fetch_of, message(mgmt, "canister_info", &args, secs))
+            let info = self.sent(&p, format!("{mgmt}.canister_info({p})"), fetch_of, None, message(mgmt, "canister_info", &args, secs))
                 .await
                 .map_err(|e| e.to_string())
                 .and_then(|r| candid::decode_one_with_config::<InfoResult>(&r, &fetch_decoder()).map_err(|e| e.to_string()));
@@ -836,7 +843,7 @@ mod ic {
                     self.reserve(&p, None).map_err(refused)?;
                     let secs = self.recheck(&p, None).map_err(refused)?;
                     let args = candid::encode_one(MetadataArgs { canister_id: p, name: "candid:service".into() }).map_err(|e| (e.to_string(), false))?;
-                    match self.sent(&p, format!("{mgmt}.canister_metadata({p})"), fetch_of, message(mgmt, "canister_metadata", &args, secs)).await {
+                    match self.sent(&p, format!("{mgmt}.canister_metadata({p})"), fetch_of, None, message(mgmt, "canister_metadata", &args, secs)).await {
                         Ok(r) => match candid::decode_one_with_config::<MetadataResult>(&r, &fetch_decoder()) {
                             Ok(m) => return String::from_utf8(m.value).map_err(|_| ("candid:service is not UTF-8".to_string(), true)),
                             Err(e) => (e.to_string(), true),
@@ -850,7 +857,7 @@ mod ic {
             let both = |e: String| format!("canister_metadata: {meta_err}; __get_candid_interface_tmp_hack: {e}");
             let hack = message(p, "__get_candid_interface_tmp_hack", &[], secs);
             let reply = self
-                .sent(&p, format!("{p}.__get_candid_interface_tmp_hack"), fetch_of, hack)
+                .sent(&p, format!("{p}.__get_candid_interface_tmp_hack"), fetch_of, None, hack)
                 .await
                 .map_err(|e| (both(e.to_string()), meta_lasting && definitive_failure(&e)))?;
             candid::decode_one_with_config::<String>(&reply, &fetch_decoder()).map_err(|e| (both(e.to_string()), meta_lasting))
@@ -937,7 +944,7 @@ mod ic {
     fn parse_principal(id: &str) -> Result<Principal, String> {
         let mut shown = id.to_string();
         truncate(&mut shown, 80);
-        Principal::from_text(id).map_err(|e| format!("invalid canister id `{shown}`: {e}"))
+        Principal::from_text(id).map_err(|e| format!("invalid canister id {}: {e}", policy::shown(&shown)))
     }
 
     impl HostBridge for IcBridge {
@@ -945,7 +952,8 @@ mod ic {
             // Canonical text: `RYJL3-…` and `ryjl3-…` are the same principal.
             let p = parse_principal(canister_id)?;
             let key = p.to_text();
-            if let Some(did) = policy::candid_override(&key) {
+            // Allowlisted canisters only, whether the text comes from an override or a fetch.
+            if let Some(did) = policy::served_override(&p).map_err(|e| self.deny(e))? {
                 return Ok(did);
             }
             // Another request of this run (Promise.all / gather) is fetching it: use that
@@ -995,10 +1003,13 @@ mod ic {
             // for at most the timeout. A timed-out call may still have executed on the
             // target; the error says so.
             let secs = self.recheck(&p, Some(method))?;
-            let label = format!("{p}.{}", method.escape_debug());
-            let reply = self.sent(&p, label.clone(), None, message(p, method, &enc.bytes, secs)).await.map_err(|e| {
+            let label = format!("{p}.{}", policy::shown(method));
+            let reply = self.sent(&p, label.clone(), None, Some(&enc.bytes), message(p, method, &enc.bytes, secs)).await.map_err(|e| {
                 let unknown = !e.is_clean_reject();
-                format!("call {p}.{} failed: {e}{}", method.escape_debug(), if unknown { " (outcome unknown: the call may have executed)" } else { "" })
+                // The reject message is the target's text: quoted and escaped.
+                let mut e = e.to_string();
+                truncate(&mut e, 300);
+                format!("call {p}.{} failed: {}{}", policy::shown(method), policy::shown(&e), if unknown { " (outcome unknown: the call may have executed)" } else { "" })
             })?;
             decode_checked(&svc, &enc.func, &reply, &label).map_err(|(e, stale)| {
                 if stale {
@@ -1216,7 +1227,7 @@ mod ic {
             let x = fx();
             let mut held = vec![];
             for _ in 0..MAX_IN_FLIGHT_PER_TOKEN {
-                let mut f = Box::pin(a.sent(&x, "m".into(), None, pending()));
+                let mut f = Box::pin(a.sent(&x, "m".into(), None, None, pending()));
                 assert!(poll_once(f.as_mut()).is_pending());
                 held.push(f);
             }
@@ -1225,7 +1236,7 @@ mod ic {
             assert!(e.contains("this token") && refuses_whole_run(&e), "{e}");
             assert!(b.reserve(&fx(), Some("m")).is_ok(), "another token is not locked out");
             for _ in 0..MAX_IN_FLIGHT - MAX_IN_FLIGHT_PER_TOKEN {
-                let mut f = Box::pin(b.sent(&x, "m".into(), None, pending()));
+                let mut f = Box::pin(b.sent(&x, "m".into(), None, None, pending()));
                 assert!(poll_once(f.as_mut()).is_pending());
                 held.push(f);
             }
@@ -1235,8 +1246,8 @@ mod ic {
             // A completed message is released at once; a refused one (ready on the first
             // poll) is never counted or recorded.
             net(|_, _| Ok(vec![]));
-            assert!(block_on(a.sent(&fx(), "m".into(), None, message(fx(), "m", &[], 1))).is_ok());
-            assert!(block_on(c.sent(&fx(), "m".into(), None, Box::pin(async { Ok(vec![]) }))).is_ok());
+            assert!(block_on(a.sent(&fx(), "m".into(), None, None, message(fx(), "m", &[], 1))).is_ok());
+            assert!(block_on(c.sent(&fx(), "m".into(), None, None, Box::pin(async { Ok(vec![]) }))).is_ok());
             assert_eq!(c.calls(), 0);
             assert!(IN_FLIGHT.with(|m| m.borrow().is_empty()));
             reset();
@@ -1484,10 +1495,10 @@ pub mod mock {
         assert_eq!(MockBridge::default().instruction_deadline(), u64::MAX);
         assert_eq!(now_ms(), 0);
         let p = candid::Principal::from_text("ryjl3-tyaaa-aaaaa-aaaba-cai").unwrap();
-        crate::policy::set_candid_override(p, Some("service : { ping : () -> () }".into()));
+        crate::policy::set_candid_override(p, Some("service : { ping : () -> () }".into())).unwrap();
         assert!(cached_service(&p, true).is_some());
         assert!(cached_service(&p, true).is_some()); // override cache hit
         evict_interface(&p);
-        crate::policy::set_candid_override(p, None);
+        crate::policy::set_candid_override(p, None).unwrap();
     }
 }

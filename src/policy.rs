@@ -7,7 +7,7 @@
 use candid::{CandidType, Decode, Deserialize, Encode, Principal};
 use ic_stable_structures::memory_manager::{MemoryId, MemoryManager, VirtualMemory};
 use ic_stable_structures::storable::Bound;
-use ic_stable_structures::{DefaultMemoryImpl, StableBTreeMap, StableCell, StableLog, Storable};
+use ic_stable_structures::{DefaultMemoryImpl, Memory, StableBTreeMap, StableCell, StableLog, Storable};
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -59,7 +59,9 @@ impl Default for Limits {
     }
 }
 
-/// Methods a script may call on one canister. `["*"]` allows every method.
+/// Methods a script may call on one canister. `["*"]` allows every method except the
+/// delegating ones (`DELEGATING_METHODS`), which must be listed by name. `"*"` is always
+/// the wildcard: a method literally named `*` is reachable only through it.
 #[derive(CandidType, Deserialize, Clone, Debug, PartialEq)]
 pub struct AllowedMethods(pub Vec<String>);
 
@@ -75,7 +77,9 @@ pub enum AuditStatus {
     /// never finishes.
     Call,
     /// The canister trapped while handling a reply, after messages had gone out. Written
-    /// during cleanup, in place of the final entry that the trap rolled back.
+    /// during cleanup, in place of the final entry that the trap rolled back. Its
+    /// `instructions` leaves out the trapped execution (rolled back with the trap), so it
+    /// is a lower bound.
     Trapped,
     Ok,
     Error,
@@ -92,9 +96,15 @@ pub struct AuditEntry {
     pub script_sha256: String,
     pub canisters: Vec<String>,
     pub calls: u32,
+    /// Instructions the run used so far. On a `Trapped` entry, a lower bound (it leaves out
+    /// the trapped execution).
     pub instructions: u64,
     pub status: AuditStatus,
+    /// Policy refusals. They may quote script- or target-authored text, which is escaped
+    /// and quoted (as are labels in `methods`).
     pub violations: Vec<String>,
+    /// May hold script- or target-authored text (a script's own error, a target's reject),
+    /// with control and bidi characters escaped.
     pub error: Option<String>,
     /// Links all entries of one run: the id of the run's `Started` entry, or the entry's
     /// own id if the run never sent a message. Script hashes alone can't tell apart two
@@ -104,7 +114,12 @@ pub struct AuditEntry {
     /// Outbound messages as `canister.method`, in order. Interface fetches appear as
     /// `aaaaa-aa.canister_metadata(<target>)` and `<target>.__get_candid_interface_tmp_hack`. On a `Started`/`Call` entry: the one message about to
     /// be sent. On a final entry: all of them. `None` on entries from before this field.
+    /// Pages cut long lists (see `audit_page`); the `Started`/`Call` entries have each one.
     pub methods: Option<Vec<String>>,
+    /// On a `Started`/`Call` entry for a script's call: its Candid-encoded argument, as hex
+    /// (decode with `didc decode`), or past 1 KiB as `sha256:<hex> prefix:<first 512 bytes
+    /// as hex>`. `None` on interface fetches, final entries and entries from before this field.
+    pub args: Option<Vec<String>>,
 }
 
 macro_rules! candid_storable {
@@ -152,8 +167,16 @@ pub fn sha256_hex(data: &[u8]) -> String {
 
 // ---------- limits ----------
 
+/// The limits in effect: normalized on read too, so a record stored before the clamp
+/// existed (or by an older version) cannot bring back an unsafe value.
 pub fn limits() -> Limits {
-    LIMITS.with(|c| c.borrow().get().clone())
+    normalized(LIMITS.with(|c| c.borrow().get().clone()))
+}
+
+fn normalized(mut l: Limits) -> Limits {
+    l.max_instructions = l.max_instructions.min(MAX_INSTRUCTIONS_CAP);
+    l.call_timeout_seconds = l.call_timeout_seconds.map(|s| s.clamp(1, 300));
+    l
 }
 
 /// Highest `max_instructions` accepted. Budgets are checked between steps, not on every
@@ -165,16 +188,75 @@ pub const MAX_INSTRUCTIONS_CAP: u64 = 30_000_000_000;
 /// Stores `l` with out-of-range values clamped: `max_instructions` to
 /// `MAX_INSTRUCTIONS_CAP`, `call_timeout_seconds` to 1..=300 (the IC's range).
 /// `get_policy` shows the values in effect.
-pub fn set_limits(mut l: Limits) {
-    l.max_instructions = l.max_instructions.min(MAX_INSTRUCTIONS_CAP);
-    l.call_timeout_seconds = l.call_timeout_seconds.map(|s| s.clamp(1, 300));
-    LIMITS.with(|c| c.borrow_mut().set(l));
+pub fn set_limits(l: Limits) {
+    LIMITS.with(|c| c.borrow_mut().set(normalized(l)));
 }
 
 // ---------- allowlist ----------
 
-pub fn set_allowed(canister: Principal, methods: Vec<String>) {
+/// Caps on admin input, so `get_policy` (one reply, at most 2 MiB) always fits: about
+/// 0.8 MB of allowlist, 0.15 MB of tokens and 0.15 MB of override rows at most.
+pub const MAX_ALLOWLISTED: u64 = 1000;
+pub const MAX_METHODS_PER_CANISTER: usize = 256;
+/// Method name bytes over the whole allowlist.
+pub const MAX_ALLOWLIST_BYTES: usize = 512 * 1024;
+pub const MAX_TOKENS: u64 = 1000;
+pub const MAX_CANDID_OVERRIDES: u64 = 1000;
+pub const MAX_LABEL_BYTES: usize = 128;
+
+/// Methods that hand authority to someone else: an approval outlives token revocation
+/// and `remove_allowlist`. `"*"` does not include them; they must be listed by name.
+pub const DELEGATING_METHODS: &[&str] = &["icrc2_approve", "icrc37_approve_tokens", "icrc37_approve_collection", "approve"];
+
+/// Whether an allowlist entry admits `method` (see `DELEGATING_METHODS` for `"*"`).
+pub fn method_allowed(allowed: &[String], method: &str) -> bool {
+    allowed.iter().any(|m| m == method || (m == "*" && !DELEGATING_METHODS.contains(&method)))
+}
+
+/// Targets no script may call, whatever the allowlist says: the management canister (the
+/// canister a call acts on is an argument, which the allowlist and the audit log cannot
+/// see) and this canister (a self-call would start a new run, not linked to this one,
+/// with a fresh budget and call cap).
+fn refused_target(canister: &Principal, self_id: Option<Principal>) -> Option<String> {
+    if *canister == Principal::management_canister() {
+        return Some("policy: the management canister (aaaaa-aa) cannot be called: the canister a call acts on is an argument, which the allowlist and audit log cannot see".into());
+    }
+    (Some(*canister) == self_id).then(|| "policy: this canister cannot call itself".into())
+}
+
+fn self_id() -> Option<Principal> {
+    #[cfg(target_arch = "wasm32")]
+    return Some(ic_cdk::api::canister_self());
+    #[cfg(not(target_arch = "wasm32"))]
+    None
+}
+
+pub fn set_allowed(canister: Principal, methods: Vec<String>) -> Result<(), String> {
+    allowed_entry_ok(&canister, &methods, self_id())?;
     ALLOWLIST.with(|m| m.borrow_mut().insert(canister, AllowedMethods(methods)));
+    Ok(())
+}
+
+fn allowed_entry_ok(canister: &Principal, methods: &[String], self_id: Option<Principal>) -> Result<(), String> {
+    if let Some(e) = refused_target(canister, self_id) {
+        return Err(e);
+    }
+    if methods.len() > MAX_METHODS_PER_CANISTER {
+        return Err(format!("at most {MAX_METHODS_PER_CANISTER} methods per canister"));
+    }
+    if methods.iter().any(|m| m.len() > crate::bridge::MAX_METHOD_LEN) {
+        return Err(format!("method names are at most {} bytes", crate::bridge::MAX_METHOD_LEN));
+    }
+    let (count, bytes) = ALLOWLIST.with(|m| {
+        m.borrow().iter().filter(|e| e.key() != canister).fold((0, 0), |(n, b), e| (n + 1, b + e.value().0.iter().map(String::len).sum::<usize>()))
+    });
+    if count >= MAX_ALLOWLISTED {
+        return Err(format!("at most {MAX_ALLOWLISTED} canisters can be allowlisted"));
+    }
+    if bytes + methods.iter().map(String::len).sum::<usize>() > MAX_ALLOWLIST_BYTES {
+        return Err(format!("the allowlist's method names may total at most {MAX_ALLOWLIST_BYTES} bytes"));
+    }
+    Ok(())
 }
 
 pub fn remove_allowed(canister: Principal) -> bool {
@@ -196,10 +278,13 @@ pub fn authorize(
     limits: &Limits,
 ) -> Result<(), String> {
     let methods = allowed.ok_or_else(|| format!("policy: canister {canister} is not allowlisted"))?;
-    // Method names come from scripts: escaped, so one cannot read as another sentence.
-    let shown = method.escape_debug();
-    if !methods.0.iter().any(|m| m == "*" || m == method) {
-        return Err(format!("policy: method `{shown}` on {canister} is not allowlisted"));
+    if !method_allowed(&methods.0, method) {
+        let hint = if DELEGATING_METHODS.contains(&method) && methods.0.iter().any(|m| m == "*") {
+            "; `*` does not include methods that delegate authority, list it by name"
+        } else {
+            ""
+        };
+        return Err(format!("policy: method {} on {canister} is not allowlisted{hint}", shown(method)));
     }
     if calls_made >= limits.max_calls_per_script {
         return Err(format!("policy: call limit of {} per script reached", limits.max_calls_per_script));
@@ -213,8 +298,31 @@ pub fn authorize(
     Ok(())
 }
 
+/// `s` as is when it is plainly a name (ASCII letters, digits, `_`, `-`), otherwise
+/// Debug-quoted. For script- or target-authored text put into audit sentences and
+/// labels: quotes, control and bidi characters are escaped and the quotes mark where
+/// the text starts and ends, so it cannot pass for another sentence or label.
+pub fn shown(s: &str) -> Cow<'_, str> {
+    if !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') {
+        Cow::Borrowed(s)
+    } else {
+        Cow::Owned(format!("{s:?}"))
+    }
+}
+
+/// `s` with control, bidi and other invisible characters escaped (as Rust's Debug does)
+/// and printable text, quotes included, kept. For free text such as a script's own error:
+/// it stays on one line and cannot hide or reorder what follows.
+pub fn escape_invisible(s: &str) -> String {
+    s.chars().map(|c| if matches!(c, '"' | '\'' | '\\') { c.to_string() } else { c.escape_debug().to_string() }).collect()
+}
+
 /// `limits`: the run's snapshot (see `IcBridge::limits`), so a run keeps the limits it started with.
 pub fn check_call(canister: &Principal, method: &str, calls_made: u32, instructions_used: u64, limits: &Limits) -> Result<(), String> {
+    // Also for entries stored before `set_allowed` refused these targets.
+    if let Some(e) = refused_target(canister, self_id()) {
+        return Err(e);
+    }
     let allowed = ALLOWLIST.with(|m| m.borrow().get(canister));
     authorize(allowed.as_ref(), &canister.to_text(), method, calls_made, instructions_used, limits)
 }
@@ -237,12 +345,34 @@ pub fn add_token_hash(sha256_hex: &str, label: String) -> Result<(), String> {
     if h == self::sha256_hex(b"") {
         return Err("that is the hash of an empty token".into());
     }
-    TOKENS.with(|t| t.borrow_mut().insert(h, label));
-    Ok(())
+    if label.len() > MAX_LABEL_BYTES {
+        return Err(format!("labels are at most {MAX_LABEL_BYTES} bytes"));
+    }
+    TOKENS.with(|t| {
+        let mut t = t.borrow_mut();
+        if !t.contains_key(&h) && t.len() >= MAX_TOKENS {
+            return Err(format!("at most {MAX_TOKENS} tokens can be registered"));
+        }
+        t.insert(h, label);
+        Ok(())
+    })
 }
 
+/// Revoke by the full hash, or by a prefix of at least 16 hex characters (the id that
+/// `get_policy` and audit entries show) that matches exactly one token.
 pub fn revoke_token_hash(sha256_hex: &str) -> bool {
-    TOKENS.with(|t| t.borrow_mut().remove(&sha256_hex.trim().to_ascii_lowercase()).is_some())
+    let h = sha256_hex.trim().to_ascii_lowercase();
+    if h.len() < 16 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return false;
+    }
+    TOKENS.with(|t| {
+        let mut t = t.borrow_mut();
+        let found: Vec<String> = t.keys_range(h.clone()..).take_while(|k| k.starts_with(&h)).take(2).collect();
+        match found.as_slice() {
+            [k] => t.remove(k).is_some(),
+            _ => false, // unknown or ambiguous
+        }
+    })
 }
 
 pub fn list_tokens() -> Vec<(String, String)> {
@@ -263,11 +393,19 @@ pub fn verify_token(token: &str) -> Option<String> {
 
 // ---------- candid overrides ----------
 
-pub fn set_candid_override(canister: Principal, did: Option<String>) {
-    CANDID_OVERRIDES.with(|m| match did {
-        Some(d) => m.borrow_mut().insert(canister.to_text(), d),
-        None => m.borrow_mut().remove(&canister.to_text()),
-    });
+pub fn set_candid_override(canister: Principal, did: Option<String>) -> Result<(), String> {
+    CANDID_OVERRIDES.with(|m| {
+        let mut m = m.borrow_mut();
+        let key = canister.to_text();
+        match did {
+            Some(_) if !m.contains_key(&key) && m.len() >= MAX_CANDID_OVERRIDES => {
+                return Err(format!("at most {MAX_CANDID_OVERRIDES} candid overrides can be registered"));
+            }
+            Some(d) => m.insert(key, d),
+            None => m.remove(&key),
+        };
+        Ok(())
+    })
 }
 
 /// (canister, interface size in bytes, SHA-256 of the interface text) for every override.
@@ -275,52 +413,151 @@ pub fn list_candid_overrides() -> Vec<(String, u64, String)> {
     CANDID_OVERRIDES.with(|m| m.borrow().iter().map(|e| (e.key().clone(), e.value().len() as u64, sha256_hex(e.value().as_bytes()))).collect())
 }
 
+/// The override for `canister`. One over `MAX_DID_BYTES` (stored before the endpoint
+/// checked the size) is ignored; `get_policy` still lists it, with its size.
 pub fn candid_override(canister: &str) -> Option<String> {
-    CANDID_OVERRIDES.with(|m| m.borrow().get(&canister.to_string()))
+    CANDID_OVERRIDES.with(|m| m.borrow().get(&canister.to_string())).filter(|d| d.len() <= crate::bridge::MAX_DID_BYTES)
+}
+
+/// The override a script may read with `icp.candid`: only for an allowlisted canister,
+/// like a fetched interface.
+pub fn served_override(canister: &Principal) -> Result<Option<String>, String> {
+    if !ALLOWLIST.with(|m| m.borrow().contains_key(canister)) {
+        return Err(format!("policy: canister {canister} is not allowlisted"));
+    }
+    Ok(candid_override(&canister.to_text()))
 }
 
 // ---------- audit log ----------
 
+thread_local! {
+    // ponytail: heap counter, reset by an upgrade; a stable cell if it must survive one.
+    static LOST_AUDIT_ENTRIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn append_to<M: Memory>(l: &StableLog<AuditEntry, M, M>, mut entry: AuditEntry) -> Result<u64, String> {
+    entry.id = l.len();
+    entry.run_id.get_or_insert(entry.id);
+    l.append(&entry).map_err(|e| format!("audit log out of stable memory: {e:?}"))
+}
+
 /// Appends an entry and returns its id. An entry without a `run_id` starts its own run.
-pub fn append_audit(mut entry: AuditEntry) -> u64 {
-    AUDIT.with(|l| {
-        let l = l.borrow();
-        entry.id = l.len();
-        entry.run_id.get_or_insert(entry.id);
-        l.append(&entry).expect("audit log out of stable memory")
-    })
+///
+/// Traps if stable memory cannot grow. That is deliberate for the entry written as a
+/// message is handed over: the trap also discards the message, so nothing is sent
+/// unaudited.
+pub fn append_audit(entry: AuditEntry) -> u64 {
+    AUDIT.with(|l| append_to(&l.borrow(), entry)).unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// Like `append_audit`, but never traps: for trap cleanup, where a trap would also undo
+/// the release of the run's slot and pending id. A failed append is counted in
+/// `lost_audit_entries` (`get_policy`).
+pub fn try_append_audit(entry: AuditEntry) -> Option<u64> {
+    let r = AUDIT.with(|l| append_to(&l.borrow(), entry)).ok();
+    if r.is_none() {
+        LOST_AUDIT_ENTRIES.with(|c| c.set(c.get() + 1));
+    }
+    r
+}
+
+/// Audit entries that could not be written since the last upgrade.
+pub fn lost_audit_entries() -> u64 {
+    LOST_AUDIT_ENTRIES.with(|c| c.get())
+}
+
+/// `AuditEntry::args` text for one encoded argument: bounded, and complete for the usual
+/// ledger call (100-200 bytes).
+pub fn arg_digest(bytes: &[u8]) -> String {
+    if bytes.len() <= 1024 {
+        hex::encode(bytes)
+    } else {
+        format!("sha256:{} prefix:{}", sha256_hex(bytes), hex::encode(&bytes[..512]))
+    }
 }
 
 pub fn audit_len() -> u64 {
     AUDIT.with(|l| l.borrow().len())
 }
 
-/// Newest first: `offset` 0 is the most recent entry.
 /// Bytes of entries one page may return; the IC refuses replies over 2 MiB.
 const MAX_AUDIT_PAGE_BYTES: usize = 1_500_000;
-/// Text kept per field when reading an oversized entry (written before fields were capped).
+/// Text kept of `error` when reading (entries written before fields were capped).
 const MAX_READ_FIELD_BYTES: usize = 4096;
+/// Items kept per list, and bytes per item, when reading. With these, one entry encodes to
+/// well under 2 MiB whatever was stored, so every entry can be read.
+const MAX_READ_ITEMS: usize = 128;
+const MAX_READ_ITEM_BYTES: usize = 2048;
 
-pub fn audit_page(offset: u64, limit: u64) -> Vec<AuditEntry> {
+fn capped(mut e: AuditEntry) -> AuditEntry {
+    use crate::bridge::truncate;
+    if let Some(s) = e.error.as_mut() {
+        truncate(s, MAX_READ_FIELD_BYTES);
+    }
+    let cut_list = |v: &mut Vec<String>| {
+        if v.len() > MAX_READ_ITEMS {
+            let more = v.len() - MAX_READ_ITEMS;
+            v.truncate(MAX_READ_ITEMS);
+            v.push(format!("…and {more} more"));
+        }
+        v.iter_mut().for_each(|s| truncate(s, MAX_READ_ITEM_BYTES));
+    };
+    cut_list(&mut e.violations);
+    cut_list(&mut e.canisters);
+    e.methods.as_mut().map(cut_list);
+    e.args.as_mut().map(cut_list);
+    e
+}
+
+/// Entries at `idxs`, cut to size, until the page's byte budget is spent. The first entry
+/// is always included, so no entry is unreadable.
+fn page_of(idxs: impl Iterator<Item = u64>) -> Vec<AuditEntry> {
     AUDIT.with(|l| {
         let l = l.borrow();
-        let len = l.len();
         let mut bytes = 0;
-        (0..limit.min(MAX_AUDIT_PAGE))
-            .map_while(|i| len.checked_sub(offset.checked_add(i)?.checked_add(1)?))
-            .filter_map(|idx| l.get(idx))
-            .map(|mut e| {
-                let cut = |s: &mut String| crate::bridge::truncate(s, MAX_READ_FIELD_BYTES);
-                e.error.as_mut().map(cut);
-                e.violations.iter_mut().for_each(cut);
-                e
-            })
-            .take_while(|e| {
-                bytes += Encode!(e).map_or(0, |b| b.len());
-                bytes <= MAX_AUDIT_PAGE_BYTES
-            })
-            .collect()
+        let mut page = vec![];
+        for e in idxs.filter_map(|i| l.get(i)).map(capped) {
+            bytes += Encode!(&e).map_or(0, |b| b.len());
+            if !page.is_empty() && bytes > MAX_AUDIT_PAGE_BYTES {
+                break;
+            }
+            page.push(e);
+        }
+        page
     })
+}
+
+/// Newest first: `offset` 0 is the most recent entry.
+pub fn audit_page(offset: u64, limit: u64) -> Vec<AuditEntry> {
+    let len = audit_len();
+    page_of((0..limit.min(MAX_AUDIT_PAGE)).map_while(|i| len.checked_sub(offset.checked_add(i)?.checked_add(1)?)))
+}
+
+/// Newest first, starting below id `before` (`None`: the newest entry). Ids do not move as
+/// entries are appended, so passing the last id of one page gives the next one, with no
+/// gaps or repeats.
+pub fn audit_page_before(before: Option<u64>, limit: u64) -> Vec<AuditEntry> {
+    let end = before.unwrap_or(u64::MAX).min(audit_len());
+    page_of((0..end).rev().take(limit.min(MAX_AUDIT_PAGE) as usize))
+}
+
+/// Ids `audit_run` looks at per call, so one query stays well inside its instruction limit.
+pub const MAX_RUN_SCAN: u64 = 5_000;
+
+/// The entries of run `run_id`, oldest first, from id `from` (`None`: the run's start).
+/// A run's entries all lie at or after its id, interleaved with other runs'; each call
+/// looks at the next `MAX_RUN_SCAN` ids at most. To continue, pass the last id returned
+/// plus one, or `from + MAX_RUN_SCAN` after an empty page. The run is complete once an
+/// entry with a status other than `Started`/`Call` is among them.
+pub fn audit_run(run_id: u64, from: Option<u64>) -> Vec<AuditEntry> {
+    let start = from.unwrap_or(run_id).max(run_id);
+    let end = start.saturating_add(MAX_RUN_SCAN).min(audit_len());
+    // ponytail: decodes every scanned entry; index by run_id if scans get slow.
+    let ids: Vec<u64> = AUDIT.with(|l| {
+        let l = l.borrow();
+        (start..end).filter(|&i| l.get(i).is_some_and(|e| e.run_id == Some(run_id))).take(MAX_AUDIT_PAGE as usize).collect()
+    });
+    page_of(ids.into_iter())
 }
 
 #[cfg(test)]
@@ -335,7 +572,7 @@ mod tests {
         let any = AllowedMethods(vec!["*".into()]);
         let some = AllowedMethods(vec!["icrc1_balance_of".into()]);
         assert!(authorize(None, LEDGER, "icrc1_balance_of", 0, 0, &lim).unwrap_err().contains("not allowlisted"));
-        assert!(authorize(Some(&some), LEDGER, "icrc1_transfer", 0, 0, &lim).unwrap_err().contains("method `icrc1_transfer`"));
+        assert!(authorize(Some(&some), LEDGER, "icrc1_transfer", 0, 0, &lim).unwrap_err().contains("method icrc1_transfer on"));
         assert!(authorize(Some(&some), LEDGER, "icrc1_balance_of", 0, 0, &lim).is_ok());
         assert!(authorize(Some(&any), LEDGER, "anything", 0, 0, &lim).is_ok());
     }
@@ -353,7 +590,7 @@ mod tests {
     fn stable_state_check_call() {
         let ledger = Principal::from_text(LEDGER).unwrap();
         assert!(check_call(&ledger, "icrc1_balance_of", 0, 0, &limits()).is_err());
-        set_allowed(ledger, vec!["icrc1_balance_of".into()]);
+        set_allowed(ledger, vec!["icrc1_balance_of".into()]).unwrap();
         assert!(check_call(&ledger, "icrc1_balance_of", 0, 0, &limits()).is_ok());
         assert!(check_call(&ledger, "icrc1_transfer", 0, 0, &limits()).is_err());
         assert!(check_call(&Principal::management_canister(), "raw_rand", 0, 0, &limits()).is_err());
@@ -381,7 +618,7 @@ mod tests {
         let e = |lang: &str| AuditEntry {
             id: 0, timestamp_ns: 1, caller: "c".into(), language: lang.into(), script_sha256: "s".into(),
             canisters: vec![], calls: 0, instructions: 0, status: AuditStatus::Ok, violations: vec![], error: None,
-            run_id: None, methods: None,
+            run_id: None, methods: None, args: None,
         };
         for l in ["a", "b", "c"] {
             append_audit(e(l));
@@ -397,7 +634,7 @@ mod tests {
     fn entry(sha: &str, status: AuditStatus, run_id: Option<u64>) -> AuditEntry {
         AuditEntry {
             id: 0, timestamp_ns: 1, caller: "c".into(), language: "javascript".into(), script_sha256: sha.into(),
-            canisters: vec![], calls: 0, instructions: 0, status, violations: vec![], error: None, run_id, methods: None,
+            canisters: vec![], calls: 0, instructions: 0, status, violations: vec![], error: None, run_id, methods: None, args: None,
         }
     }
 
@@ -451,17 +688,219 @@ mod tests {
         let p = Principal::from_text(LEDGER).unwrap();
         set_limits(Limits::default());
         assert!(check_interface_fetch(&p, 0, 0, &limits()).is_err());
-        set_allowed(p, vec![]);
+        set_allowed(p, vec![]).unwrap();
         assert!(check_interface_fetch(&p, 0, 0, &limits()).is_ok());
 
-        set_candid_override(p, Some("service : { ping : () -> () }".into()));
+        set_candid_override(p, Some("service : { ping : () -> () }".into())).unwrap();
         assert_eq!(candid_override(&p.to_text()).as_deref(), Some("service : { ping : () -> () }"));
-        set_candid_override(p, None);
+        set_candid_override(p, None).unwrap();
         assert!(candid_override(&p.to_text()).is_none());
 
         assert!(add_token_hash(&"0".repeat(63), "short".into()).is_err());
         assert!(add_token_hash(&"g".repeat(64), "badhex".into()).is_err());
         assert!(!revoke_token_hash(&"f".repeat(64)));
         remove_allowed(p);
+    }
+
+    /// #106: a record stored before set_limits clamped (or by an older version) is
+    /// clamped when read.
+    #[test]
+    fn stored_unsafe_limits_are_clamped_on_read() {
+        let raw = Limits { max_instructions: 60_000_000_000, call_timeout_seconds: Some(0), ..Limits::default() };
+        LIMITS.with(|c| c.borrow_mut().set(raw));
+        let l = limits();
+        assert_eq!((l.max_instructions, l.call_timeout_seconds), (MAX_INSTRUCTIONS_CAP, Some(1)));
+    }
+
+    /// #80: an override is served to scripts only for an allowlisted canister, and one
+    /// over the size cap (stored before the endpoint checked it) is ignored.
+    #[test]
+    fn overrides_need_the_allowlist_and_the_size_cap() {
+        let p = Principal::from_text(LEDGER).unwrap();
+        set_candid_override(p, Some("service : {}".into())).unwrap();
+        assert!(served_override(&p).unwrap_err().contains("not allowlisted"));
+        set_allowed(p, vec![]).unwrap();
+        assert_eq!(served_override(&p).unwrap().as_deref(), Some("service : {}"));
+        set_candid_override(p, Some("a".repeat(crate::bridge::MAX_DID_BYTES + 1))).unwrap();
+        assert!(candid_override(&p.to_text()).is_none());
+        assert_eq!(served_override(&p), Ok(None));
+        assert_eq!(list_candid_overrides()[0].1, crate::bridge::MAX_DID_BYTES as u64 + 1, "still listed for the admin");
+    }
+
+    /// #82, #147: the management canister and this canister are refused, when allowlisted
+    /// and for entries stored before that check.
+    #[test]
+    fn privileged_targets_are_refused() {
+        let mgmt = Principal::management_canister();
+        let me = Principal::from_text("rrkah-fqaaa-aaaaa-aaaaq-cai").unwrap();
+        assert!(set_allowed(mgmt, vec!["*".into()]).unwrap_err().contains("management canister"));
+        assert!(set_allowed(mgmt, vec!["canister_status".into()]).is_err());
+        assert!(allowed_entry_ok(&me, &["ping".into()], Some(me)).unwrap_err().contains("itself"));
+        assert!(allowed_entry_ok(&Principal::from_text(LEDGER).unwrap(), &["*".into()], Some(me)).is_ok());
+        // An entry stored before the check: refused at call time.
+        ALLOWLIST.with(|m| m.borrow_mut().insert(mgmt, AllowedMethods(vec!["*".into()])));
+        assert!(check_call(&mgmt, "stop_canister", 0, 0).unwrap_err().contains("management canister"));
+        remove_allowed(mgmt);
+    }
+
+    /// #170: admin input is capped.
+    #[test]
+    fn admin_input_is_capped() {
+        let p = Principal::from_text(LEDGER).unwrap();
+        let h = sha256_hex(b"t");
+        assert!(add_token_hash(&h, "x".repeat(MAX_LABEL_BYTES + 1)).unwrap_err().contains("labels"));
+        assert!(add_token_hash(&h, "x".repeat(MAX_LABEL_BYTES)).is_ok());
+        assert!(set_allowed(p, vec!["m".into(); MAX_METHODS_PER_CANISTER + 1]).is_err());
+        assert!(set_allowed(p, vec!["m".repeat(crate::bridge::MAX_METHOD_LEN + 1)]).is_err());
+        assert!(set_allowed(p, vec!["m".into(); MAX_METHODS_PER_CANISTER]).is_ok());
+        // Replacing an entry does not count its old methods against the total.
+        assert!(set_allowed(p, vec!["m".into(); MAX_METHODS_PER_CANISTER]).is_ok());
+        remove_allowed(p);
+        revoke_token_hash(&h);
+    }
+
+    /// #129: script-authored method names are quoted and escaped, so they cannot forge a
+    /// sentence or a label.
+    #[test]
+    fn script_text_is_escaped_in_refusals_and_labels() {
+        let some = AllowedMethods(vec!["a".into()]);
+        let e = authorize(Some(&some), LEDGER, "x` on y\n\u{202e} z", 0, 0, &Limits::default()).unwrap_err();
+        assert!(!e.contains('\n') && !e.contains('\u{202e}') && !e.contains("method `x"), "{e}");
+        assert!(e.contains("method \"x` on y\\n\\u{202e} z\" on"), "{e}");
+        assert!(shown("x ryjl3-tyaaa-aaaaa-aaaba-cai.icrc1_transfer").starts_with('"'));
+        assert_eq!(shown("icrc1_transfer"), "icrc1_transfer");
+        assert_eq!(shown(""), "\"\"");
+        // A script's own error, as run_script stores it in `error`.
+        let e = escape_invisible("Error: policy: method `x` on y is not allowlisted\n\u{202e}Z\u{1b}[31m \"q\"");
+        assert!(!e.contains('\n') && !e.contains('\u{202e}') && !e.contains('\u{1b}'), "{e}");
+        assert!(e.ends_with("allowlisted\\n\\u{202e}Z\\u{1b}[31m \"q\""), "{e}");
+    }
+
+    /// #138: the 16-character id shown by get_policy revokes, unless ambiguous.
+    #[test]
+    fn revoke_by_shown_prefix() {
+        let (a, b) = (format!("{}{}", "ab".repeat(8), "0".repeat(48)), format!("{}{}", "ab".repeat(8), "1".repeat(48)));
+        add_token_hash(&a, "a".into()).unwrap();
+        add_token_hash(&b, "b".into()).unwrap();
+        assert!(!revoke_token_hash(&a[..16]), "ambiguous");
+        assert!(!revoke_token_hash(&a[..15]), "too short");
+        assert_eq!(list_tokens().len(), 2);
+        assert!(revoke_token_hash(&a[..17]));
+        let h = sha256_hex(b"secret");
+        add_token_hash(&h, "c".into()).unwrap();
+        let id = list_tokens().into_iter().find(|(_, l)| l == "c").unwrap().0;
+        assert!(revoke_token_hash(&id.to_uppercase()));
+        assert!(verify_token("secret").is_none());
+        assert!(revoke_token_hash(&b));
+    }
+
+    /// #193: `*` does not admit delegating methods unless they are listed by name.
+    #[test]
+    fn wildcard_excludes_delegating_methods() {
+        let lim = Limits::default();
+        let e = authorize(Some(&AllowedMethods(vec!["*".into()])), LEDGER, "icrc2_approve", 0, 0, &lim).unwrap_err();
+        assert!(e.contains("list it by name"), "{e}");
+        assert!(authorize(Some(&AllowedMethods(vec!["*".into(), "icrc2_approve".into()])), LEDGER, "icrc2_approve", 0, 0, &lim).is_ok());
+        assert!(authorize(Some(&AllowedMethods(vec!["*".into()])), LEDGER, "icrc1_transfer", 0, 0, &lim).is_ok());
+    }
+
+    /// #96: a huge legacy entry is returned (cut) on its own page under 2 MiB, and pages
+    /// stop by bytes.
+    #[test]
+    fn oversized_entries_are_readable_and_pages_bounded() {
+        let mut big = entry("big", AuditStatus::Ok, None);
+        big.error = Some("e".repeat(8 << 20));
+        big.violations = vec!["v".repeat(100); 20_000];
+        big.methods = Some(vec!["m".repeat(1500); 5_000]);
+        big.canisters = vec!["c".repeat(3000); 2_000];
+        let id = append_audit(big);
+        let page = audit_page(0, 100);
+        assert_eq!(page.iter().map(|e| e.id).collect::<Vec<_>>(), vec![id]);
+        assert!(Encode!(&page).unwrap().len() < 2 << 20);
+        assert!(page[0].error.as_ref().unwrap().len() <= MAX_READ_FIELD_BYTES + 16);
+        assert_eq!(page[0].violations.len(), MAX_READ_ITEMS + 1);
+        assert!(page[0].violations.last().unwrap().contains("more"));
+        for _ in 0..100 {
+            let mut e = entry("mid", AuditStatus::Ok, None);
+            e.methods = Some(vec!["m".repeat(1000); 30]);
+            append_audit(e);
+        }
+        let page = audit_page(0, 100);
+        assert!(page.len() < 100 && Encode!(&page).unwrap().len() <= MAX_AUDIT_PAGE_BYTES + 100);
+    }
+
+    /// #182: id-anchored pages have no repeats or gaps while entries are appended.
+    #[test]
+    fn pages_before_an_id_do_not_shift() {
+        for _ in 0..300 {
+            append_audit(entry("s", AuditStatus::Ok, None));
+        }
+        let first = audit_page_before(None, 100);
+        for _ in 0..10 {
+            append_audit(entry("s", AuditStatus::Ok, None));
+        }
+        let second = audit_page_before(Some(first.last().unwrap().id), 100);
+        let ids: Vec<u64> = first.iter().chain(&second).map(|e| e.id).collect();
+        assert_eq!(ids, (100..300).rev().collect::<Vec<_>>());
+        assert_eq!(audit_page_before(Some(0), 10), vec![]);
+        assert_eq!(audit_page_before(Some(u64::MAX), 1)[0].id, 309);
+    }
+
+    /// #182: one run's entries, without paging through the runs interleaved with it.
+    #[test]
+    fn a_run_is_read_by_its_id() {
+        let a = append_audit(entry("a", AuditStatus::Started, None));
+        let b = append_audit(entry("b", AuditStatus::Started, None));
+        append_audit(entry("a", AuditStatus::Call, Some(a)));
+        append_audit(entry("b", AuditStatus::Ok, Some(b)));
+        let done = append_audit(entry("a", AuditStatus::Ok, Some(a)));
+        let ids = |v: Vec<AuditEntry>| v.iter().map(|e| e.id).collect::<Vec<_>>();
+        assert_eq!(ids(audit_run(a, None)), vec![a, a + 2, done]);
+        assert_eq!(ids(audit_run(a, Some(a + 3))), vec![done]);
+        assert_eq!(ids(audit_run(b, Some(0))), vec![b, b + 2], "never before the run's id");
+        assert_eq!(ids(audit_run(done + 1, None)), Vec::<u64>::new());
+        // The scan is bounded: matches past MAX_RUN_SCAN ids need another call.
+        for _ in 0..MAX_RUN_SCAN {
+            append_audit(entry("x", AuditStatus::Ok, None));
+        }
+        let late = append_audit(entry("a", AuditStatus::Ok, Some(a)));
+        assert!(!ids(audit_run(a, Some(done + 1))).contains(&late));
+        assert_eq!(ids(audit_run(a, Some(done + 1 + MAX_RUN_SCAN))), vec![late]);
+    }
+
+    /// #170: the override count is capped like tokens, so get_policy stays under the
+    /// reply limit. Replacing or clearing an existing one is still allowed at the cap.
+    #[test]
+    fn candid_overrides_are_capped() {
+        let p = |i: u64| Principal::from_slice(&i.to_be_bytes());
+        for i in 0..MAX_CANDID_OVERRIDES {
+            set_candid_override(p(i), Some("service : {}".into())).unwrap();
+        }
+        assert!(set_candid_override(p(MAX_CANDID_OVERRIDES), Some("service : {}".into())).unwrap_err().contains("at most"));
+        set_candid_override(p(0), Some("service : { a : () -> () }".into())).unwrap();
+        set_candid_override(p(1), None).unwrap();
+        set_candid_override(p(MAX_CANDID_OVERRIDES), Some("service : {}".into())).unwrap();
+        assert_eq!(list_candid_overrides().len() as u64, MAX_CANDID_OVERRIDES);
+    }
+
+    /// #150, #180: a full stable memory makes the append fail without trapping.
+    #[test]
+    fn append_over_full_memory_is_an_error() {
+        use ic_stable_structures::{RestrictedMemory, VectorMemory};
+        let m = || RestrictedMemory::new(VectorMemory::default(), 0..1);
+        let log = StableLog::init(m(), m());
+        let mut e = entry("s", AuditStatus::Ok, None);
+        e.error = Some("x".repeat(16 * 1024));
+        let results: Vec<_> = (0..8).map(|_| append_to(&log, e.clone())).collect();
+        assert!(results[0].is_ok());
+        assert!(results.last().unwrap().as_ref().unwrap_err().contains("out of stable memory"));
+    }
+
+    /// #194: arguments are recorded, bounded.
+    #[test]
+    fn arg_digest_is_bounded() {
+        assert_eq!(arg_digest(&[1u8; 100]), "01".repeat(100));
+        let d = arg_digest(&[7u8; 64 * 1024]);
+        assert!(d.starts_with("sha256:") && d.len() <= 1200, "{}", d.len());
     }
 }
