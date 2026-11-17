@@ -172,8 +172,9 @@ async fn run_search(caller_hash: &str, args: SearchArgs) -> serde_json::Value {
             // be refused too; don't try, and don't log one violation per remaining canister.
             (None, Some(why)) => Err(format!("not fetched: {why}; search with canister_id")),
             (None, None) => {
-                use bridge::HostBridge;
-                let r = bridge.candid(&canister.to_text()).await.map(|_| bridge::cached_service(&canister, true).and_then(Result::ok));
+                // The service `candid` fetched, or the expired copy it served when a
+                // re-fetch failed transiently (a TTL-checked cache read would miss that).
+                let r = bridge.service(&canister).await.map(Some);
                 if let Err(e) = &r {
                     if bridge::refuses_whole_run(e) {
                         halted = Some(e.clone());
