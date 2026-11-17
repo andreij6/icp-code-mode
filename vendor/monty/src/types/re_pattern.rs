@@ -276,7 +276,7 @@ impl RePattern {
     /// values could not release them, since `dec_ref` needs `&mut Heap` while the
     /// match iterator borrows the compiled pattern out of it.
     pub fn findall(&self, text: &str, heap: &Heap) -> RunResult<Value> {
-        check_subject(&self.compiled, text, heap)?; // icp-code-mode patch
+        let fancy = check_subject(&self.compiled, text, heap)?; // icp-code-mode patch
         let cap_count = self.compiled.captures_len();
 
         match cap_count {
@@ -284,6 +284,7 @@ impl RePattern {
             0 | 1 => {
                 let mut matches = Vec::new();
                 for m in self.compiled.find_iter(text) {
+                    poll_match(fancy, heap)?; // icp-code-mode patch
                     check_slice_growth(&matches, heap)?;
                     matches.push(m.map_err(ExcType::re_pattern_error)?.as_str());
                 }
@@ -293,6 +294,7 @@ impl RePattern {
             2 => {
                 let mut matches = Vec::new();
                 for caps in self.compiled.captures_iter(text) {
+                    poll_match(fancy, heap)?; // icp-code-mode patch
                     check_slice_growth(&matches, heap)?;
                     let caps = caps.map_err(ExcType::re_pattern_error)?;
                     matches.push(caps.get(1).map_or("", |m| m.as_str()));
@@ -305,6 +307,7 @@ impl RePattern {
                 let groups = cap_count - 1;
                 let mut flat = Vec::new();
                 for caps in self.compiled.captures_iter(text) {
+                    poll_match(fancy, heap)?; // icp-code-mode patch
                     let caps = caps.map_err(ExcType::re_pattern_error)?;
                     for cap in caps.iter().skip(1) {
                         check_slice_growth(&flat, heap)?;
@@ -328,7 +331,7 @@ impl RePattern {
     /// avoids both false rejections from conservative pre-estimates and untracked
     /// Rust heap allocations from delegating to `fancy_regex::replace_all()`.
     pub fn sub(&self, repl: &str, text: &str, count: usize, heap: &Heap) -> RunResult<Value> {
-        check_subject(&self.compiled, text, heap)?; // icp-code-mode patch
+        let fancy = check_subject(&self.compiled, text, heap)?; // icp-code-mode patch
         // Translate Python-style backreferences (\1, \2) to regex crate style ($1, $2)
         let rust_repl = translate_replacement(repl)?;
         let effective_count = if count == 0 { usize::MAX } else { count };
@@ -337,6 +340,7 @@ impl RePattern {
         let mut last_end = 0;
 
         for caps in self.compiled.captures_iter(text).take(effective_count) {
+            poll_match(fancy, heap)?; // icp-code-mode patch
             let caps = caps.map_err(ExcType::re_pattern_error)?;
             let m = caps.get(0).expect("capture group 0 always exists");
             result.push_str(&text[last_end..m.start()]);
@@ -358,18 +362,18 @@ impl RePattern {
     /// element; if it is negative, no splits occur at all (CPython's split loop
     /// runs zero times), returning the whole subject as a single element.
     pub fn split(&self, text: &str, maxsplit: i64, heap: &Heap) -> RunResult<Value> {
-        check_subject(&self.compiled, text, heap)?; // icp-code-mode patch
+        let fancy = check_subject(&self.compiled, text, heap)?; // icp-code-mode patch
         if self.compiled.captures_len() > 1 {
-            return self.split_with_groups(text, maxsplit, heap);
+            return self.split_with_groups(text, maxsplit, fancy, heap);
         }
         let pieces = match maxsplit.cmp(&0) {
             Ordering::Less => vec![text],
-            Ordering::Equal => collect_slices(self.compiled.split(text), heap)?,
+            Ordering::Equal => collect_slices(self.compiled.split(text), fancy, heap)?,
             Ordering::Greater => {
                 // `maxsplit + 1` pieces = at most `maxsplit` splits; saturate
                 // for absurdly large limits (splitn caps at the piece count).
                 let limit = usize::try_from(maxsplit).unwrap_or(usize::MAX).saturating_add(1);
-                collect_slices(self.compiled.splitn(text, limit), heap)?
+                collect_slices(self.compiled.splitn(text, limit), fancy, heap)?
             }
         };
 
@@ -378,7 +382,7 @@ impl RePattern {
 
     /// [`RePattern::split`] for a pattern with capture groups, whose text CPython puts after
     /// the piece before each match: one entry per group, `None` for a group that didn't take part.
-    fn split_with_groups(&self, text: &str, maxsplit: i64, heap: &Heap) -> RunResult<Value> {
+    fn split_with_groups(&self, text: &str, maxsplit: i64, fancy: bool, heap: &Heap) -> RunResult<Value> {
         let limit = match maxsplit.cmp(&0) {
             Ordering::Less => 0,
             Ordering::Equal => usize::MAX,
@@ -387,6 +391,7 @@ impl RePattern {
         let mut pieces: Vec<Option<&str>> = Vec::new();
         let mut last_end = 0;
         for caps in self.compiled.captures_iter(text).take(limit) {
+            poll_match(fancy, heap)?; // icp-code-mode patch
             let caps = caps.map_err(ExcType::re_pattern_error)?;
             let m = caps.get(0).expect("capture group 0 always exists");
             check_slice_growth(&pieces, heap)?;
@@ -413,11 +418,12 @@ impl RePattern {
     /// The build pass that follows is preflighted as a whole, since it cannot stop
     /// part way without leaking the matches it has built.
     pub fn finditer(&self, subject: &Value, text: &str, heap: &Heap) -> RunResult<Value> {
-        check_subject(&self.compiled, text, heap)?; // icp-code-mode patch
+        let fancy = check_subject(&self.compiled, text, heap)?; // icp-code-mode patch
         let stride = self.compiled.captures_len();
         let mut spans: Vec<Option<(usize, usize)>> = Vec::new();
         let mut text_len = 0usize;
         for (count, caps) in self.compiled.captures_iter(text).enumerate() {
+            poll_match(fancy, heap)?; // icp-code-mode patch
             let caps = caps.map_err(ExcType::re_pattern_error)?;
             // `check_slice_growth` for a push of `stride` spans at once.
             heap.tracker.check_time_every(count)?;
@@ -478,10 +484,12 @@ fn check_slice_growth<T>(slices: &Vec<T>, heap: &Heap) -> RunResult<()> {
 /// result list exists, so the check on that list comes too late.
 fn collect_slices<'t>(
     pieces: impl Iterator<Item = Result<&'t str, RegexError>>,
+    fancy: bool,
     heap: &Heap,
 ) -> RunResult<Vec<&'t str>> {
     let mut collected = Vec::new();
     for piece in pieces {
+        poll_match(fancy, heap)?; // icp-code-mode patch
         check_slice_growth(&collected, heap)?;
         collected.push(piece.map_err(ExcType::re_pattern_error)?);
     }
@@ -826,22 +834,34 @@ const MAX_FANCY_SUBJECT_BYTES: usize = 5_000;
 
 // icp-code-mode patch: regex work bound.
 /// Refuses a subject longer than [`MAX_FANCY_SUBJECT_BYTES`] for a regex that runs
-/// on fancy-regex's backtracking VM. One VM run is a single step the time limit
-/// cannot interrupt, costing up to [`MAX_BACKTRACKS`] backtracks, each of which may
-/// rescan the subject (a lookahead such as `(?=[^x]*$)`), so the subject length
-/// bounds it. Regexes the regex crate runs on its own are linear and take any
-/// subject. Also polls the time limit before a long search, since the VM polls only
-/// every 255 bytecodes.
-fn check_subject(regex: &Regex, text: &str, heap: &Heap) -> RunResult<()> {
-    if text.len() > 1 << 10 && is_fancy(regex) {
+/// on fancy-regex's backtracking VM, and returns whether it does. One VM run is a
+/// single step the time limit cannot interrupt, costing up to [`MAX_BACKTRACKS`]
+/// backtracks, each of which may rescan the subject (a lookahead such as
+/// `(?=[^x]*$)`), so the subject length bounds it. Regexes the regex crate runs on
+/// its own are linear and take any subject. A backtracking regex polls the time limit
+/// here and before every further match ([`poll_match`]): each match of `findall`,
+/// `sub`, `split` and `finditer` is a fresh VM run with a fresh backtrack allowance,
+/// so one call can cost n^3/6 steps, and a loop of calls on short subjects as much.
+fn check_subject(regex: &Regex, text: &str, heap: &Heap) -> RunResult<bool> {
+    if !is_fancy(regex) {
+        return Ok(false);
+    }
+    heap.tracker.check_time()?;
+    if text.len() > MAX_FANCY_SUBJECT_BYTES {
+        return Err(ExcType::value_error(format!(
+            "a pattern with lookaround or backreferences takes at most {MAX_FANCY_SUBJECT_BYTES} bytes \
+             of text in the sandbox (got {})",
+            text.len()
+        )));
+    }
+    Ok(true)
+}
+
+// icp-code-mode patch: regex work bound.
+/// Polls the time limit before each match of a backtracking regex (see [`check_subject`]).
+fn poll_match(fancy: bool, heap: &Heap) -> RunResult<()> {
+    if fancy {
         heap.tracker.check_time()?;
-        if text.len() > MAX_FANCY_SUBJECT_BYTES {
-            return Err(ExcType::value_error(format!(
-                "a pattern with lookaround or backreferences takes at most {MAX_FANCY_SUBJECT_BYTES} bytes \
-                 of text in the sandbox (got {})",
-                text.len()
-            )));
-        }
     }
     Ok(())
 }

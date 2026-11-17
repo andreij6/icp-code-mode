@@ -54,7 +54,8 @@ impl monty_types::PrintWriterCallback for Printed {
     fn stdout_write(&mut self, output: std::borrow::Cow<'_, str>) -> Result<(), MontyException> {
         // Once cut, the vendored `print` probes with an empty write before formatting its
         // arguments and skips them on Err (vendor/monty/PATCHES.md): no formatting cost
-        // for output nobody sees. Any other write still succeeds.
+        // for output nobody sees. The probe is its only empty write (empty `sep`, `end`
+        // and argument text are not written), and any other write still succeeds.
         if self.cut && output.is_empty() {
             return Err(exc(ExcType::RuntimeError, "print output is full"));
         }
@@ -152,7 +153,9 @@ fn to_json(o: ObjectRef<'_>, depth: usize, budget: &mut ValueBudget) -> Result<V
                 let key = match node(k) {
                     N::String(s) => s.clone(),
                     N::Int(_) | N::BigInt(_) => int_text(k, budget)?,
-                    _ => return Err(format!("dict keys must be str or int to leave the sandbox, not {}", k.type_name())),
+                    // As `json.dumps` renders them.
+                    N::Bool(b) => b.to_string(),
+                    _ => return Err(format!("dict keys must be str, int or bool to leave the sandbox, not {}", k.type_name())),
                 };
                 budget.bytes(key.len())?;
                 let value = to_json(v, depth + 1, budget)?;
@@ -286,9 +289,11 @@ async fn rebased<T>(f: impl std::future::Future<Output = T>) -> T {
     v
 }
 
-/// `eval` and `exec` compile source built at run time, in one step the budget cannot
-/// interrupt and outside the size limit on scripts. There is no `builtins` module or
-/// `compile` in Monty, so the names are the only way to reach them.
+/// `eval` and `exec` compile source built at run time. There is no `builtins` module or
+/// `compile` in Monty, so the names are the only direct way to reach them; this scan is
+/// not a boundary, though: a string annotation is evaluated as an expression, so
+/// `typing.get_type_hints` can still run `eval` from run-time text. What bounds that is
+/// the patched Monty's 16 KiB cap and time poll on every snippet it compiles.
 ///
 /// Python folds identifiers with NFKC (`ｅval` is `eval`), so the check runs on the folded text.
 fn uses_dynamic_code(code: &str) -> Option<&'static str> {
@@ -695,6 +700,16 @@ mod tests {
         let (r, b) = py("print('x' * 70000)\nbig = list(range(100000))\nfor i in range(2000):\n    print(big)\n1");
         assert_eq!(r.unwrap(), json!(1));
         assert!(b.logs.take().last().unwrap().ends_with("[truncated]"));
+        // Empty `end`, `sep` or argument text is not the probe: the print that crosses
+        // the cap, and later ones, still succeed.
+        for code in ["print('x' * 70000, end='')\n1", "print('x' * 65000)\nprint('y' * 1000, '')\nprint('', sep='', end='')\n1"] {
+            let (r, b) = py(code);
+            assert_eq!(r.unwrap(), json!(1), "{code}");
+            assert!(b.logs.take().last().unwrap().ends_with("[truncated]"), "{code}");
+        }
+        let (r, b) = py("print('a', end='')\nprint('', 'b', sep='')\n1");
+        assert_eq!(r.unwrap(), json!(1));
+        assert_eq!(b.logs.take(), vec!["ab".to_string()]);
     }
 
     #[test]
@@ -715,6 +730,9 @@ mod tests {
         // Keys that collide once turned into text, and keys that are not str or int.
         assert!(py("{1: 'a', '1': 'b'}").0.unwrap_err().contains("two keys"));
         assert!(py("{(1, 2): 1}").0.unwrap_err().contains("dict keys"));
+        assert!(py("{None: 1}").0.unwrap_err().contains("dict keys"));
+        assert_eq!(py("{True: 1, 'a': 2}").0.unwrap(), json!({"true": 1, "a": 2}));
+        assert!(py("{False: 1, 'false': 2}").0.unwrap_err().contains("two keys"));
         assert_eq!(py("{1: 'a', 'b': 2}").0.unwrap(), json!({"1": "a", "b": 2}));
         // A class instance over a DAG that doubles at each level is refused at once, not
         // rendered 2^26 times; so is one holding a cycle.
@@ -789,6 +807,11 @@ mod tests {
         for code in [
             "import math\nx = (1 << 32000) | 1\ny = (1 << 31000) | 3\nwhile True:\n    math.gcd(x, y)",
             "class K:\n    def __hash__(self):\n        return 0\nk = [K() for _ in range(3000)]\nwhile True:\n    set(k)",
+            // Each match of a backtracking regex is a fresh VM run with a fresh backtrack
+            // allowance: one `sub` on the 5,000-byte cap ran ~6 s natively unpolled, and
+            // a loop of `findall` on short subjects as long.
+            "import re\nwhile True:\n    re.sub('a*(?=[^x]*$)x|.', '', 'a' * 4999)",
+            "import re\nwhile True:\n    re.findall('a*(?=[^x]*$)x|.', 'a' * 1000)",
         ] {
             let _turn = test_serial::Turn::take(); // start the clock after the test lock
             let t0 = std::time::Instant::now();

@@ -42,7 +42,8 @@ pub fn builtin_print(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
     let stream = print_stream(file, vm)?;
     // icp-code-mode patch: print probe. An empty write the writer refuses means its
     // output is full (the host's `Printed` callback); skip formatting the arguments,
-    // which would cost time and memory for text that is then dropped.
+    // which would cost time and memory for text that is then dropped. So that the probe
+    // is the only empty write, empty `sep`, `end` and argument text is not written.
     if vm.print_writer.write(stream, "".into()).is_err() {
         return Ok(Value::None);
     }
@@ -52,7 +53,9 @@ pub fn builtin_print(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
         if first {
             first = false;
         } else if let Some(sep) = &sep_str {
-            vm.print_writer.write(stream, sep.as_str().into())?;
+            if !sep.is_empty() {
+                vm.print_writer.write(stream, sep.as_str().into())?;
+            }
         } else {
             vm.print_writer.push(stream, ' ')?;
         }
@@ -60,14 +63,16 @@ pub fn builtin_print(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
         defer_drop!(s, vm);
         // Resolve the `str` `Value` against the heap/interns tables directly so
         // the `&str` borrow stays disjoint from the `&mut vm.print_writer` write.
-        vm.print_writer.write(
-            stream,
-            s.as_str_heap(vm.heap, vm.interns).expect("py_str returns str").into(),
-        )?;
+        let text = s.as_str_heap(vm.heap, vm.interns).expect("py_str returns str");
+        if !text.is_empty() {
+            vm.print_writer.write(stream, text.into())?;
+        }
     }
 
     if let Some(end) = end_str {
-        vm.print_writer.write(stream, end.into())?;
+        if !end.is_empty() {
+            vm.print_writer.write(stream, end.into())?;
+        }
     } else {
         vm.print_writer.push(stream, '\n')?;
     }

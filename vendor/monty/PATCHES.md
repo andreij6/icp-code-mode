@@ -23,12 +23,12 @@ which discards the audit entry (audit findings 60, 61, 62 and 93).
 | `src/types/type.rs` | `int(text, base)` for power-of-two bases capped by significant digits x bits per digit (CPython's 4300-digit limit skips these bases). |
 | `src/types/decimal/context.rs` | `check_digits` refuses more than 65,536 digits (it only checked memory) and polls time above 1,024. |
 | `src/types/decimal/py_context.rs` | Settable precision capped at 10,000. |
-| `src/types/re_pattern.rs` | `backtrack_limit` 10,000 (fancy-regex default 1,000,000). A regex that runs on fancy-regex's backtracking VM takes at most 5,000 bytes of subject; regexes the regex crate runs alone take any subject. Detected per compiled regex through `debug_print` (the anchored `match`/`fullmatch` variants can be backtracking when the plain one is not). Polls time before such a search over 1 KiB. |
+| `src/types/re_pattern.rs` | `backtrack_limit` 10,000 (fancy-regex default 1,000,000). A regex that runs on fancy-regex's backtracking VM takes at most 5,000 bytes of subject; regexes the regex crate runs alone take any subject. Detected per compiled regex through `debug_print` (the anchored `match`/`fullmatch` variants can be backtracking when the plain one is not). Such a regex polls time before every search and before every match of `findall`, `finditer`, `sub` and `split`: each match is a fresh VM run with a fresh backtrack allowance, so without the poll one call cost n^3/6 steps (`re.sub('a*(?=[^x]*$)x|.', '', 'a' * 4999)` ran 5.8 s natively). |
 | `src/types/hash_table.rs`, `src/types/set.rs` | A probe that walks more than 64 equal-hash entries polls the time limit (`set(keys)` over keys whose `__hash__` is constant is quadratic inside one bytecode). |
 | `src/string_builder.rs` | Polls time when a string build grows past 64 KiB (`unicodedata.normalize` in a loop ran ~1.6 s past a 0.3 s limit). |
 | `src/builtins/eval_exec.rs` | `snippet_source`, the choke point of `eval`, `exec` and annotation evaluation (`eval_hint`), refuses text over 16 KiB (the host's script limit) and polls time above 1 KiB. |
 | `src/types/forward_ref.rs` | `ForwardRef.evaluate()` raises `NotImplementedError`: it compiles run-time text like `eval`, which the sandbox disables. |
-| `src/builtins/print.rs` | Print probe: before formatting its arguments, `print` writes an empty string; if the writer refuses it, the call returns without formatting. The host's `Printed` callback refuses empty writes once its 64 KiB is full, so later prints cost nothing. Other writers accept empty writes. |
+| `src/builtins/print.rs` | Print probe: before formatting its arguments, `print` writes an empty string; if the writer refuses it, the call returns without formatting. The host's `Printed` callback refuses empty writes once its 64 KiB is full, so later prints cost nothing. Other writers accept empty writes. `print` no longer writes empty `sep`, `end` or argument text, so the probe is its only empty write. |
 | `src/run_progress.rs` | `tracker_mut()` on `NameLookup`, `OsCall` and `ResolveFutures` (only `FunctionCall` had it), so the host can give the VM a fresh allowance from the live instruction counter before every resume. |
 
 ## Measurements (native, release, Apple M-series)
@@ -44,7 +44,7 @@ Overshoot past a 300 ms time limit with each operation in a `while True` loop, a
 patches: `gcd` at the cap 1.6 ms (was 95 ms), `isqrt` 0.2 ms, `int(Decimal('1e65000'))`
 1.1 ms (was 74 ms), `unicodedata.normalize` of 1.8M chars 6 ms (was 1.6 s), the
 backtracking regex `a*(?=[^x]*$)` anchored on 10,000 bytes 4 ms (was 130-170 ms; one search
-is n^2/2 steps, ~14 ms at 10,000 bytes, ~3.5 ms at the 5,000-byte cap), `set()` of 20,000
+is n^2/2 steps, ~14 ms at 10,000 bytes, ~3.5 ms at the 5,000-byte cap; `findall`/`sub` overshoot one such run, since they poll between matches), `set()` of 20,000
 keys with a constant hash 0.2 ms, `exec` of 16 KB text ~1 ms.
 
 ## Updating
