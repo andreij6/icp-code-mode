@@ -377,9 +377,13 @@ without `pre_upgrade` code. `post_upgrade` accepts the same optional `InitArgs` 
 
 **Audit entries come in pairs.** A script that reaches the network writes a `Started` entry
 before its first outbound message. IC state commits at that await, so the entry survives even
-if the script traps later. The final `Ok` / `Error` / `PolicyViolation` entry follows. A
-`Started` entry with no matching final entry (same `script_sha256`) means the run trapped
-after its calls went out.
+if the script traps later. The final `Ok` / `Error` / `PolicyViolation` entry follows, and both
+carry the same `run_id` (the `Started` entry's id). A `Started` entry with no other entry for
+its `run_id` means the run trapped after its calls went out.
+
+The script hash can't link the two: the same code can run several times, and runs interleave
+across awaits. A run that never reaches the network writes a single entry whose `run_id` is
+its own id.
 
 Canister ids are canonicalised (`RYJL3-…` and `ryjl3-…` are the same principal) before the
 allowlist check, the interface cache and the override lookup.

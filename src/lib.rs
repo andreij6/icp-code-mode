@@ -172,6 +172,7 @@ async fn run_search(caller_hash: &str, args: SearchArgs) -> serde_json::Value {
             status,
             violations,
             error,
+            run_id: bridge.run_id(),
         });
     }
     mcp::tool_result(Ok(result), vec![])
@@ -217,6 +218,7 @@ async fn run_script(caller_hash: &str, call: ToolCall) -> serde_json::Value {
         status,
         violations,
         error,
+        run_id: bridge.run_id(),
     });
     mcp::tool_result(out, bridge.logs.take())
 }

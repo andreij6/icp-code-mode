@@ -40,8 +40,8 @@ pub struct AllowedMethods(pub Vec<String>);
 
 #[derive(CandidType, Deserialize, Clone, Debug, PartialEq)]
 pub enum AuditStatus {
-    /// Written before a script's first outbound message; a `Started` entry with no
-    /// later entry for the same script hash means the run trapped after reaching the network.
+    /// Written before a script's first outbound message. A `Started` entry with no other
+    /// entry carrying its `run_id` means the run trapped after reaching the network.
     Started,
     Ok,
     Error,
@@ -62,6 +62,11 @@ pub struct AuditEntry {
     pub status: AuditStatus,
     pub violations: Vec<String>,
     pub error: Option<String>,
+    /// Links all entries of one run: the id of the run's `Started` entry, or the entry's
+    /// own id if the run never sent a message. Script hashes alone can't tell apart two
+    /// runs of the same script (one trapped, one not), and runs interleave across awaits.
+    /// `None` only on entries written before this field existed.
+    pub run_id: Option<u64>,
 }
 
 macro_rules! candid_storable {
@@ -210,10 +215,12 @@ pub fn candid_override(canister: &str) -> Option<String> {
 
 // ---------- audit log ----------
 
+/// Appends an entry and returns its id. An entry without a `run_id` starts its own run.
 pub fn append_audit(mut entry: AuditEntry) -> u64 {
     AUDIT.with(|l| {
         let l = l.borrow();
         entry.id = l.len();
+        entry.run_id.get_or_insert(entry.id);
         l.append(&entry).expect("audit log out of stable memory")
     })
 }
@@ -292,6 +299,7 @@ mod tests {
         let e = |lang: &str| AuditEntry {
             id: 0, timestamp_ns: 1, caller: "c".into(), language: lang.into(), script_sha256: "s".into(),
             canisters: vec![], calls: 0, instructions: 0, status: AuditStatus::Ok, violations: vec![], error: None,
+            run_id: None,
         };
         for l in ["a", "b", "c"] {
             append_audit(e(l));
@@ -302,5 +310,47 @@ mod tests {
         assert_eq!(audit_page(2, 10).len(), 1);
         assert!(audit_page(3, 10).is_empty());
         assert!(audit_page(u64::MAX, u64::MAX).is_empty());
+    }
+
+    fn entry(sha: &str, status: AuditStatus, run_id: Option<u64>) -> AuditEntry {
+        AuditEntry {
+            id: 0, timestamp_ns: 1, caller: "c".into(), language: "javascript".into(), script_sha256: sha.into(),
+            canisters: vec![], calls: 0, instructions: 0, status, violations: vec![], error: None, run_id,
+        }
+    }
+
+    /// The case from review: the same caller runs identical code twice; the first run traps
+    /// after an outbound call (its final entry is rolled back, its Started entry stays), the
+    /// second succeeds. The run id says which attempt finished; the script hash can't.
+    #[test]
+    fn run_id_links_started_and_final_entries() {
+        let first = append_audit(entry("same", AuditStatus::Started, None)); // trapped later
+        let second = append_audit(entry("same", AuditStatus::Started, None));
+        let done = append_audit(entry("same", AuditStatus::Ok, Some(second)));
+        let page = audit_page(0, 3);
+        assert_eq!(page.iter().map(|e| (e.id, e.run_id)).collect::<Vec<_>>(),
+            vec![(done, Some(second)), (second, Some(second)), (first, Some(first))]);
+        // The trapped run is the Started entry with no other entry in its run.
+        let finished: Vec<_> = page.iter().filter(|e| e.status != AuditStatus::Started).map(|e| e.run_id).collect();
+        assert!(!finished.contains(&Some(first)) && finished.contains(&Some(second)));
+        // A run that never reached the network is its own run.
+        let solo = append_audit(entry("other", AuditStatus::Error, None));
+        assert_eq!(audit_page(0, 1)[0].run_id, Some(solo));
+    }
+
+    /// Entries stored before `run_id` existed still decode (the opt field reads as null).
+    #[test]
+    fn old_audit_entries_still_decode() {
+        #[derive(CandidType)]
+        struct OldEntry {
+            id: u64, timestamp_ns: u64, caller: String, language: String, script_sha256: String, canisters: Vec<String>,
+            calls: u32, instructions: u64, status: AuditStatus, violations: Vec<String>, error: Option<String>,
+        }
+        let old = OldEntry {
+            id: 7, timestamp_ns: 1, caller: "c".into(), language: "rhai".into(), script_sha256: "s".into(), canisters: vec![],
+            calls: 1, instructions: 2, status: AuditStatus::Ok, violations: vec![], error: None,
+        };
+        let decoded = <AuditEntry as Storable>::from_bytes(Cow::Owned(Encode!(&old).unwrap()));
+        assert_eq!((decoded.id, decoded.run_id, decoded.language.as_str()), (7, None, "rhai"));
     }
 }

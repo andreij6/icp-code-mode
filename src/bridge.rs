@@ -152,7 +152,8 @@ mod ic {
         max_instructions: u64,
         /// (caller, language, script sha) for the provisional audit entry.
         audit_key: (String, String, String),
-        started: Cell<bool>,
+        /// Id of this run's `Started` audit entry, once one is written.
+        started: Cell<Option<u64>>,
         pub touched: RefCell<BTreeSet<String>>,
         pub violations: RefCell<Vec<String>>,
         pub violations_dropped: Cell<u32>,
@@ -166,7 +167,7 @@ mod ic {
                 base_instructions: instruction_counter(),
                 max_instructions: policy::limits().max_instructions,
                 audit_key: (caller, language.to_string(), script_sha256),
-                started: Cell::new(false),
+                started: Cell::new(None),
                 touched: RefCell::default(),
                 violations: RefCell::default(),
                 violations_dropped: Cell::new(0),
@@ -176,6 +177,11 @@ mod ic {
 
         pub fn calls(&self) -> u32 {
             self.calls.get()
+        }
+
+        /// The run this script's final audit entry belongs to (see `AuditEntry::run_id`).
+        pub fn run_id(&self) -> Option<u64> {
+            self.started.get()
         }
 
         /// Instructions spent by *this* script (batched requests share a call context).
@@ -215,11 +221,11 @@ mod ic {
         /// at that await, so even if the script later traps (rolling back the final entry),
         /// the log still records that this script reached the network.
         fn mark_started(&self, p: &Principal) {
-            if self.started.replace(true) {
+            if self.started.get().is_some() {
                 return;
             }
             let (caller, language, sha) = self.audit_key.clone();
-            policy::append_audit(AuditEntry {
+            let id = policy::append_audit(AuditEntry {
                 id: 0,
                 timestamp_ns: ic_cdk::api::time(),
                 caller,
@@ -231,7 +237,9 @@ mod ic {
                 status: AuditStatus::Started,
                 violations: vec![],
                 error: None,
+                run_id: None, // a Started entry opens its own run
             });
+            self.started.set(Some(id));
         }
 
         async fn service(&self, p: &Principal) -> Result<Rc<Service>, String> {

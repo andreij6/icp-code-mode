@@ -2,6 +2,11 @@ type AuditEntry = record {
   id : nat64;
   status : AuditStatus;
   timestamp_ns : nat64;
+  // Links all entries of one run: the id of the run's `Started` entry, or the entry's
+  // own id if the run never sent a message. Script hashes alone can't tell apart two
+  // runs of the same script (one trapped, one not), and runs interleave across awaits.
+  // `None` only on entries written before this field existed.
+  run_id : opt nat64;
   calls : nat32;
   violations : vec text;
   instructions : nat64;
@@ -14,8 +19,8 @@ type AuditEntry = record {
 };
 type AuditStatus = variant {
   Ok;
-  // Written before a script's first outbound message; a `Started` entry with no
-  // later entry for the same script hash means the run trapped after reaching the network.
+  // Written before a script's first outbound message. A `Started` entry with no other
+  // entry carrying its `run_id` means the run trapped after reaching the network.
   Started;
   Error;
   PolicyViolation;
