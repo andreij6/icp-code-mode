@@ -87,7 +87,7 @@ MCP client ──POST /mcp──▶ HTTP gateway ──▶ http_request (query)
 | `src/candid_bridge.rs` | `.did` parsing (`candid_parser`) and type-directed `serde_json::Value` ⇄ `IDLValue` conversion |
 | `src/demo.html` | Demo UI served at `GET /`, including the Classic MCP vs Code Mode comparison |
 | `demo_store/` | Demo target canister: 10 store methods with seed data |
-| `scripts/` | `demo-setup.sh` (allowlists `demo_store` in `icp_code_mode`), plus the checks CI runs (Wasm imports, README URLs, demo page, audit workflow) |
+| `scripts/` | `demo-setup.sh` (allowlists `demo_store` in `icp_code_mode`), plus the checks CI runs (Wasm imports, README URLs, demo page, demo setup, audit workflow) |
 | `video/` | Explainer video: script, HTML composition, Gemini TTS and render pipeline, final MP4 |
 | `src/search.rs` | `search_icp_canisters`: allowlist × interface → filtered signatures and referenced type definitions |
 | `src/policy.rs` | Stable-memory guardrails: allowlist, limits, SHA-256 token hashes, audit log (appended to only) |
@@ -140,7 +140,7 @@ cargo build --target wasm32-unknown-unknown --release --no-default-features --fe
 
 To deploy a worker, copy the canister entry in `icp.yaml` under a new name, use that build command,
 and change its `cp` source to `target/rhai/wasm32-unknown-unknown/release/icp_code_mode.wasm`.
-The all-in-one build is about 12 MB (3.6 MB gzipped). JS + Rhai without Python is about 6 MB.
+The all-in-one build is about 12 MB (3.8 MB gzipped). JS + Rhai without Python is about 6 MB.
 
 To regenerate the `.did` after changing endpoints:
 
@@ -751,8 +751,9 @@ allowlist check, the interface cache and the override lookup.
   `web_time::Instant` on every execution window, and chrono's default `wasmbind` feature pulls
   in `js_sys::Date`. Three bound work the engines would otherwise run until the IC traps the
   message (instruction limit, heap ceiling, stack overflow, or a panic under
-  `panic = "abort"`), which discards the audit entry. Each vendored crate lists its changes in
-  its `PATCHES.md`, and each change is marked `icp-code-mode patch` in the source.
+  `panic = "abort"`), which discards the audit entry. Those three (Boa, Monty, candid) each
+  list their changes in a `PATCHES.md`, and each change is marked `icp-code-mode patch` in the
+  source; chrono's one change is described at the top of its `Cargo.toml`.
   - `shims/web-time` backs `Instant` with the IC instruction counter. This also turns Monty's
     duration limits into deterministic instruction budgets.
   - `vendor/chrono` is chrono 0.4.45 with `wasmbind` removed from its default features.
