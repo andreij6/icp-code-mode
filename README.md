@@ -636,8 +636,8 @@ allowlist check, the interface cache and the override lookup.
 - **One native operation can still hit the IC's 40B-instruction trap.** The engines check
   budgets between steps (JavaScript also inside built-in loops over objects), not inside one
   built-in call: in JavaScript a regular expression with heavy backtracking, in Python a linear
-  operation on a large value (for example `unicodedata.normalize` on megabytes of text, up to
-  about 7B instructions between time checks). Python's superlinear operations are capped in
+  operation on a large value (for example `unicodedata.normalize` on megabytes of text; the
+  largest such step measured cost about 13B instructions, which the 20B turn cap leaves room for). Python's superlinear operations are capped in
   the patched Monty: big integers, `decimal`, backtracking regexes, colliding hash keys and
   run-time compiled text. The script size limit, value limits, and caps on integer text (1,000
   digits in, 32,768 bits out of Python, 100,000 bits in a reply) bound the rest. Such a trap is
