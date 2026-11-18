@@ -6,99 +6,139 @@
 <title>ICP Code Mode Demo</title>
 <style>
   :root {
+    color-scheme: light dark;
     --bg: #f7f7f5; --panel: #ffffff; --text: #1d1d1f; --muted: #6b6b70; --line: #e3e3e0;
-    --accent: #3b5bdb; --accent-text: #ffffff; --ok: #2b8a3e; --err: #c92a2a; --code: #f1f1ee;
+    --accent: #3b5bdb; --accent-text: #ffffff; --accent-soft: #e7ecff;
+    --ok: #2b8a3e; --ok-soft: #e6f4ea; --err: #c92a2a; --err-soft: #fdecec; --code: #f1f1ee;
+    --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --bg: #141416; --panel: #1c1c1f; --text: #ececf0; --muted: #9a9aa3; --line: #2e2e33;
-      --accent: #748ffc; --accent-text: #0b0b0d; --ok: #69db7c; --err: #ff8787; --code: #232327;
+      --accent: #748ffc; --accent-text: #0b0b0d; --accent-soft: #252b45;
+      --ok: #69db7c; --ok-soft: #1c2e21; --err: #ff8787; --err-soft: #3a1f1f; --code: #232327;
     }
   }
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--text);
          font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
-  main { max-width: 980px; margin: 0 auto; padding: 24px 16px 48px; }
-  h1 { font-size: 22px; margin: 0 0 4px; }
-  h2 { font-size: 15px; margin: 0 0 12px; }
-  p.lead { color: var(--muted); margin: 0 0 20px; }
-  section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+  main { max-width: 980px; margin: 0 auto; padding: 32px 16px 48px; }
+  h1 { font-size: 26px; margin: 0 0 6px; }
+  h2 { font-size: 18px; margin: 0 0 4px; }
+  h3 { font-size: 14px; margin: 0 0 8px; }
+  code { font: 0.92em var(--mono); }
+  .lead { color: var(--muted); margin: 0 0 24px; max-width: 70ch; }
+  .desc { color: var(--muted); font-size: 14px; margin: 0 0 14px; max-width: 75ch; }
+  .note { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 20px; margin-bottom: 20px; }
+  .sub-block { border-top: 1px solid var(--line); margin-top: 18px; padding-top: 16px; }
+  .tool-name { color: var(--muted); font-weight: normal; margin-left: 6px; }
   label { font-size: 13px; color: var(--muted); display: block; margin-bottom: 4px; }
   input, select, textarea { width: 100%; font: inherit; color: var(--text); background: var(--bg);
          border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; }
-  textarea { font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; min-height: 190px; resize: vertical; }
+  textarea { font: 13px/1.45 var(--mono); min-height: 260px; resize: vertical; margin-top: 10px; }
   .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
+  .row.center, .result .row { align-items: center; }
   .row > .grow { flex: 1 1 220px; }
+  .row > .fixed { flex: 0 0 180px; }
   button { font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--text);
            border-radius: 6px; padding: 8px 14px; cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--muted); }
   button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 600; }
   button:disabled { opacity: .55; cursor: progress; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  /* No overflow on .tabs: it would clip the focus ring and the -1px underline overlap. Two short tabs fit at 320px with the narrow padding below. */
+  .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); margin: 0 0 20px; }
+  .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  .tabs [role="tab"] { background: none; border: 0; border-bottom: 2px solid transparent; border-radius: 0; margin-bottom: -1px;
+                       padding: 10px 14px; color: var(--muted); font-weight: 600; white-space: nowrap; }
+  @media (max-width: 400px) { .tabs [role="tab"] { padding: 10px 8px; } }
+  .tabs [role="tab"]:hover { color: var(--text); border-color: transparent transparent var(--line); }
+  .tabs [role="tab"][aria-selected="true"] { color: var(--text); border-color: transparent transparent var(--accent); }
+  /* Chips pick an option; they are not actions, so they never look like the primary button. */
   .chips { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
-  .status { font-size: 13px; color: var(--muted); margin-left: auto; }
+  .chip { border-radius: 999px; padding: 5px 12px; font-size: 14px; }
+  .chip[aria-pressed="true"] { background: var(--accent-soft); border-color: var(--accent); color: var(--text); }
+  .status { font-size: 13px; color: var(--muted); }
   .status.ok { color: var(--ok); } .status.err { color: var(--err); }
-  pre { background: var(--code); border-radius: 6px; padding: 12px; margin: 8px 0 0; overflow: auto;
-        max-height: 420px; font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; word-break: break-word; }
-  .out-label { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin-top: 12px; }
-  details summary { cursor: pointer; color: var(--muted); font-size: 13px; margin-top: 12px; }
-  .hint { font-size: 13px; color: var(--muted); margin-top: 6px; }
-  .cmp-prompt { background: var(--code); border-radius: 6px; padding: 10px 12px; margin: 10px 0 14px; font-size: 14px; }
-  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .push-right { margin-left: auto; }
+  pre { background: var(--code); border-radius: 6px; padding: 12px; margin: 6px 0 0; overflow: auto;
+        max-height: 420px; font: 13px/1.45 var(--mono); white-space: pre-wrap; word-break: break-word; }
+  .out-label { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin-top: 14px; }
+  details summary { cursor: pointer; color: var(--muted); font-size: 13px; margin-top: 14px; }
+  details .note p { margin: 8px 0; }
+  .task { background: var(--code); border-radius: 6px; padding: 10px 12px; margin: 0 0 14px; font-size: 14px; }
+  .task b { color: var(--muted); font-weight: 600; }
+  .verdict { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin: 20px 0 10px; }
+  .headline { font-size: 20px; font-weight: 600; }
+  .badge { font-size: 13px; font-weight: 600; border-radius: 999px; padding: 3px 10px; }
+  .badge.good { color: var(--ok); background: var(--ok-soft); } .badge.bad { color: var(--err); background: var(--err-soft); }
+  .good { color: var(--ok); }
+  .bar-row { display: grid; grid-template-columns: 110px 1fr 90px; gap: 8px; align-items: center; font-size: 13px; margin: 6px 0; }
+  .bar-row > :last-child { text-align: right; }
+  .bar { height: 14px; border-radius: 4px; background: var(--accent); min-width: 2px; }
+  .bar.classic { background: var(--muted); }
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 18px; }
   @media (max-width: 720px) { .cols { grid-template-columns: 1fr; } }
   .col { border: 1px solid var(--line); border-radius: 8px; padding: 12px; min-width: 0; }
-  .col h3 { font-size: 14px; margin: 0 0 2px; }
+  .col h3 { margin: 0 0 2px; }
   .col .sub { font-size: 12px; color: var(--muted); margin-bottom: 10px; }
   .turns { list-style: none; padding: 0; margin: 0; font-size: 13px; }
   .turns li { padding: 6px 0; border-top: 1px dashed var(--line); }
   .turns li:first-child { border-top: 0; }
-  .turns code { font-size: 12px; }
-  .turns .meta { color: var(--muted); font-size: 12px; }
-  .bad { color: var(--err); } .good { color: var(--ok); }
-  table.metrics { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 4px; }
+  .turns code { font-size: 12px; overflow-wrap: anywhere; }
+  .turns .meta { color: var(--muted); font-size: 12px; white-space: nowrap; }
+  table.metrics { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 18px; }
   table.metrics th, table.metrics td { text-align: right; padding: 6px 8px; border-bottom: 1px solid var(--line); }
   table.metrics th:first-child, table.metrics td:first-child { text-align: left; color: var(--muted); font-weight: normal; }
   table.metrics td.win { color: var(--ok); font-weight: 600; }
-  .bar-row { display: grid; grid-template-columns: 110px 1fr 90px; gap: 8px; align-items: center; font-size: 13px; margin: 6px 0; }
-  .bar { height: 14px; border-radius: 4px; background: var(--accent); min-width: 2px; }
-  .bar.classic { background: var(--muted); }
-  .headline { font-size: 18px; font-weight: 600; margin: 4px 0 8px; }
+  .result { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 14px; margin-top: 18px; scroll-margin: 16px; }
+  .result pre { background: var(--code); }
 </style>
 </head>
 <body>
 <main>
   <h1>ICP Code Mode</h1>
-  <p class="lead">An MCP server running inside this canister. Each button sends a real JSON-RPC request to <code>POST /mcp</code>.</p>
+  <p class="lead">An MCP server that runs inside an Internet Computer canister. Instead of one tool per method, it gives
+    the model two: search what it may call, then run one script that makes every call inside the canister and returns
+    only the answer. Each button on this page sends a real JSON-RPC request to <code>POST /mcp</code>.</p>
 
   <section>
-    <h2>1. Connect</h2>
+    <h2>Connect</h2>
+    <p class="desc">Paste the API token once; every request below uses it.</p>
     <div class="row">
       <div class="grow">
         <label for="token">Bearer token</label>
         <input id="token" type="password" autocomplete="off" placeholder="Paste the API token (MCP_TOKEN in .env)">
       </div>
-      <button id="btn-init" class="primary">Initialize</button>
-      <button id="btn-list">List tools</button>
+      <button id="btn-init">Test connection</button>
     </div>
-    <div class="hint">The token stays in this browser tab (sessionStorage) and is gone when you close it. Only its SHA-256 hash is stored on-chain.</div>
+    <p class="note"><span id="conn-status" class="status" role="status"></span></p>
+    <p class="note">The token stays in this browser tab (sessionStorage) and is gone when you close it. Only its SHA-256 hash is stored on-chain.</p>
   </section>
 
-  <section>
-    <h2>2. Classic MCP vs Code Mode, side by side</h2>
-    <p class="hint" style="margin-top:0">Same task, same store canister, real calls on both sides. Classic MCP exposes one tool per
-      method, and every result goes through the model. Code Mode searches once, then runs one script in the canister and sends back only the answer.</p>
-    <div class="chips" id="scenarios"></div>
-    <div class="cmp-prompt" id="cmp-prompt">Pick a task above.</div>
-    <div class="row" style="margin-bottom:12px">
+  <div class="tabs" role="tablist" aria-label="Demo">
+    <button role="tab" id="tab-compare" aria-controls="panel-compare">Classic vs Code Mode</button>
+    <button role="tab" id="tab-tools" aria-controls="panel-tools">Try the tools</button>
+  </div>
+
+  <section id="panel-compare" role="tabpanel" aria-labelledby="tab-compare">
+    <h2 class="sr-only">Classic MCP vs Code Mode</h2>
+    <p class="desc">Same task, same store canister, real calls on both sides. Classic MCP exposes one tool per method,
+      and every result goes through the model. Code Mode searches once, then runs one script in the canister and sends back only the answer.</p>
+    <div class="chips" id="scenarios" role="group" aria-label="Task"></div>
+    <div class="task" id="cmp-prompt">Pick a task above.</div>
+    <div class="row center">
       <button id="btn-compare" class="primary">Run both</button>
-      <span id="cmp-status" class="status"></span>
+      <span id="cmp-status" class="status" role="status"></span>
     </div>
     <div id="cmp-out" hidden>
-      <div class="headline" id="cmp-headline"></div>
+      <div class="verdict">
+        <div class="headline" id="cmp-headline"></div>
+        <span id="cmp-same" class="badge"></span>
+      </div>
       <div id="cmp-bars"></div>
-      <div class="hint">Most of Code Mode's cost is fixed: its two tool definitions, re-read every turn, plus one search.
-        Classic MCP grows with every row and call it passes through the model, so the gap widens with real data volumes.
-        This demo store has only 60 orders.</div>
-      <table class="metrics" id="cmp-table"></table>
-      <div class="cols" style="margin-top:14px">
+      <div class="cols">
         <div class="col">
           <h3>Classic MCP</h3><div class="sub" id="classic-sub"></div>
           <ol class="turns" id="classic-turns"></ol>
@@ -108,9 +148,13 @@
           <ol class="turns" id="code-turns"></ol>
         </div>
       </div>
-      <div class="out-label">Answer (identical on both sides: <span id="cmp-same"></span>)</div>
+      <table class="metrics" id="cmp-table"></table>
+      <p class="note">Most of Code Mode's cost is fixed: its two tool definitions, re-read every turn, plus one search.
+        Classic MCP grows with every row and call it passes through the model, so the gap widens with real data volumes.
+        This demo store has only 60 orders.</p>
+      <div class="out-label">The answer</div>
       <pre id="cmp-answer"></pre>
-      <details><summary>How the numbers are counted</summary><div class="hint">
+      <details><summary>How the numbers are counted</summary><div class="note">
         <p><b>Real:</b> every call on both sides runs against the canister, so the call counts, the results (in characters) and the
         canister time are measured. On the Classic side, each tool call is run as its own one-call script, so its result is exactly
         what a per-method tool would return.</p>
@@ -124,39 +168,42 @@
     </div>
   </section>
 
-  <section>
-    <h2>3. Search: what may scripts call?</h2>
+  <section id="panel-tools" role="tabpanel" aria-labelledby="tab-tools" hidden>
+    <h2 class="sr-only">Try the two tools</h2>
+    <p class="desc">The two tools Code Mode gives an MCP client. Results appear at the bottom of this card.</p>
+
+    <h3>Search what scripts may call <code class="tool-name">search_icp_canisters</code></h3>
     <div class="row">
       <div class="grow">
         <label for="q">Keywords (optional)</label>
         <input id="q" placeholder="e.g. order, balance">
       </div>
       <button id="btn-search" class="primary">Search</button>
+      <button id="btn-list">List tools</button>
     </div>
-  </section>
 
-  <section>
-    <h2>4. Execute a script</h2>
-    <div class="chips" id="examples"></div>
-    <div class="row" style="margin-bottom:10px">
-      <div style="flex:0 0 180px">
-        <label for="lang">Language</label>
-        <select id="lang"><option value="javascript">JavaScript</option><option value="python">Python</option><option value="rhai">Rhai</option></select>
+    <div class="sub-block">
+      <h3>Run a script <code class="tool-name">execute_icp_script</code></h3>
+      <div class="chips" id="examples" role="group" aria-label="Example script"></div>
+      <div class="row">
+        <div class="fixed">
+          <label for="lang">Language</label>
+          <select id="lang"><option value="javascript">JavaScript</option><option value="python">Python</option><option value="rhai">Rhai</option></select>
+        </div>
+        <button id="btn-run" class="primary">Run script</button>
       </div>
-      <button id="btn-run" class="primary">Run script</button>
+      <textarea id="code" spellcheck="false" aria-label="Script"></textarea>
     </div>
-    <textarea id="code" spellcheck="false"></textarea>
-  </section>
 
-  <section>
-    <div class="row"><h2 style="margin:0">Result</h2><span id="status" class="status">Nothing sent yet</span></div>
-    <div class="out-label">Result</div>
-    <pre id="result">Click a button above.</pre>
-    <div id="console-wrap" hidden>
-      <div class="out-label">Console output</div>
-      <pre id="console"></pre>
+    <div class="result" id="result-panel">
+      <div class="row"><h3 style="margin:0">Result</h3><span id="status" class="status push-right" role="status">Nothing sent yet</span></div>
+      <pre id="result">Search or run a script above.</pre>
+      <div id="console-wrap" hidden>
+        <div class="out-label">Console output</div>
+        <pre id="console"></pre>
+      </div>
+      <details><summary>Raw JSON-RPC exchange</summary><pre id="raw"></pre></details>
     </div>
-    <details><summary>Raw JSON-RPC exchange</summary><pre id="raw"></pre></details>
   </section>
 </main>
 <script>
@@ -211,40 +258,80 @@ const store = {
 $("token").value = store.get("icp-code-mode-token");
 $("token").addEventListener("change", () => store.set("icp-code-mode-token", $("token").value.trim()));
 
+// Make one chip in a group the selected one.
+function pick(group, i) { group.querySelectorAll(".chip").forEach((c, j) => c.setAttribute("aria-pressed", String(j === i))); }
+
+// The one place that talks to the canister.
 let nextId = 1;
-async function rpc(method, params) {
+async function send(method, params) {
   const token = $("token").value.trim();
   store.set("icp-code-mode-token", token);
   const body = { jsonrpc: "2.0", id: nextId++, method, ...(params ? { params } : {}) };
-  document.querySelectorAll("button").forEach((b) => (b.disabled = true));
-  setStatus("Waiting for the canister…", "");
   const t0 = performance.now();
+  const res = await fetch("/mcp", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Accept": "application/json, text/event-stream",
+               "Authorization": "Bearer " + token },
+    body: JSON.stringify(body),
+  });
+  const text = await res.text();
+  const ms = Math.round(performance.now() - t0);
+  let json = null;
+  try { json = JSON.parse(text); } catch {}
+  return { body, res, json, text, ms };
+}
+
+// Tabs stay usable while a request runs: its results still land in the other tab.
+function busy(on) { document.querySelectorAll("button:not([role=tab])").forEach((b) => (b.disabled = on)); }
+
+// Tabs: one panel at a time, arrow keys move between tabs, and the URL hash
+// (#compare, #tools) remembers the choice across reloads and links.
+const tabs = [...document.querySelectorAll('[role="tab"]')];
+function selectTab(tab, focus) {
+  tabs.forEach((t) => {
+    const on = t === tab;
+    t.setAttribute("aria-selected", String(on));
+    t.tabIndex = on ? 0 : -1;
+    $(t.getAttribute("aria-controls")).hidden = !on;
+  });
+  if (focus) tab.focus();
+  history.replaceState(null, "", "#" + tab.id.slice(4));
+}
+tabs.forEach((t, i) => {
+  t.onclick = () => selectTab(t);
+  t.onkeydown = (e) => {
+    const to = { ArrowRight: i + 1, ArrowLeft: i - 1, Home: 0, End: tabs.length - 1 }[e.key];
+    if (to === undefined) return;
+    e.preventDefault();
+    selectTab(tabs[(to + tabs.length) % tabs.length], true);
+  };
+});
+const tabFromHash = () => tabs.find((t) => location.hash === "#" + t.id.slice(4)) || tabs[0];
+selectTab(tabFromHash());
+addEventListener("hashchange", () => selectTab(tabFromHash()));
+
+// For the "Try the two tools" card: send, record the raw exchange, and report network errors.
+async function rpc(method, params) {
+  busy(true);
+  setStatus("Waiting for the canister…", "");
   try {
-    const res = await fetch("/mcp", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Accept": "application/json, text/event-stream",
-                 "Authorization": "Bearer " + token },
-      body: JSON.stringify(body),
-    });
-    const ms = Math.round(performance.now() - t0);
-    const text = await res.text();
-    let json = null;
-    try { json = JSON.parse(text); } catch {}
-    $("raw").textContent = "→ " + JSON.stringify(body, null, 2) + "\n\n← HTTP " + res.status + "\n" + (json ? JSON.stringify(json, null, 2) : text);
-    return { res, json, text, ms };
+    const r = await send(method, params);
+    $("raw").textContent = "→ " + JSON.stringify(r.body, null, 2) + "\n\n← HTTP " + r.res.status + "\n" + (r.json ? JSON.stringify(r.json, null, 2) : r.text);
+    return r;
   } catch (e) {
     setStatus("Network error: " + e.message, "err");
     $("result").textContent = String(e);
     return null;
   } finally {
-    document.querySelectorAll("button").forEach((b) => (b.disabled = false));
+    busy(false);
   }
 }
 
-function setStatus(text, cls) { $("status").textContent = text; $("status").className = "status " + cls; }
+function setStatus(text, cls) { $("status").textContent = text; $("status").className = "status push-right " + cls; }
 function pretty(s) { try { return JSON.stringify(JSON.parse(s), null, 2); } catch { return s; } }
 
 function show(r, label) {
+  $("result-panel").scrollIntoView({ block: "nearest", behavior: "smooth" });
   if (!r) return;
   const { res, json, text, ms } = r;
   $("console-wrap").hidden = true;
@@ -264,8 +351,23 @@ function show(r, label) {
   }
 }
 
-$("btn-init").onclick = async () => show(await rpc("initialize", {
-  protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "demo-page", version: "1" } }), "initialize");
+// Test connection: an MCP initialize, reported next to the button.
+$("btn-init").onclick = async () => {
+  const s = $("conn-status");
+  s.className = "status"; s.textContent = "Connecting…";
+  busy(true);
+  try {
+    const { res, json, ms } = await send("initialize", {
+      protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "demo-page", version: "1" } });
+    const info = json && json.result && json.result.serverInfo;
+    if (info) { s.className = "status ok"; s.textContent = `Connected to ${info.name} ${info.version} · ${ms} ms`; }
+    else { s.className = "status err"; s.textContent = res.status === 401 ? "401: missing or wrong token" : "HTTP " + res.status + (json && json.error ? ": " + json.error.message : ""); }
+  } catch (e) {
+    s.className = "status err"; s.textContent = "Network error: " + e.message;
+  } finally {
+    busy(false);
+  }
+};
 $("btn-list").onclick = async () => {
   const r = await rpc("tools/list");
   if (r && r.json && r.json.result) {
@@ -277,14 +379,16 @@ $("btn-search").onclick = async () => {
   const q = $("q").value.trim();
   show(await rpc("tools/call", { name: "search_icp_canisters", arguments: q ? { query: q } : {} }), "search");
 };
+$("q").addEventListener("keydown", (e) => { if (e.key === "Enter") $("btn-search").click(); });
 $("btn-run").onclick = async () => show(await rpc("tools/call", {
   name: "execute_icp_script", arguments: { language: $("lang").value, code: $("code").value } }), "execute");
 
 [...$("lang").options].forEach((o) => { if (!LANGS.includes(o.value)) o.remove(); });
 EXAMPLES.filter((ex) => LANGS.includes(ex.lang)).forEach((ex, i) => {
   const b = document.createElement("button");
+  b.className = "chip";
   b.textContent = ex.name;
-  b.onclick = () => { $("lang").value = ex.lang; $("code").value = ex.code; };
+  b.onclick = () => { $("lang").value = ex.lang; $("code").value = ex.code; pick($("examples"), i); };
   $("examples").appendChild(b);
   if (i === 0) b.onclick();
 });
@@ -366,15 +470,9 @@ let scenario = 0;
 const cache = {};
 
 async function post(method, params) {
-  const token = $("token").value.trim();
-  const body = { jsonrpc: "2.0", id: nextId++, method, ...(params ? { params } : {}) };
-  const t0 = performance.now();
-  const res = await fetch("/mcp", { method: "POST", body: JSON.stringify(body), headers: {
-    "Content-Type": "application/json", "Accept": "application/json, text/event-stream", "Authorization": "Bearer " + token } });
-  const text = await res.text();
-  const ms = performance.now() - t0;
-  if (res.status === 401) throw new Error("401: missing or wrong token (step 1)");
-  let json; try { json = JSON.parse(text); } catch { throw new Error("HTTP " + res.status + ": " + text.slice(0, 200)); }
+  const { res, json, text, ms } = await send(method, params);
+  if (res.status === 401) throw new Error("401: missing or wrong token (see Connect)");
+  if (!json) throw new Error("HTTP " + res.status + ": " + text.slice(0, 200));
   if (json.error) throw new Error("JSON-RPC " + json.error.code + ": " + json.error.message);
   return { json, ms };
 }
@@ -451,8 +549,13 @@ function simulate(defs, prompt, steps, answer) {
   return { input, output, turns: steps.length + 1, data: steps.reduce((a, s) => a + s.in, 0) };
 }
 
+
 function li(html) { const e = document.createElement("li"); e.innerHTML = html; return e; }
 const esc = (t) => String(t).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]);
+// Display only: "eywkj-36a77-xakai-camca-kbq" → "eywkj…", so call lists stay one line each.
+const shortIds = (s) => s.replace(/\b([a-z0-9]{5})(-[a-z0-9]{3,5}){3,}\b/g, "$1…");
+// One row per line: compact, and still easy to scan.
+const compact = (v) => Array.isArray(v) ? "[\n" + v.map((x) => "  " + JSON.stringify(x)).join(",\n") + "\n]" : JSON.stringify(v, null, 2);
 
 async function runComparison() {
   if (!LANGS.includes("javascript")) {
@@ -461,8 +564,7 @@ async function runComparison() {
     return;
   }
   const sc = SCENARIOS[scenario];
-  const btns = document.querySelectorAll("button");
-  btns.forEach((b) => (b.disabled = true));
+  busy(true);
   $("cmp-status").className = "status"; $("cmp-status").textContent = "Running both sides…";
   try {
     const S = await findStore();
@@ -504,7 +606,7 @@ async function runComparison() {
     $("classic-sub").textContent = `${defs.count} tools, one per store method`;
     const ct = $("classic-turns"); ct.innerHTML = "";
     classicTurns.forEach((rs, i) => ct.appendChild(li(`<b>LLM turn ${i + 1}</b>: ${rs.length} tool call${rs.length > 1 ? "s" : ""}<br>` +
-      rs.map((r) => `<code>${esc(r.method)}(${esc(JSON.stringify(r.args)).slice(0, 40)})</code> <span class="meta">→ ${fmt(r.resultChars)} chars into context</span>`).join("<br>"))));
+      rs.map((r) => `<code>${esc(r.method)}(${esc(shortIds(JSON.stringify(r.args)).slice(0, 40))})</code> <span class="meta">→ ${fmt(r.resultChars)} chars into context</span>`).join("<br>"))));
     ct.appendChild(li(`<b>LLM turn ${classicTurns.length + 1}</b>: reads all of it, writes the answer`));
 
     const mt = $("code-turns"); mt.innerHTML = "";
@@ -531,22 +633,23 @@ async function runComparison() {
     $("cmp-headline").innerHTML = ratio >= 1
       ? `Code Mode used <span class="good">${ratio.toFixed(1)}× fewer</span> input tokens: ${fmt(tok(C.input - M.input))} saved`
       : `Classic MCP used ${(1 / ratio).toFixed(1)}× fewer input tokens on this task`;
-    $("cmp-same").innerHTML = same ? '<span class="good">yes ✓</span>' : '<span class="bad">no, they differ</span>';
-    $("cmp-answer").textContent = JSON.stringify(codeAnswer, null, 2);
+    $("cmp-same").className = "badge " + (same ? "good" : "bad");
+    $("cmp-same").textContent = same ? "Same answer on both sides ✓" : "The answers differ";
+    $("cmp-answer").textContent = compact(codeAnswer);
     $("cmp-out").hidden = false;
     $("cmp-status").className = "status ok"; $("cmp-status").textContent = "Done";
   } catch (e) {
     $("cmp-status").className = "status err"; $("cmp-status").textContent = e.message;
   } finally {
-    btns.forEach((b) => (b.disabled = false));
+    busy(false);
   }
 }
 
 SCENARIOS.forEach((sc, i) => {
   const b = document.createElement("button");
+  b.className = "chip";
   b.textContent = sc.title;
-  b.onclick = () => { scenario = i; $("cmp-prompt").textContent = "Task: " + sc.prompt;
-    document.querySelectorAll("#scenarios button").forEach((x, j) => x.classList.toggle("primary", j === i)); };
+  b.onclick = () => { scenario = i; $("cmp-prompt").innerHTML = "<b>Task:</b> " + esc(sc.prompt); pick($("scenarios"), i); };
   $("scenarios").appendChild(b);
   if (i === 0) b.onclick();
 });
